@@ -1,145 +1,105 @@
-# chatgpt-proxy — Architecture
-
-This document explains how the pieces fit together, the wire protocols, and
-the message flows. Read this before modifying the code.
+# Architecture
 
 ## Overview
 
 ```
-                          Internet / HTTPS                      Outbound WebSocket
-┌─────────────┐   MCP Streamable HTTP (JSON-RPC 2.0)   ┌──────────────────┐   (no inbound ports)   ┌──────────────────┐
-│ ChatGPT Web │ ────── POST /mcp ─────────────────────▶│   Relay Server   │ ──────────────────────▶│   Local Agent    │
-│ (MCP client)│ ◀───── json | text/event-stream ───────│   (public host)  │ ◀──────────────────────│   (your machine) │
-└─────────────┘                                        └──────────────────┘                        └──────────────────┘
-                                                               │                                        │
-                                                     forward tools/list, tools/call         execute tools locally
+┌────────────────────┐   MCP (stdio / HTTP)    ┌───────────────┐   CDP (WebSocket)   ┌──────────────────────┐
+│  AI agent          │ ───────────────────────▶│ chatgpt-proxy │ ───────────────────▶│ Chrome (dedicated    │
+│  (MCP client)      │   initialize /          │  (Go process) │   navigate/type/    │ profile)             │
+│                    │   tools/list /          │               │   evaluate          │  chatgpt.com         │
+│                    │   tools/call            │               │                     │  (your login)        │
+│                    │ ◀───────────────────────│               │ ◀───────────────────│                      │
+└────────────────────┘   result (text)         └───────────────┘                     └──────────────────────┘
 ```
 
-Key property: **the agent is the one that dials out**. The relay never needs
-to reach the agent, so the agent can sit behind NAT / CGNAT / a hotel Wi-Fi /
-a phone hotspot. The only thing that must be publicly reachable is the relay.
+Two layers, both hand-rolled where it matters:
 
-## Components
+1. **MCP layer** (`internal/mcp`, `internal/server`) — JSON-RPC 2.0 framing,
+   `initialize` / `ping` / `tools/list` / `tools/call`. Transport-agnostic.
+2. **Browser layer** (`internal/chatgpt`) — chromedp driving chatgpt.com in a
+   dedicated Chrome profile.
 
-| Component | Package | Role |
-|---|---|---|
-| Relay | `internal/relay` | Public gateway. Exposes MCP over HTTP, holds agent connections, correlates requests. |
-| Agent | `internal/agent` | Outbound WS client. Receives forwarded JSON-RPC, dispatches to tools, returns results. |
-| Tools | `internal/tools` | The local execution layer + safety policy. |
-| Protocol | `internal/mcp` | Shared MCP / JSON-RPC 2.0 types used by both sides. |
+## MCP layer
 
-## Wire protocols
+- `internal/mcp` — protocol types (`Request`, `Response`, `Tool`,
+  `ToolResult`, …) and helpers. Deliberately hand-rolled (no SDK) to keep the
+  wire format explicit.
+- `internal/server/server.go` — the `Handler`, which dispatches JSON-RPC to
+  the two tools:
+  - `ask_chatgpt` → `chatgpt.Client.Ask(prompt, new_session, timeout)`
+  - `chatgpt_status` → `chatgpt.Client.Status()`
+- `internal/server/transports.go` — two transports:
+  - **stdio** — newline-delimited JSON on stdin/stdout (what Hermes / Claude
+    Desktop spawn).
+  - **Streamable HTTP** — `POST /mcp` returning SSE (`text/event-stream`) or
+    JSON depending on the `Accept` header; `DELETE /mcp` → 202; stateless
+    (`Mcp-Session-Id` issued but not validated).
 
-### 1. Client ↔ Relay: MCP Streamable HTTP
+## Browser layer (`internal/chatgpt`)
 
-The relay implements the MCP **Streamable HTTP** transport (a subset):
+### Chrome lifecycle
 
-- `POST /mcp` with `Content-Type: application/json` and a single JSON-RPC
-  message in the body.
-- Response is `application/json` by default, or `text/event-stream` (SSE)
-  when the client sends `Accept: text/event-stream`.
-- `initialize` responses carry an `Mcp-Session-Id` header. The relay is
-  **stateless** — the session id is issued but not validated (see
-  `internal/relay/server.go: handleMCP`).
-- `GET /mcp` (SSE stream keep-alive) is **not** implemented; POST-only.
+The client owns **one Chrome instance** (launched on demand with a dedicated
+profile) and **one tab**, serialized by a mutex.
 
-Methods handled by the relay itself:
+1. `ensureBrowser` scans ports `9222..9231` for an existing DevTools server
+   (`GET /json/version`) and attaches if found — this is how a restart reuses
+   the already-logged-in session.
+2. Otherwise it launches Chrome with `--remote-debugging-port` +
+   `--user-data-dir=~/.chatgpt-proxy`, then polls for the port (up to 20s).
+   The port is **auto-picked** if the default is taken (a stray listener on
+   9222 once wedged us — see HANDOFF bug #2).
+3. `connect` creates the chromedp allocator **rooted at `c.life`**
+   (`context.Background()`), never at a per-request context, so the browser
+   connection survives across MCP calls.
 
-| Method | Behavior |
+### The chromedp teardown gotcha
+
+chromedp's `RemoteAllocator.Allocate` binds browser teardown to the **context
+of the first `Run`**:
+
+```go
+a.wg.Go(func() {
+    <-ctx.Done()   // ctx = first Run's context
+    Cancel(ctx)    // cancels the tab context
+    cancel()       // closes the websocket
+})
+```
+
+If the first `Run` used a short-lived `context.WithTimeout(tab, …)`, the
+connection dies the moment that timeout context is cancelled. The fix
+(`tabCtx`) forces allocation with a **no-op `chromedp.Run` on the long-lived
+tab context** immediately after `NewContext`.
+
+### ask_chatgpt flow
+
+```
+Status:      Navigate(chatgpt.com) → probe DOM (composer/sidebar/login) → Status
+Ask:         Navigate → (optional) click "New chat" → type prompt → submit →
+             poll until the assistant reply is stable (stop button gone, text
+             unchanged across 2 polls) → return text
+```
+
+DOM selectors (single source of truth, re-tune here if chatgpt.com changes):
+
+| Element | Selector |
 |---|---|
-| `initialize` | Echoes the client's protocol version, advertises `tools` capability, returns `serverInfo`. |
-| `ping` | Returns `{}`. |
-| `notifications/initialized` | `202 Accepted`, no body. |
-| `resources/*`, `prompts/*`, `logging/*` | Return empty / method-not-supported so clients degrade gracefully. |
+| composer | `#prompt-textarea` |
+| New chat | `a[href="/"]` (+ text fallback `"New chat"`) |
+| send button | `[data-testid="send-button"]` |
+| stop generating | `[data-testid="stop-button"]` |
+| continue | `[data-testid="continue-generate-button"]` |
+| assistant message | `[data-message-author-role="assistant"]` (last) |
 
-Methods forwarded to the agent through the tunnel:
+Typing uses `document.execCommand('insertText', …)` (fires React input
+events); submitting prefers the send button and falls back to Enter. Long
+answers auto-click "Continue generating" up to 3 times.
 
-| Method | Behavior |
+## Code map
+
+| อยากทำอะไร | แก้ที่ไหน |
 |---|---|
-| `tools/list` | Forwarded to the agent; the agent builds the tool list from `internal/tools`. |
-| `tools/call` | Forwarded with `params` (tool name + arguments) untouched. |
-
-### 2. Relay ↔ Agent: WebSocket tunnel
-
-The agent connects to `wss://<relay>/ws/agent` (optionally `?token=...` or an
-`Authorization: Bearer` header). Each WebSocket text message is a JSON-RPC
-2.0 message — the **same shape** the client uses, so the relay is a thin
-pass-through.
-
-On connect the agent sends a relay-level hello (not JSON-RPC):
-
-```json
-{ "type": "hello", "name": "macbook-pro" }
-```
-
-The relay then forwards requests:
-
-```json
-{ "jsonrpc": "2.0", "id": "<hex>", "method": "tools/call", "params": { "name": "read_file", "arguments": { "path": "/x/y.go" } } }
-```
-
-and the agent replies:
-
-```json
-{ "jsonrpc": "2.0", "id": "<hex>", "result": { "content": [ { "type": "text", "text": "..." } ], "isError": false } }
-```
-
-**Request correlation** (`internal/relay/hub.go`): the relay assigns a fresh
-request id per forwarded call, stores a `chan []byte` in the agent's
-`inflight` map, and waits (bounded by `AGENT_TIMEOUT`). When the agent's
-response arrives, `deliver()` routes it back by id. The relay then rewraps
-the result under the **client's** original id.
-
-**Heartbeat**: the agent sends a WebSocket control `PingMessage` every 20s so
-both sides detect dead connections; the relay re-reads each agent's socket.
-
-**Reconnect**: the agent re-dials with exponential backoff
-(1s → 2s → 4s → … capped at 30s) and re-sends its hello. The relay
-re-registers it (replacing any stale connection for the same id).
-
-## Request lifecycle (a `tools/call` end to end)
-
-```
-ChatGPT                         Relay                            Agent
-  │  POST /mcp tools/call         │                                 │
-  ├──────────────────────────────▶│  pick agent (round-robin)       │
-  │                               ├────────────────────────────────▶│
-  │                               │  JSON-RPC tools/call (new id)   │
-  │                               │                                 │  execute tool
-  │                               │                                 │  (policy check → run)
-  │                               │◀────────────────────────────────┤
-  │                               │  JSON-RPC result                │
-  │  json | SSE response          │                                 │
-  │◀──────────────────────────────┤                                 │
-```
-
-## Safety model
-
-- **Policy is enforced on the agent** (`internal/tools/policy.go`), because
-  that's where the destructive operation would actually run. A blocked
-  command returns `isError: true` with a message explaining why.
-- **Workspace roots** (`WORKSPACE_ROOT`) are also enforced on the agent:
-  `read_file`, `apply_patch`, `shell` (cwd), `search_text` and
-  `workspace_list` all refuse paths outside the allowed roots.
-- **Two tokens**: `AGENT_TOKEN` (agent↔relay) and `CLIENT_TOKEN`
-  (client↔relay) are checked in different places and should be different
-  secrets. Empty `CLIENT_TOKEN` = `/mcp` is unauthenticated.
-
-## Code map (where to change things)
-
-| You want to… | Edit |
-|---|---|
-| Add a tool | `internal/tools/tools.go` (`List` + `Call`) + a new file in `internal/tools/`. See `docs/EXTENDING.md`. |
-| Change the safety policy | `internal/tools/policy.go` (`DefaultDenyPatterns`). |
-| Change tunnel transport | `internal/agent/agent.go` + `internal/relay/hub.go`. |
-| Add an MCP method | `internal/relay/server.go` (`dispatch`) + `internal/mcp/mcp.go` (method constants). |
-| Change timeouts | `RELAY_ADDR`/`AGENT_TIMEOUT` env on relay; `timeout_seconds` per shell call. |
-
-## Testing
-
-- `internal/tools/tools_test.go` — unit tests for file tools + policy.
-- `internal/relay/server_test.go` — **integration**: spins up a real relay
-  over `httptest`, connects a real agent over WebSocket, and drives the full
-  MCP flow (initialize, tools/list, tools/call, policy blocking, SSE).
-
-Run everything with `go test ./...`.
+| เพิ่ม tool ใหม่ | `internal/server/server.go` (`tools()`, `dispatch`, `callTool`) |
+| แก้วิธีคุยกับ chatgpt.com | `internal/chatgpt/chatgpt.go` |
+| เปลี่ยน transport / เพิ่ม auth | `internal/server/transports.go` + `cmd/proxy/main.go` |
+| เปลี่ยน MCP wire format | `internal/mcp/mcp.go` |

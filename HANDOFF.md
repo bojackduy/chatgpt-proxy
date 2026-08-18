@@ -1,118 +1,91 @@
 # Handoff: chatgpt-proxy
 
 > **Created:** 2026-08-18
-> **Stack:** Go 1.26 · gorilla/websocket v1.5.3 · zero other deps
+> **Stack:** Go 1.26 · chromedp v0.16.0 · gorilla/websocket (legacy only)
 > **Location:** `~/Documents/AI_workspaces/chatgpt-proxy`
-> **Status:** ✅ MVP ทำงานครบ (unit + integration test ผ่าน, live smoke test ผ่าน)
-> **Goal:** ให้ ChatGPT Web (หรือ MCP client ใดๆ) ควบคุมเครื่อง local ผ่าน tunnel **outbound-only** — ไม่ต้องเปิด public port
+> **Status:** ✅ ทำงานจริง end-to-end (live test ผ่าน)
+> **Goal:** MCP server ให้ AI agent (Hermes / Claude Desktop / Codebuff ฯลฯ) เรียกใช้ **ChatGPT Web** ผ่านบัญชีผู้ใช้แบบฟรี ไม่ใช้ API key
 
 ---
 
-## TL;DR — สิ่งที่ทำเสร็จแล้ว
+## ทิศทาง (สำคัญ — มีการเปลี่ยนทาง)
+
+ตอนแรกสร้างเป็น **relay + agent outbound tunnel** (ให้ ChatGPT Web ควบคุมเครื่อง) ตามแรงบันดาลใจที่เจอมา แต่**ทิศทางจริงที่ต้องการคือกลับกัน**:
 
 ```
-ChatGPT Web ──HTTPS(MCP Streamable HTTP)──▶ [Relay] ◀──WebSocket(outbound)── [Agent บนเครื่อง]
+AI agent ──MCP──▶ chatgpt-proxy ──CDP──▶ Chrome (chatgpt.com, session ของผู้ใช้)
 ```
 
-- **Relay** (`cmd/relay`) — server สาธารณะ รับ MCP ผ่าน `POST /mcp`, forward `tools/list`/`tools/call` ไปหา agent ผ่าน WebSocket tunnel
-- **Agent** (`cmd/agent`) — รันบนเครื่อง local, **dial ออก** ไปหา relay (ไม่ต้องเปิด port), execute tools จริง, reconnect อัตโนมัติแบบ exponential backoff
-- **Policy** — บล็อกคำสั่งทำลายล้าง/ลบโดย default (`ALLOW_DELETE=true` ถึงจะยอม) + จำกัดขอบเขตด้วย `WORKSPACE_ROOT`
-
-### Tools ที่มี (12 ตัว)
-`read_file` · `search_text` · `apply_patch` · `workspace_list` · `git_status` · `git_diff` · `git_log` · `shell` · `process_list` · `process_start` · `process_stop` · `system_info`
+โค้ดเก่า (relay/agent/tools/tunnel) ย้ายไปไว้ที่ `legacy/` เก็บไว้เป็น reference — **ไม่ใช่ product หลักอีกต่อไป**
 
 ---
 
-## โครงสร้างโปรเจกต์
+## โครงสร้างโปรเจกต์ (ใหม่)
 
 ```
 chatgpt-proxy/
-├── cmd/
-│   ├── relay/main.go        # entrypoint relay (env: RELAY_ADDR, AGENT_TOKEN, CLIENT_TOKEN, AGENT_TIMEOUT)
-│   └── agent/main.go        # entrypoint agent (env: RELAY_URL, AGENT_TOKEN, AGENT_NAME, WORKSPACE_ROOT, ALLOW_DELETE)
+├── cmd/proxy/main.go          # entrypoint: -transport stdio|http, -wait-login, -open, -profile
 ├── internal/
-│   ├── mcp/mcp.go           # MCP/JSON-RPC protocol types + helpers (hand-rolled, ไม่ใช้ SDK)
-│   ├── relay/
-│   │   ├── server.go        # MCP Streamable HTTP endpoint + /ws/agent + /healthz
-│   │   └── hub.go           # agent registry (round-robin pick) + tunnel request/response correlation
-│   ├── agent/agent.go       # outbound WS client + tool dispatch + reconnect
-│   └── tools/
-│       ├── tools.go         # aggregate Tools struct + List() + Call() dispatcher
-│       ├── file.go          # read_file, search_text, apply_patch, workspace_list
-│       ├── git.go           # git_status, git_diff, git_log
-│       ├── shell.go         # shell, process_list/start/stop
-│       ├── system.go        # system_info
-│       └── policy.go        # destructive-command denylist
-├── bin/                     # build artifacts (git-ignored)
-└── README.md / docs/        # docs ครบชุด
+│   ├── mcp/mcp.go             # MCP/JSON-RPC types (hand-rolled, ใช้ร่วมกับ legacy)
+│   ├── chatgpt/chatgpt.go     # CDP automation: launch/attach Chrome, login check, Ask, Status
+│   └── server/
+│       ├── server.go          # MCP dispatch + tools (ask_chatgpt, chatgpt_status)
+│       ├── transports.go      # stdio (newline JSON) + Streamable HTTP (POST /mcp)
+│       └── server_test.go     # unit tests (fake chatgpt client)
+├── legacy/                    # relay/agent/tools เก่า + scripts/start-local.sh (อ้างอิง)
+├── bin/                       # build artifacts (git-ignored)
+└── README.md · HANDOFF.md · docs/
 ```
 
 ---
 
-## Verified ✅ (อย่าโม้เกินจริง — นี้คือหลักฐาน)
+## Verified ✅ (หลักฐานจากการ live test จริงวันนี้)
 
-| รายการ | ผล | หลักฐาน |
-|---|---|---|
-| `go build ./...` + `go vet ./...` + `gofmt` | ✅ clean | — |
-| `go test ./...` | ✅ ผ่านทั้งหมด | relay + tools packages |
-| relay ↔ agent tunnel (WS) | ✅ | `TestToolsListAndCall`, `TestInitialize` |
-| policy บล็อก `rm -rf` | ✅ | `TestPolicyBlocksDestructiveShell` |
-| workspace restriction | ✅ | `TestWorkspaceRestriction` |
-| SSE response | ✅ | `TestSSEResponse` |
-| **Live smoke test** (binary จริง) | ✅ | relay :8791 + agent จริง → initialize / tools/list (12 tools) / system_info / บล็อก `rm -rf` / shell echo / apply_patch นอก workspace ถูกปฏิเสธ |
+| รายการ | ผล |
+|---|---|
+| `go build ./...` + `go vet ./...` + `go test ./...` | ✅ clean |
+| `chatgpt_status` ผ่าน Chrome จริง | ✅ `logged_in:true, composer:true` |
+| `ask_chatgpt("1+1?")` | ✅ ตอบ `2` |
+| `ask_chatgpt` เขียน fibonacci (Python) ผ่าน HTTP MCP path | ✅ ได้โค้ดกลับมา |
+| Profile session อยู่ข้ามการรัน | ✅ `~/.chatgpt-proxy/Default/Cookies` (61KB) |
 
-### Bug ที่เจอระหว่าง dev และแก้แล้ว
-1. **`Agent.Stop()` panic `close of nil channel`** — `stopCh`/`done` ไม่ถูก init → แก้ด้วย lazy init ผ่าน `sync.Once` (`agent.go: init()`)
-2. **Agent ส่ง token ผ่าน `Authorization` header แต่ relay เช็คแค่ `?token=` query** → bad handshake → แก้ให้ relay รับได้ทั้งสองแบบ (`server.go: handleAgentWS`)
-3. **`shell` result แสดงเป็น Go struct ดิบ** (`{0 hello-agent }`) → แก้ให้ format เป็น `exit code / stdout / stderr` ใน `tools.go: Call()`
-4. **`workspace_list` root ว่าง (default `.`) ถูก `checkPath` ปฏิเสธ** เมื่อ cwd ของ agent อยู่นอก `WORKSPACE_ROOT` → แก้ให้ default เป็น workspace root ตัวแรกเมื่อตั้งไว้ (`file.go: WorkspaceList`)
-5. **`git_status/diff/log` คืน `isError: false` ทั้งที่ git ล้มเหลว (exit 128)** → แก้ให้ `gitRun` คืน error เมื่อ exit code ≠ 0 (`git.go`)
+### Bug สำคัญที่เจอระหว่าง dev และแก้แล้ว
+
+1. **Deadlock ใน `tabCtx`** — public methods lock `c.mu` แล้ว `tabCtx` lock ซ้ำ (Go mutex ไม่ reentrant) → ค้างตลอด → แก้: `tabCtx` ไม่ lock (caller ถือ lock อยู่แล้ว)
+2. **`attach` ค้างไม่มี timeout** — มี HTTP server แปลกๆ ครอบ port 9222 (ตอบ 404 เปล่า) → `attach` รอค้าง → แก้: timeout 3 วิ + **auto-pick port** (`resolvePort` scan 9222-9231)
+3. **`launch` ซ้ำวน loop** — หลัง launch ครั้งแรก port เป็น busy แล้ว resolvePort เลือก port ใหม่ → launch ซ้ำ → Chrome handoff → เปิด tab chatgpt.com เพิ่มเรื่อยๆ → แก้: `launchAttempted`/`launchPort` cache + poll รอ port ขึ้น 20 วิ ไม่ relaunch
+4. **browser context ผูกกับ request context** — `NewRemoteAllocator(ctx)` ใช้ ctx ของ request แรก → พอ request จบ connection ตาย → แก้: ใช้ `c.life` (background) เป็น parent
+5. **`chromedp` cancel tab context หลัง Run แรก** (ตัวที่ทำให้ `ask_chatgpt` พังเป็นวันๆ) — `Allocate` ผูก teardown กับ context ของ **Run แรก** ซึ่งเป็น `navCtx` (WithTimeout) → พอ Run แรกจบ `defer cancel()` → chromedp เข้าใจว่า "ปิด browser" → ปิด websocket + cancel tab → call ถัดไปได้ `context canceled` → **แก้: no-op `chromedp.Run` บน tab context ทันทีหลัง `NewContext`** เพื่อบังคับ allocation เกิดบน long-lived context
+6. **selector "New chat" ไม่ตรง** — DOM จริงคือ `<a href="/">` (ไม่มี aria-label, ไม่อยู่ใน `#sidebar`) → แก้: selector `a[href="/"]` + text fallback `"New chat"`
 
 ---
 
-## Known limitations / TODO (P0 → P3)
+## Known limitations (P0 → P3)
 
 | Priority | รายการ | หมายเหตุ |
 |---|---|---|
-| **P1** | `GET /mcp` (SSE stream) ยังไม่รองรับ — รองรับแค่ `POST` | MCP client ส่วนใหญ่ (ChatGPT, Cursor) ใช้ POST ได้ แต่ client บางตัวอาจต้องใช้ GET |
-| **P1** | Session เป็นแบบ stateless — ออก `Mcp-Session-Id` แต่ไม่ validate | ใช้ได้จริง แต่ยังไม่ใช่ production-grade |
-| **P1** | ยังไม่มี **rate limiting** บน `/mcp` | จำเป็นก่อนเปิด public |
-| **P2** | Routing เลือก agent แค่แบบ round-robin ตัวแรก | ยังไม่มี concept "client X → agent Y" |
-| **P2** | `apply_patch` แบบ unified diff ต้องพึ่ง binary `patch` บนเครื่อง | fallback เป็น edits (find/replace) ได้เสมอ |
-| **P2** | Relay ไม่มี TLS ในตัว — ต้อง reverse proxy ข้างหน้า (Caddy/Nginx/CF Tunnel) | ตั้งใจไว้แบบนี้อยู่แล้ว (ดู docs/DEPLOYMENT) |
-| **P3** | `process_start` ยังไม่ reap child (zombie) | minor |
-| **P3** | ยังไม่มี logging/observability กลาง | ใช้ stdout ของ process ก่อน |
-
-### Tools ที่ยังไม่มี (จากแรงบันดาลใจที่ใบ้มา — เติมได้ต่อ)
-`office` (Excel/Word) · `clipboard` · `screenshot`/`vision` · `window` (Windows) · `scheduler` (Scheduled Task) · `notification` · `dom_cdp` (ควบคุม Chrome) · `codex_run` (เรียก Codex CLI) · `audio`/`screen_record` · `web_fetch` — วิธีเพิ่ม: ดู `docs/EXTENDING.md`
+| **P0** | HTTP transport ยังไม่มี auth | `stdio` ปลอดภัย (ไม่ bind network) แต่ `-transport http` เปิดใครก็เรียกได้ — ก่อนใช้ข้ามเครื่องต้องมี token |
+| **P1** | `ask_chatgpt` ต่อ conversation (`new_session:false`) ยังไม่ robust | ใช้ได้ แต่ state ขึ้นกับ DOM; default `true` (fresh chat) เป็นเส้นทางที่เสถียร |
+| **P1** | selector อิง DOM ปัจจุบันของ chatgpt.com | OpenAI เปลี่ยน layout เมื่อไหร่ต้อง re-tune (จุดรวม selector อยู่ที่ `internal/chatgpt/chatgpt.go`) |
+| **P2** | ยังไม่มี streaming | คืน text ทั้งก้อนตอนเสร็จ (รอจนครบ) — พอใช้ แต่ latency สูงสำหรับคำตอบยาว |
+| **P2** | `Continue generating` กดได้สูงสุด 3 รอบ | คำตอบยาวมากจะถูกตัด |
+| **P2** | ยังรองรับแค่ macOS Chrome path | Windows/Linux path ใน `findChrome()` มีครบแล้วแต่ยังไม่ test |
+| **P3** | `chrome_port` ใน status report เป็น port ที่ attach ได้จริงแล้ว (actualPort) | แต่ยัง report ค่า default ถ้ายังไม่เคย connect |
 
 ---
 
 ## ขั้นต่อไป (ลำดับแนะนำ)
 
-### Phase 1 — เอาไปใช้จริง
-- [ ] Deploy relay ไป server สาธารณะ + HTTPS (ดู `docs/DEPLOYMENT.md` — มีทั้ง Caddy / fly.io / Cloudflare Tunnel)
-- [ ] รัน agent บนเครื่อง local พร้อม `WORKSPACE_ROOT` + `AGENT_TOKEN`/`CLIENT_TOKEN` แยกกัน
-- [ ] เชื่อม ChatGPT Web → Settings → MCP servers → `https://<relay>/mcp` + Bearer `CLIENT_TOKEN`
-- [ ] ทดสอบ: ขอให้ ChatGPT อ่านไฟล์/ค้นโค้ด/รัน `git status` บนเครื่อง
-
-### Phase 2 — Hardening (ก่อนเปิดให้คนอื่น / เปิด public)
-- [ ] เพิ่ม rate limiting บน `/mcp`
-- [ ] เพิ่ม audit log (ใครเรียก tool อะไร เมื่อไหร่) ฝั่ง relay
-- [ ] รองรับ `GET /mcp` SSE + session validation
-- [ ] ตั้งใจตรวจ policy regex ให้ครอบคลุม (โดยเฉพาะ Windows: `del`, `rmdir`, `format`)
-
-### Phase 3 — เพิ่ม tools / ฟีเจอร์
-- [ ] เพิ่ม tools ตามรายการ "ยังไม่มี" ข้างบน
-- [ ] ระบบ approval: คำสั่งอันตราย → ส่ง notification ให้เจ้าของเครื่อง approve ก่อน execute (แทนการบล็อกทิ้ง)
-- [ ] หลาย agent / หลายเครื่อง ต่อ relay ตัวเดียว เลือก target ได้
+1. **เชื่อม Hermes จริง** — ใส่ command `bin/chatgpt-proxy` (stdio) ลง MCP config ของ Hermes แล้วลองให้ Hermes เรียก `ask_chatgpt`
+2. **Auth สำหรับ HTTP mode** — เพิ่ม optional `-token` / env `PROXY_TOKEN` บน `/mcp`
+3. **เพิ่ม tools** — e.g. `ask_chatgpt_image` (แนบรูป), `chatgpt_new_thread`, หรือ `chatgpt_history`
+4. **re-tune selector** เมื่อ chatgpt.com เปลี่ยน UI (จุดเดียวที่ต้องแก้คือ `internal/chatgpt/chatgpt.go`)
 
 ---
 
-## หมายเหตุสำคัญสำหรับคนรับช่วง
+## หมายเหตุสำคัญ
 
-1. **MCP protocol เป็นแบบ hand-rolled** (`internal/mcp`) — จงใจไม่ใช้ official SDK เพื่อควบคุม wire format และลด dependency ระวังเวลาแก้ต้องเช็คทั้ง 2 ฝั่ง (relay ↔ agent ใช้ JSON-RPC รูปแบบเดียวกัน)
-2. **Policy อยู่ฝั่ง agent เท่านั้น** — ถ้า agent ถูก bypass (โดน hack ฝั่ง local) policy ก็ไร้ผล ต้องเชื่อใจว่าเครื่องที่รัน agent เป็นของเรา
-3. **`CLIENT_TOKEN` ว่าง = `/mcp` ไม่มี auth** — ห้ามลืมตั้งก่อนเปิด public
-4. **Token ทั้งคู่ควรเป็น secret คนละตัว** ไม่ควรใช้ตัวเดียวกัน
-5. ดู `README.md` สำหรับ quick start, `docs/ARCHITECTURE.md` สำหรับ protocol deep-dive
+1. **ใช้ session ส่วนตัวของคุณ** — อย่าเปิด `-transport http` ให้คนอื่นถ้าไม่เพิ่ม auth; `stdio` mode ปลอดภัยโดยปริยาย
+2. **MCP protocol เป็น hand-rolled** (`internal/mcp`) — จงใจไม่ใช้ SDK
+3. **โค้ด legacy** (`legacy/`) ยัง build/test ผ่าน แต่ไม่เกี่ยวกับ product หลัก — จะลบทีหลังก็ได้ (git history เก็บไว้แล้ว)
+4. **`bin/chatgpt-proxy`** คือ binary ใหม่; `bin/relay`/`bin/agent` เป็นของ legacy

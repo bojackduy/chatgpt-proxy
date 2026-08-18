@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"chatgpt-proxy/internal/agent"
-	"chatgpt-proxy/internal/relay"
-	"chatgpt-proxy/internal/tools"
+	"chatgpt-proxy/legacy/internal/agent"
+	"chatgpt-proxy/legacy/internal/relay"
+	"chatgpt-proxy/legacy/internal/tools"
 )
 
 func startTestRelay(t *testing.T) (*httptest.Server, string) {

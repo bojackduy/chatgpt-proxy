@@ -1,123 +1,63 @@
-# chatgpt-proxy — Extending: adding new tools
+# Extending chatgpt-proxy
 
-Adding a tool is a two-step job: **implement it** (in `internal/tools`) and
-**register it** (in `List()` and `Call()`). That's it — the relay and agent
-pick it up automatically because they forward `tools/list` / `tools/call`
-verbatim.
+## Add a new tool
 
-## Step 1 — Implement the tool
+1. **Implement the browser action** in `internal/chatgpt/chatgpt.go` (a new
+   method on `*Client`, e.g. `NewChat`, `AskImage`, `History`), returning
+   plain data + `error`.
+2. **Expose it** in `internal/server/server.go`:
+   - add the name to the `Tool…` consts,
+   - add an entry in `tools()` (name, description, `inputSchema`),
+   - add a case in `callTool` that parses `p.Arguments` and calls the client,
+     returning `mcp.TextResult(...)` or `mcp.ErrorResult(...)`.
+3. **Add a unit test** in `internal/server/server_test.go` using the `fakeCG`
+   scripted client (extend the interface in `server.go` if needed).
+4. Run `gofmt -w internal && go build ./... && go vet ./... && go test ./...`.
 
-Create a file in `internal/tools/` (or add to an existing one). A tool is
-just a method on the `*Tools` struct that returns `(string, error)`:
-
-```go
-// internal/tools/uptime.go
-package tools
-
-import "time"
-
-// UptimeArgs are the arguments of the uptime tool.
-type UptimeArgs struct {
-    // optional fields...
-}
-
-// Uptime reports how long the machine has been running.
-func (t *Tools) Uptime(args UptimeArgs) (string, error) {
-    // ... real implementation ...
-    return time.Since(bootTime).Round(time.Second).String(), nil
-}
-```
-
-Conventions:
-
-- **Arguments**: a struct with `json` tags; decode via the existing
-  `jsonArgs[T]` helper in `Call()`. Empty args struct is fine.
-- **Errors**: return `(string, error)`; `Call()` wraps errors into an
-  `isError: true` tool result automatically.
-- **Safety**: if the tool can do something destructive, gate it on
-  `t.Policy` (see `internal/tools/policy.go`). If it touches the filesystem
-  or runs commands, call `t.checkPath(...)` first so `WORKSPACE_ROOT` is
-  respected.
-- **Reuse**: shell out via `t.Shell(...)` or `execOutput(...)`; read files
-  via `os.ReadFile`; check policy with `t.Policy.CheckShell(...)`.
-
-## Step 2 — Register the tool
-
-Two places in `internal/tools/tools.go`:
-
-### 2a. Add the dispatch case in `Call()`
+Example — a `chatgpt_history` tool that lists recent conversation titles:
 
 ```go
-case "uptime":
-    var a UptimeArgs
-    if a, err = jsonArgs[UptimeArgs](args); err == nil {
-        result, err = t.Uptime(a)
-    }
-```
-
-If the tool takes no arguments, you can skip `jsonArgs`:
-
-```go
-case "uptime":
-    result, err = t.Uptime(UptimeArgs{})
-```
-
-### 2b. Add the definition in `List()`
-
-```go
-{
-    Name:        "uptime",
-    Description: "Report how long the machine has been running.",
-    InputSchema: map[string]any{
-        "type": "object",
-        "properties": map[string]any{},
-    },
-},
-```
-
-`InputSchema` is a standard JSON Schema — describe your arguments so the LLM
-client knows how to call the tool.
-
-## Step 3 — Test it
-
-Add a case to `internal/tools/tools_test.go`:
-
-```go
-func TestUptime(t *testing.T) {
-    tl := NewTools(nil)
-    out, err := tl.Uptime(UptimeArgs{})
-    if err != nil {
-        t.Fatal(err)
-    }
-    if out == "" {
-        t.Error("expected a duration string")
-    }
+// internal/chatgpt/chatgpt.go
+func (c *Client) History(ctx context.Context) ([]string, error) {
+    c.mu.Lock(); defer c.mu.Unlock()
+    tab, err := c.tabCtx(ctx)
+    if err != nil { return nil, err }
+    var raw string
+    js := `JSON.stringify([...document.querySelectorAll('nav a')].map(a => (a.textContent||'').trim()).filter(Boolean))`
+    if err := chromedp.Run(tab, chromedp.Evaluate(js, &raw)); err != nil { return nil, err }
+    var out []string
+    json.Unmarshal([]byte(raw), &out)
+    return out, nil
 }
 ```
 
-Then:
+## Re-tune selectors (when chatgpt.com changes UI)
 
-```bash
-go test ./internal/tools/
-go build ./... && go vet ./...
-```
+All page selectors live in **`internal/chatgpt/chatgpt.go`**. If a step starts
+failing (e.g. "New chat button not found"), dump the live DOM to find the new
+markup. Quick way: run `./bin/chatgpt-proxy -open`, then in DevTools on that
+window inspect the element, and update the selector/JS.
 
-## Tool checklist (before shipping)
+Selector locations:
 
-- [ ] Uses `t.checkPath(...)` if it touches paths / runs commands.
-- [ ] Destructive behavior is gated on `t.Policy` (or clearly documented).
-- [ ] Has a `Description` an LLM can understand, and a correct `InputSchema`.
-- [ ] Registered in **both** `Call()` and `List()`.
-- [ ] Has a unit test.
-
-## Ideas from the original inspiration list
-
-| Tool | Notes |
+| What | Where |
 |---|---|
-| `office` (Excel/Word) | macOS: `osascript`/AppleScript; Windows: COM. |
-| `clipboard` | `pbpaste`/`pbcopy` (macOS), `clip` (Windows). |
-| `screenshot` | `screencapture` (macOS) / PowerShell (Windows). |
-| `notification` | macOS `osascript -e 'display notification'`; Windows toast. |
-| `scheduler` | `crontab` / Windows `schtasks`. |
-| `web_fetch` | `http.Get` in Go — no shell needed. |
-| `codex_run` | Shell out to a local `codex` CLI. |
+| login probe | `probeState` |
+| New chat click | `startNewChat` |
+| type prompt | `typePrompt` |
+| submit | `submit` |
+| wait/read answer | `waitForAnswer` (`stateJS`) |
+
+Keep selectors as simple and text/anchor-based as possible — they survive
+minor redesigns better than deeply-nested `data-testid` chains.
+
+## Tool ideas (from the original inspiration list)
+
+- `ask_chatgpt_image` — attach an image file to the prompt (file input in the
+  composer).
+- `chatgpt_history` — list past conversations.
+- `chatgpt_continue` — resume the last conversation by title.
+- `chatgpt_model` — read/switch the active model via the model picker.
+
+The browser layer already gives you the full page — anything the web UI can do
+is reachable via CDP + a selector.

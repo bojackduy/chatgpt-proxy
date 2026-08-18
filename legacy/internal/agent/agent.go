@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"chatgpt-proxy/internal/mcp"
-	"chatgpt-proxy/internal/tools"
+	"chatgpt-proxy/legacy/internal/tools"
 )
 
 // Agent is the local side of the tunnel.

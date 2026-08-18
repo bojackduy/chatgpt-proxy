@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"chatgpt-proxy/internal/relay"
+	"chatgpt-proxy/legacy/internal/relay"
 )
 
 func main() {

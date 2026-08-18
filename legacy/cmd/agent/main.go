@@ -16,8 +16,8 @@ import (
 	"os"
 	"strings"
 
-	"chatgpt-proxy/internal/agent"
-	"chatgpt-proxy/internal/tools"
+	"chatgpt-proxy/legacy/internal/agent"
+	"chatgpt-proxy/legacy/internal/tools"
 )
 
 func main() {

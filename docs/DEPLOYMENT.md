@@ -1,165 +1,86 @@
-# chatgpt-proxy — Deployment & Connecting ChatGPT
+# Running & connecting agents
 
-This guide walks through getting chatgpt-proxy **actually working** with
-ChatGPT Web, end to end.
-
-## What you need
-
-1. A **public server** (any VPS, or a serverless/container host) — this runs
-   the relay.
-2. A **domain** pointed at that server, with HTTPS (ChatGPT's remote MCP
-   connector refuses plain `http://`).
-3. Your **local machine** — runs the agent (outbound connection only).
-
----
-
-## Step 1 — Build the binaries
+## 1. Build
 
 ```bash
-go build -o bin/relay ./cmd/relay
-go build -o bin/agent ./cmd/agent
+go build -o bin/chatgpt-proxy ./cmd/proxy
 ```
 
-## Step 2 — Deploy the relay
+## 2. First-time login (once)
 
-### Option A: plain VPS + Caddy (simplest, auto-HTTPS)
-
-Install Caddy on the server, then a single `Caddyfile`:
-
+```bash
+./bin/chatgpt-proxy -wait-login
 ```
-relay.example.com {
-    reverse_proxy 127.0.0.1:8080
+
+A Chrome window opens on chatgpt.com using a **dedicated profile**
+(`~/.chatgpt-proxy`) — your normal Chrome is untouched. Log in there once; the
+session persists and every later run reuses it.
+
+> If you ever get signed out, just run `-wait-login` again.
+
+## 3. Run the MCP server
+
+```bash
+# stdio — the default; spawn this from your agent's MCP config
+./bin/chatgpt-proxy
+
+# or HTTP, for remote/non-stdio clients
+./bin/chatgpt-proxy -transport http -addr 127.0.0.1:8787
+```
+
+## 4. Connect an agent
+
+### Hermes Agent (stdio)
+
+Add to your Hermes MCP config (`~/.hermes/` — see `hermes-config-web` for the
+UI) a server pointing at the binary:
+
+```yaml
+mcp_servers:
+  - name: chatgpt
+    command: /absolute/path/to/chatgpt-proxy/bin/chatgpt-proxy
+```
+
+Hermes will spawn it as a stdio subprocess and gain `ask_chatgpt` +
+`chatgpt_status`.
+
+### Claude Desktop (stdio)
+
+In `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "chatgpt": {
+      "command": "/absolute/path/to/bin/chatgpt-proxy"
+    }
+  }
 }
 ```
 
-Run the relay behind it:
+### Any HTTP MCP client
+
+Point it at `http://127.0.0.1:8787/mcp` (SSE transport), or expose it over a
+tunnel/HTTPS if the client is remote.
+
+## 5. Verify
 
 ```bash
-export AGENT_TOKEN="$(openssl rand -hex 24)"
-export CLIENT_TOKEN="$(openssl rand -hex 24)"
-export RELAY_ADDR="127.0.0.1:8080"
-./bin/relay
+# HTTP mode
+curl http://127.0.0.1:8787/healthz
+# → {"ok":true}
+
+curl -X POST http://127.0.0.1:8787/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chatgpt_status","arguments":{}}}'
+# → {"content":[{"type":"text","text":"{\"logged_in\":true,...}"}]}
 ```
 
-Caddy terminates TLS and gives you `https://relay.example.com/mcp`.
+## Security notes
 
-> Save `AGENT_TOKEN` and `CLIENT_TOKEN` somewhere safe — you'll need both.
-
-### Option B: fly.io (serverless-ish, free tier)
-
-Add a `Dockerfile`:
-
-```dockerfile
-FROM golang:1.26 AS build
-WORKDIR /app
-COPY . .
-RUN CGO_ENABLED=0 go build -o /relay ./cmd/relay
-
-FROM alpine
-COPY --from=build /relay /relay
-ENV RELAY_ADDR=:8080
-EXPOSE 8080
-ENTRYPOINT ["/relay"]
-```
-
-```bash
-fly launch --no-deploy
-fly secrets set AGENT_TOKEN=... CLIENT_TOKEN=...
-fly deploy
-```
-
-fly.io gives you an `https://` URL automatically.
-
-### Option C: Cloudflare Tunnel (no public IP needed)
-
-Run the relay on any box (even a free one), then:
-
-```bash
-cloudflared tunnel create chatgpt-proxy
-cloudflared tunnel route dns chatgpt-proxy relay.example.com
-cloudflared tunnel run chatgpt-proxy
-```
-
-> **Quick tunnel (no account, great for testing):** `scripts/start-local.sh`
-> runs relay + agent + a throwaway `https://*.trycloudflare.com` tunnel in
-> one command — perfect for a first ChatGPT Web test.
->
-> ⚠️ **Use `--protocol http2`.** cloudflared's default QUIC transport can be
-> unstable on some networks (tunnel registers but requests never answer).
-> Forcing HTTP/2 over TCP makes the tunnel reliable:
-> `cloudflared tunnel --url http://127.0.0.1:8080 --protocol http2`
-
-with `config.yml`:
-
-```yaml
-tunnel: chatgpt-proxy
-ingress:
-  - hostname: relay.example.com
-    service: http://localhost:8080
-  - service: http_status:404
-```
-
-## Step 3 — Run the agent on your machine
-
-```bash
-export RELAY_URL="wss://relay.example.com/ws/agent"
-export AGENT_TOKEN="<the relay's AGENT_TOKEN>"
-export AGENT_NAME="macbook-pro"
-export WORKSPACE_ROOT="/Users/you/Projects"   # optional, comma-separated for many
-./bin/agent
-```
-
-Expected log:
-
-```
-agent: starting, workspace roots=[...]
-agent: connected to relay wss://relay.example.com/ws/agent
-```
-
-Verify the relay sees you:
-
-```bash
-curl https://relay.example.com/healthz
-# {"ok":true,"agents":1}
-```
-
-## Step 4 — Connect ChatGPT Web
-
-1. Open **ChatGPT** (web at chatgpt.com or the desktop app).
-2. Click your profile → **Settings** → **MCP servers** (or **Connectors**,
-   depending on your ChatGPT version).
-3. **Add server**:
-   - **URL:** `https://relay.example.com/mcp`
-   - **Authentication:** Bearer token → paste `CLIENT_TOKEN`.
-4. ChatGPT should list the 12 tools. Try asking:
-   - *"List the files in my workspace"* → `workspace_list`
-   - *"Search for 'TODO' in my project"* → `search_text`
-   - *"Read src/main.go"* → `read_file`
-   - *"Run git status"* → `git_status`
-
-> If ChatGPT doesn't show the tools, check the relay log for the
-> `tools/list` call and the agent log for `tool call: ...`. Also confirm the
-> URL is `https://` and the Bearer token matches `CLIENT_TOKEN`.
-
-Any other MCP client works identically — Claude Desktop, Cursor, `mcp`
-CLI, etc. just point at the same `/mcp` URL with the same Bearer token.
-
----
-
-## Security checklist (before opening to others)
-
-- [ ] `CLIENT_TOKEN` set (empty = anyone can call `/mcp`).
-- [ ] `AGENT_TOKEN` set and different from `CLIENT_TOKEN`.
-- [ ] Relay behind HTTPS.
-- [ ] `WORKSPACE_ROOT` set on the agent so it can't wander the whole disk.
-- [ ] `ALLOW_DELETE` **not** set (destructive commands stay blocked).
-- [ ] Consider adding rate limiting (TODO, see `HANDOFF.md`).
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `websocket: bad handshake` in agent log | Wrong `AGENT_TOKEN`, or relay not up / wrong port. |
-| `/healthz` shows `agents:0` | Agent not connected; check its log, confirm `RELAY_URL` scheme is `wss://`. |
-| ChatGPT: "could not reach server" | URL must be `https://`; check the domain resolves and TLS works (`curl https://relay.example.com/healthz`). |
-| Tool call times out | Long commands — raise `AGENT_TIMEOUT` on the relay, or pass `timeout_seconds` in `shell`. |
+- **stdio mode binds to nothing** — safe by default.
+- **HTTP mode has no auth yet** (`P0` in HANDOFF). Keep it on loopback
+  (`127.0.0.1`) and only expose it to agents you trust, or put an
+  authenticating reverse proxy in front.
+- This uses **your personal ChatGPT session** — treat any agent that can reach
+  `ask_chatgpt` as being able to chat as you.
