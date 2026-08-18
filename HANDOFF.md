@@ -48,6 +48,8 @@ chatgpt-proxy/
 | `ask_chatgpt("1+1?")` | ✅ ตอบ `2` |
 | `ask_chatgpt` เขียน fibonacci (Python) ผ่าน HTTP MCP path | ✅ ได้โค้ดกลับมา |
 | Profile session อยู่ข้ามการรัน | ✅ `~/.chatgpt-proxy/Default/Cookies` (61KB) |
+| Long Task Code Review (~30KB prompt) | ✅ ได้รีวิวเชิงลึก 28,000+ ตัวอักษร |
+| Background mode (`-background`) | ✅ รัน off-screen/minimized โดยไม่บังจอ |
 
 ### Bug สำคัญที่เจอระหว่าง dev และแก้แล้ว
 
@@ -57,6 +59,12 @@ chatgpt-proxy/
 4. **browser context ผูกกับ request context** — `NewRemoteAllocator(ctx)` ใช้ ctx ของ request แรก → พอ request จบ connection ตาย → แก้: ใช้ `c.life` (background) เป็น parent
 5. **`chromedp` cancel tab context หลัง Run แรก** (ตัวที่ทำให้ `ask_chatgpt` พังเป็นวันๆ) — `Allocate` ผูก teardown กับ context ของ **Run แรก** ซึ่งเป็น `navCtx` (WithTimeout) → พอ Run แรกจบ `defer cancel()` → chromedp เข้าใจว่า "ปิด browser" → ปิด websocket + cancel tab → call ถัดไปได้ `context canceled` → **แก้: no-op `chromedp.Run` บน tab context ทันทีหลัง `NewContext`** เพื่อบังคับ allocation เกิดบน long-lived context
 6. **selector "New chat" ไม่ตรง** — DOM จริงคือ `<a href="/">` (ไม่มี aria-label, ไม่อยู่ใน `#sidebar`) → แก้: selector `a[href="/"]` + text fallback `"New chat"`
+7. **multi-turn (`new_session:false`) composer ยังไม่ render** หลัง Navigate → `typePrompt` fail ทันที → แก้: `typePrompt` poll รอ composer (30 วิ) + เพิ่ม render wait หลัง Navigate ใน `Ask` → verified 3 รอบต่อเนื่องตอบถูก (จำชื่อ "บอส" ได้)
+8. **ProseMirror พิมพ์ช้าค้างเมื่อส่งข้อความยาว (~30KB)** → `execCommand('insertText')` ส่งข้อความใหญ่แล้ว browser ค้าง → แก้: ใช้ synthetic `ClipboardEvent('paste')` ด้วย `DataTransfer` paste ทันที (0ms)
+9. **Event Click บนปุ่มส่งไม่ trigger ใน React** → `btn.click()` ธรรมดา React มองข้าม → แก้: ยิง Event ครบลูป (`pointerdown` ➔ `mousedown` ➔ `mouseup` ➔ `click`)
+10. **False-positive error ใน Prompt ที่มีคำว่า error** → แก้: scope การตรวจ error ในหน้าเว็บให้อยู่เฉพาะ Alert Banners (`[role="alert"]`, `.text-token-text-error`)
+11. **Timeout & Polling สำหรับ Long Task / Reasoning Models** → ปรับ Default Timeout เป็น 10 นาที (600s) และ Polling 10s ระหว่างคิด
+12. **Background Flag (`-background`)** → เปิด Chrome แบบ off-screen (`--window-position=-2400,-2400`, `--start-minimized`) ทำงานข้างหลังเงียบๆ ไม่บังจอและไม่ติด Bot Protection ของ Cloudflare
 
 ---
 
@@ -65,7 +73,6 @@ chatgpt-proxy/
 | Priority | รายการ | หมายเหตุ |
 |---|---|---|
 | **P0** | HTTP transport ยังไม่มี auth | `stdio` ปลอดภัย (ไม่ bind network) แต่ `-transport http` เปิดใครก็เรียกได้ — ก่อนใช้ข้ามเครื่องต้องมี token |
-| **P1** | `ask_chatgpt` ต่อ conversation (`new_session:false`) ยังไม่ robust | ใช้ได้ แต่ state ขึ้นกับ DOM; default `true` (fresh chat) เป็นเส้นทางที่เสถียร |
 | **P1** | selector อิง DOM ปัจจุบันของ chatgpt.com | OpenAI เปลี่ยน layout เมื่อไหร่ต้อง re-tune (จุดรวม selector อยู่ที่ `internal/chatgpt/chatgpt.go`) |
 | **P2** | ยังไม่มี streaming | คืน text ทั้งก้อนตอนเสร็จ (รอจนครบ) — พอใช้ แต่ latency สูงสำหรับคำตอบยาว |
 | **P2** | `Continue generating` กดได้สูงสุด 3 รอบ | คำตอบยาวมากจะถูกตัด |

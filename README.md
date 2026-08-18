@@ -73,7 +73,7 @@ Then Hermes can call `ask_chatgpt` like any other tool.
 |-------------------|---------|---------|------------------------------------------|
 | `prompt`          | string  | —       | **Required.** The prompt to send.        |
 | `new_session`     | boolean | `true`  | Start a fresh conversation each call. Set `false` to continue the previous one. |
-| `timeout_seconds` | number  | `180`   | Max seconds to wait for the answer.      |
+| `timeout_seconds` | number  | `600`   | Max seconds to wait for the answer.      |
 
 ## Flags
 
@@ -86,6 +86,7 @@ Then Hermes can call `ask_chatgpt` like any other tool.
 | `-chrome`        | auto-detected                 | Chrome binary path override                    |
 | `-open`          | —                             | Open Chrome with the profile and exit          |
 | `-wait-login`    | —                             | Open Chrome and poll until logged in, then exit |
+| `-background`    | `false`                       | Run Chrome in background (off-screen/minimized)|
 
 ## API (HTTP mode, for debugging)
 

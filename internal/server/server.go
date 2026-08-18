@@ -193,7 +193,7 @@ func tools() []mcp.Tool {
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "number",
-						"description": "Max seconds to wait for the answer (default 180).",
+						"description": "Max seconds to wait for the answer (default 600).",
 					},
 				},
 				"required": []string{"prompt"},

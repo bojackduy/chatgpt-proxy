@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,13 +23,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
 // Defaults.
 const (
 	DefaultChromePort = 9222
-	DefaultTimeout    = 180 * time.Second
+	DefaultTimeout    = 10 * time.Minute
 	HomePage          = "https://chatgpt.com/"
 )
 
@@ -60,6 +62,7 @@ type Client struct {
 	ChromePort int
 	ProfileDir string
 	ChromePath string // optional override; auto-detected when empty
+	Background bool   // run Chrome window in background (off-screen / minimized)
 
 	mu              sync.Mutex
 	life            context.Context // long-lived parent for browser/tab contexts
@@ -78,7 +81,12 @@ func New(port int, profileDir, chromePath string) *Client {
 		port = DefaultChromePort
 	}
 	if profileDir == "" {
-		profileDir = filepath.Join(os.Getenv("HOME"), ".chatgpt-proxy")
+		dir, err := os.UserHomeDir()
+		if err == nil && dir != "" {
+			profileDir = filepath.Join(dir, ".chatgpt-proxy")
+		} else {
+			profileDir = ".chatgpt-proxy"
+		}
 	}
 	return &Client{ChromePort: port, ProfileDir: profileDir, ChromePath: chromePath,
 		life: context.Background()}
@@ -225,8 +233,15 @@ func (c *Client) launch(ctx context.Context, port int) error {
 		"--no-default-browser-check",
 		"--disable-session-crashed-bubble",
 		"--disable-features=Translate",
-		HomePage,
 	}
+	if c.Background {
+		args = append(args,
+			"--window-position=-2400,-2400",
+			"--window-size=1280,800",
+			"--start-minimized",
+		)
+	}
+	args = append(args, HomePage)
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -263,12 +278,23 @@ func (c *Client) tabCtx(ctx context.Context) (context.Context, error) {
 		if err := c.ensureBrowser(ctx); err != nil {
 			return nil, err
 		}
-		c.tab, c.tabDone = chromedp.NewContext(c.browser)
-		// Force browser allocation on the long-lived tab context. chromedp
-		// binds the browser teardown (Cancel + websocket close) to the context
-		// passed to the FIRST Run. If that first Run used a short-lived
-		// timeout context, the connection would be torn down as soon as the
-		// call finished — killing every later call.
+		// Look for an existing chatgpt.com page target before creating a blank one
+		infos, err := chromedp.Targets(c.browser)
+		var targetID target.ID
+		if err == nil {
+			for _, info := range infos {
+				if info.Type == "page" && strings.Contains(info.URL, "chatgpt.com") {
+					targetID = info.TargetID
+					break
+				}
+			}
+		}
+		if targetID != "" {
+			c.tab, c.tabDone = chromedp.NewContext(c.browser, chromedp.WithTargetID(targetID))
+		} else {
+			c.tab, c.tabDone = chromedp.NewContext(c.browser)
+		}
+		// Force browser allocation on the long-lived tab context.
 		if err := chromedp.Run(c.tab, chromedp.ActionFunc(func(context.Context) error { return nil })); err != nil {
 			return nil, fmt.Errorf("alloc: %w", err)
 		}
@@ -369,39 +395,68 @@ func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeou
 		return "", err
 	}
 
-	// 1. Load the app. All chromedp runs must use the tab context (or a
-	//    child of it) — a plain context has no chromedp state.
-	navCtx, cancel := context.WithTimeout(tab, 45*time.Second)
-	defer cancel()
-	if err := chromedp.Run(navCtx, chromedp.Navigate(HomePage)); err != nil {
-		return "", fmt.Errorf("navigate: %w", err)
-	}
-
-	// 2. New chat when requested.
+	// 1. If starting a new session, navigate to HomePage
 	if newSession {
-		if err := c.startNewChat(ctx, tab); err != nil {
-			return "", err
+		log.Printf("[chatgpt] starting fresh session at %s", HomePage)
+		navCtx, cancel := context.WithTimeout(tab, 45*time.Second)
+		defer cancel()
+		if err := chromedp.Run(navCtx, chromedp.Navigate(HomePage)); err != nil {
+			return "", fmt.Errorf("navigate: %w", err)
 		}
 	}
 
+	// 2. Wait up to 30s for the SPA to finish loading & hydrating
+	log.Printf("[chatgpt] waiting for page ready...")
+	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
+		return "", err
+	}
+
 	// 3. Type the prompt.
+	log.Printf("[chatgpt] typing prompt (%d bytes)...", len(prompt))
 	if err := c.typePrompt(ctx, tab, prompt); err != nil {
 		return "", err
 	}
 
 	// 4. Submit.
+	log.Printf("[chatgpt] submitting prompt...")
 	if err := c.submit(ctx, tab); err != nil {
 		return "", err
 	}
 
 	// 5. Wait for the answer.
+	log.Printf("[chatgpt] waiting for answer (timeout: %v)...", timeout)
 	return c.waitForAnswer(ctx, tab, timeout)
+}
+
+func (c *Client) waitPageReady(ctx context.Context, tab context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		checkCtx, cancel := context.WithTimeout(tab, 3*time.Second)
+		var ready bool
+		js := `(() => {
+		  if (document.readyState !== 'complete') return false;
+		  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea');
+		  if (!el) return false;
+		  const rect = el.getBoundingClientRect();
+		  return rect.width > 0 && rect.height > 0;
+		})()`
+		_ = chromedp.Run(checkCtx, chromedp.Evaluate(js, &ready))
+		cancel()
+		if ready {
+			// Grace period for React hydration / event listener attachment
+			time.Sleep(2 * time.Second)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return ErrNoComposer
 }
 
 func (c *Client) startNewChat(ctx context.Context, tab context.Context) error {
 	clickCtx, cancel := context.WithTimeout(tab, 20*time.Second)
 	defer cancel()
 	clickJS := `(() => {
+	  if (location.pathname === '/' || location.pathname === '') return true;
 	  const sels = ['a[aria-label="New chat"]', 'button[aria-label="New chat"]', 'a[href="/"]'];
 	  for (const sel of sels) {
 	    const el = document.querySelector(sel);
@@ -410,39 +465,62 @@ func (c *Client) startNewChat(ctx context.Context, tab context.Context) error {
 	  const all = [...document.querySelectorAll('a, button')];
 	  const el = all.find(e => (e.textContent || '').trim().replace(/\s+/g, ' ') === 'New chat');
 	  if (el) { el.click(); return true; }
-	  return false;
+	  location.href = 'https://chatgpt.com/';
+	  return true;
 	})()`
 	var ok bool
 	if err := chromedp.Run(clickCtx, chromedp.Evaluate(clickJS, &ok)); err != nil {
 		return fmt.Errorf("new chat: %w", err)
 	}
-	if !ok {
-		// Might already be on a fresh chat (no sidebar button on empty state).
-		checkCtx, cancel2 := context.WithTimeout(tab, 10*time.Second)
-		defer cancel2()
-		var hasComposer bool
-		_ = chromedp.Run(checkCtx, chromedp.Evaluate(
-			`!!document.querySelector('#prompt-textarea')`, &hasComposer))
-		if hasComposer {
-			return nil
-		}
-		return ErrNoNewChat
-	}
-	// Give the SPA a beat to reset the conversation.
-	time.Sleep(1200 * time.Millisecond)
-	return nil
+	// Wait for composer to be ready on the fresh session
+	return c.waitPageReady(ctx, tab, 20*time.Second)
 }
 
 func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt string) error {
+	// Wait for the composer to render — after a Navigate the SPA can take a
+	// moment, and failing immediately breaks follow-ups (new_session=false).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		checkCtx, cancel := context.WithTimeout(tab, 5*time.Second)
+		var ready bool
+		err := chromedp.Run(checkCtx, chromedp.Evaluate(
+			`!!(document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea'))`, &ready))
+		cancel()
+		if err == nil && ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			return ErrNoComposer
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Use ClipboardEvent paste with DataTransfer for instant, non-blocking
+	// insertion in modern ProseMirror contenteditable (especially for large prompts),
+	// with fallbacks for standard textarea and execCommand.
 	typeCtx, cancel := context.WithTimeout(tab, 30*time.Second)
 	defer cancel()
-	// execCommand('insertText') is the most reliable way to set a
-	// contenteditable the way React expects (fires input events).
 	js := fmt.Sprintf(`(() => {
 	  const t = %s;
 	  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea');
 	  if (!el) return false;
 	  el.focus();
+	  try {
+	    const dt = new DataTransfer();
+	    dt.setData('text/plain', t);
+	    const pasteEvent = new ClipboardEvent('paste', {
+	      bubbles: true,
+	      cancelable: true,
+	      clipboardData: dt
+	    });
+	    el.dispatchEvent(pasteEvent);
+	    return true;
+	  } catch (e) {}
+	  if (el.tagName === 'TEXTAREA') {
+	    el.value = t;
+	    el.dispatchEvent(new Event('input', { bubbles: true }));
+	    return true;
+	  }
 	  document.execCommand('insertText', false, t);
 	  return true;
 	})()`, strconv.Quote(prompt))
@@ -457,20 +535,30 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 }
 
 func (c *Client) submit(ctx context.Context, tab context.Context) error {
-	// Prefer the send button; fall back to the Enter key.
-	clickCtx, cancel := context.WithTimeout(tab, 8*time.Second)
-	defer cancel()
-	js := `(() => {
-	  const btn = document.querySelector('[data-testid="send-button"]');
-	  if (btn && !btn.disabled) { btn.click(); return true; }
-	  return false;
-	})()`
-	var clicked bool
-	_ = chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
-	if clicked {
-		return nil
+	// Wait up to 5s for the send button to become enabled after typing/pasting.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		clickCtx, cancel := context.WithTimeout(tab, 2*time.Second)
+		var clicked bool
+		js := `(() => {
+		  const btn = document.querySelector('[data-testid="send-button"]');
+		  if (btn && !btn.disabled) {
+		    btn.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+		    btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+		    btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+		    btn.click();
+		    return true;
+		  }
+		  return false;
+		})()`
+		_ = chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
+		cancel()
+		if clicked {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	keyCtx, cancel2 := context.WithTimeout(tab, 8*time.Second)
+	keyCtx, cancel2 := context.WithTimeout(tab, 5*time.Second)
 	defer cancel2()
 	return chromedp.Run(keyCtx, chromedp.KeyEvent("\r"))
 }
@@ -492,11 +580,18 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 	    const md = m.querySelector('.markdown');
 	    last = (md || m).innerText || '';
 	  }
-	  const bodyText = document.body ? document.body.innerText : '';
+	  if (!last) {
+	    const allMd = document.querySelectorAll('.markdown');
+	    if (allMd.length > 1) {
+	      last = allMd[allMd.length - 1].innerText || '';
+	    }
+	  }
+	  const alertEl = q('[role="alert"], [data-testid="error-notification"], .text-token-text-error');
+	  const alertText = alertEl ? (alertEl.innerText || '') : '';
 	  return {
 	    stopBtn: !!q('[data-testid="stop-button"]'),
 	    continueBtn: !!q('[data-testid="continue-generate-button"]'),
-	    errorText: bodyText.includes('Something went wrong') || bodyText.includes('There was an error'),
+	    errorText: alertText.includes('Something went wrong') || alertText.includes('There was an error'),
 	    lastAssistant: last,
 	  };
 	})())`
@@ -515,13 +610,14 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 		if err := json.Unmarshal([]byte(raw), &st); err != nil {
 			return "", fmt.Errorf("poll decode: %w", err)
 		}
+		log.Printf("[chatgpt] poll: stop=%v, cont=%v, err=%v, len=%d", st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last))
 
 		if st.ErrorText && st.Last == "" {
 			return "", errors.New("chatgpt reported an error on the page")
 		}
 		if st.StopBtn {
 			stablePolls = 0
-			time.Sleep(time.Second)
+			time.Sleep(10 * time.Second)
 			continue
 		}
 		if st.ContinueBtn && st.Last != "" && st.Last == lastText {
@@ -533,7 +629,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 			_ = chromedp.Run(clickCtx, chromedp.Evaluate(
 				`document.querySelector('[data-testid="continue-generate-button"]')?.click()`, nil))
 			cancel()
-			time.Sleep(1500 * time.Millisecond)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		if st.Last == lastText && st.Last != "" {
@@ -545,7 +641,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 			lastText = st.Last
 			stablePolls = 0
 		}
-		time.Sleep(time.Second)
+		time.Sleep(5 * time.Second)
 	}
 	if lastText != "" {
 		return strings.TrimSpace(lastText), nil
