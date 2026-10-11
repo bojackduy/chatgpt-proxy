@@ -372,8 +372,23 @@ Unset (or any other value) keeps today's shared-project behavior byte-for-byte.
 - State gains one field per session (`Project`, the project URL) in
   `~/.chatgpt-proxy/openai-sessions.json`; old state files load unchanged.
 
-### Logs, readiness and repair
+### Parallelism (one browser, strictly serial turns)
 
+Two opencode sessions via the model never interleave: the adapter holds an
+in-process gate for the whole turn, so concurrent requests queue (a long
+turn head-of-line-blocks the rest — `/readyz` 503s while a turn owns the
+gate). The MCP server is a separate process on the same Chrome, so both
+binaries additionally hold a cross-process file lock
+(`<profile>/bridge.lock`, `internal/chatgpt/turnlock.go`) for whole turns —
+an MCP ask landing mid-turn waits instead of mixing navigate/type/poll
+across tabs. Pure read-only endpoints (`/healthz`, `/v1/models`) take
+neither lock; `/readyz` takes the gate only; every browser-driving path
+(turns, recover, resync, MCP ask/status) holds both. True parallel
+generations are intentionally serialized by the current implementation,
+not proven impossible for one account or browser. Server-side overlap limits
+remain unverified; see the gated multi-tab proposal in [BACKLOG.md](BACKLOG.md).
+
+### Logs, readiness and repair
 ```sh
 curl -s http://127.0.0.1:8788/healthz
 curl -s http://127.0.0.1:8788/readyz

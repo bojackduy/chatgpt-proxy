@@ -1,5 +1,34 @@
 # Backlog
 
+## Genuine concurrent generations (proposal only)
+
+**Status:** deferred; not implemented. Current adapter and cross-process
+profile locks intentionally serialize whole turns. One browser/account is
+not evidence that concurrent generation is impossible; account/server limits
+are unverified.
+
+**Gate first:** run a live two-tab overlapping-generation probe on the same
+account. Record submission, generation-start and completion timestamps, prove
+overlap rather than two queued requests, and observe rate limits/interruption.
+Do not enable concurrency unless this probe succeeds.
+
+**Proposed ownership and locking:**
+- One adapter process owns generation orchestration, with a dedicated owned
+  tab per active session and a small configurable tab pool (default size 2).
+  Concurrency remains flag-gated/off initially.
+- Per-session turn/recovery locks serialize duplicate requests, recovery and
+  resync within a session; different sessions may generate independently.
+- Hold only short state-persistence and browser initialization/reconnection/
+  project-setup locks. Replace the profile-wide whole-generation lock only
+  after tab ownership and overlap behavior are proven safe.
+- MCP uses its own owned tabs and must never adopt or navigate adapter tabs.
+
+**Acceptance before rollout:** timestamped overlap; prompt/answer and thread/
+project isolation; canceling one request does not stop the other; duplicate
+and recovery safety within each session; restart-safe persistence without
+lost updates; pool exhaustion queues safely; reconnect retains ownership;
+MCP asks/status cannot steal adapter tabs. Keep serial mode as fallback.
+
 ## Project-per-session (1 OpenCode session → 1 ChatGPT Project)
 
 **Status:** IMPLEMENTED flag-gated default-off on 2026-10-10
