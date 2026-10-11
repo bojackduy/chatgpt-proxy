@@ -5,9 +5,39 @@ import (
 	"errors"
 	"fmt"
 	"github.com/chromedp/chromedp"
+	"log"
 	"strings"
 	"time"
 )
+
+// firstDiffByte returns the first byte offset at which a and b differ,
+// or min(len) when one is a prefix of the other. Evidence-only helper for
+// the adoption user-bubble comparison above.
+func firstDiffByte(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// windowAt returns ±40 bytes around off for mismatch evidence logging.
+func windowAt(s string, off int) string {
+	lo := off - 40
+	if lo < 0 {
+		lo = 0
+	}
+	hi := off + 40
+	if hi > len(s) {
+		hi = len(s)
+	}
+	return s[lo:hi]
+}
 
 // ReadThreadTurn only reads an existing finished turn. It validates against
 // the RENDERED page (the same representation the bridge normally extracts)
@@ -69,8 +99,27 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	normSpace := func(s string) string {
 		return strings.Join(strings.Fields(s), " ")
 	}
-	if corr.User == "" || corr.User != normSpace(prompt) {
-		return TurnResult{}, fmt.Errorf("stored user prompt does not exactly match original request (rendered %dB want %dB)", len(corr.User), len(normSpace(prompt)))
+	want := normSpace(prompt)
+	// ChatGPT collapses long user bubbles with a trailing expander whose
+	// label leaks into innerText (proven live: a byte-identical 1068B prompt
+	// rendered as 1082B with a 14B " … Show more" suffix). Strip one trailing
+	// occurrence before comparing — a submitted prompt never contains it, so
+	// the binding to this exact turn stays intact.
+	userText := corr.User
+	for _, suffix := range []string{" … Show more", " … Show less", "... Show more", "... Show less"} {
+		if strings.HasSuffix(userText, suffix) {
+			userText = strings.TrimSuffix(userText, suffix)
+			break
+		}
+	}
+	if userText == "" || userText != want {
+		// Evidence for the inevitable near-miss: log WHERE the rendered
+		// bubble first diverges (byte offset + surrounding windows) so the
+		// transform can be identified instead of guessed. Still fails
+		// closed — this changes no decision, only debuggability.
+		off := firstDiffByte(userText, want)
+		log.Printf("[chatgpt] adoption user-bubble mismatch rendered=%dB want=%dB diffoff=%d renderedctx=%q wantctx=%q", len(userText), len(want), off, windowAt(userText, off), windowAt(want, off))
+		return TurnResult{}, fmt.Errorf("stored user prompt does not exactly match original request (rendered %dB want %dB)", len(userText), len(want))
 	}
 	if !corr.AnswerNext {
 		return TurnResult{}, errors.New("current response is not finished and nonempty")

@@ -35,12 +35,13 @@ type Chatgpt interface {
 
 // Handler dispatches JSON-RPC requests to the ChatGPT-backed tools.
 type Handler struct {
-	cg Chatgpt
+	cg         Chatgpt
+	profileDir string // Chrome profile dir; scopes the cross-process turn lock
 }
 
 // NewHandler builds a Handler.
-func NewHandler(cg Chatgpt) *Handler {
-	return &Handler{cg: cg}
+func NewHandler(cg Chatgpt, profileDir string) *Handler {
+	return &Handler{cg: cg, profileDir: profileDir}
 }
 
 // Handle processes one JSON-RPC request and returns the response bytes, or
@@ -132,6 +133,14 @@ func (h *Handler) askChatgpt(ctx context.Context, args json.RawMessage) mcp.Tool
 		timeout = chatgpt.DefaultTimeout
 	}
 
+	// Cross-process turn lock: the :8788 adapter drives the same Chrome
+	// from another process. Read-only probes skip it; whole turns hold it.
+	unlock, err := chatgpt.LockTurn(ctx, h.profileDir)
+	if err != nil {
+		return mcp.ErrorResult("bridge busy: " + err.Error())
+	}
+	defer unlock()
+
 	text, err := h.cg.Ask(ctx, a.Prompt, newSession, timeout)
 	if err != nil {
 		return mcp.ErrorResult(agentMessage(err))
@@ -140,6 +149,12 @@ func (h *Handler) askChatgpt(ctx context.Context, args json.RawMessage) mcp.Tool
 }
 
 func (h *Handler) status(ctx context.Context) mcp.ToolResult {
+	unlock, err := chatgpt.LockTurn(ctx, h.profileDir)
+	if err != nil {
+		return mcp.ErrorResult("bridge busy: " + err.Error())
+	}
+	defer unlock()
+
 	st, err := h.cg.Status(ctx)
 	if err != nil {
 		return mcp.ErrorResult(agentMessage(err))

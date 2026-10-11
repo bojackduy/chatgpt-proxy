@@ -32,7 +32,21 @@
     const source = md || body;
     if (source) {
       const clone = source.cloneNode(true);
-      for (const e of clone.querySelectorAll('button, [role="toolbar"], [hidden], [aria-hidden="true"], script, style, [data-markdown-copy="exclude"], [data-testid="thought-block"], [data-thinking]')) e.remove();
+      // Language labels live in the code header, which the cleanup below
+      // removes as toolbar UI — capture them first, keyed by wrapper. The
+      // current renderer carries no language-* class on <code>; the header
+      // label (TypeScript/Bash/JSON/…) or .cm-content[data-language] is the
+      // only source. Validation keeps stray toolbar text out of the fence.
+      const blockLang = new WeakMap();
+      for (const w of clone.querySelectorAll('[data-markdown-copy="code-block"], [data-d-component="code-block"]')) {
+        const cm = w.querySelector('.cm-content[data-language]');
+        const cmLang = cm && cm.getAttribute('data-language');
+        if (cmLang && /^[\w#+.-]{1,20}$/.test(cmLang)) { blockLang.set(w, cmLang.toLowerCase()); continue; }
+        const labelEl = w.querySelector('[data-markdown-copy="exclude"] .truncate');
+        const first = ((labelEl && labelEl.textContent) || '').trim().split(/\s+/)[0] || '';
+        if (/^[\w#+.-]{1,20}$/.test(first)) blockLang.set(w, first.toLowerCase());
+      }
+      for (const e of clone.querySelectorAll('button, [role="toolbar"], [hidden], [aria-hidden="true"], script, style, [data-markdown-copy="exclude"], [data-testid="thought-block"], [data-thinking], [data-d-component="badge"]')) e.remove();
       // Serialize only this answer, never page HTML. textContent decodes escaped
       // literal protocol tags without ever interpreting them as HTML elements.
       const ticks = raw => '`'.repeat(Math.max(0, ...(raw.match(/`+/g) || []).map(s => s.length)) + 1);
@@ -47,13 +61,28 @@
         if (tag === 'PRE' || e.matches('[data-markdown-copy="code-block"], [data-d-component="code-block"]')) {
           // Process the outer wrapper once; code text retains indentation and JSON.
           const code = e.querySelector('code');
-          const raw = (code || e).textContent;
-          const lang = /(?:^|\s)language-([\w.+-]+)/.exec(code?.className || '');
+          // CodeMirror renders one .cm-line div per line with no newline text
+          // between them, so plain textContent glues lines together — rejoin.
+          const cm = e.querySelectorAll('.cm-content .cm-line');
+          const raw = cm.length
+            ? [...cm].map(l => l.textContent).join('\n')
+            : (code || e).textContent;
+          const clsLang = /(?:^|\s)language-([\w.+-]+)/.exec(code?.className || '');
+          const cmLang = e.querySelector('.cm-content[data-language]')?.getAttribute('data-language');
+          const wrap = e.closest('[data-markdown-copy="code-block"], [data-d-component="code-block"]');
+          const lang = clsLang ? clsLang[1] : (cmLang || (wrap && blockLang.get(wrap)) || '');
           const fence = '`'.repeat(Math.max(3, ticks(raw).length));
-          codeBlocks.push(fence + (lang ? lang[1] : '') + '\n' + raw + (raw.endsWith('\n') ? '' : '\n') + fence);
+          codeBlocks.push(fence + lang + '\n' + raw + (raw.endsWith('\n') ? '' : '\n') + fence);
           return block('\u0000CODE' + (codeBlocks.length - 1) + '\u0000');
         }
         if (tag === 'CODE') {
+          // Div-rendered block code without <pre> (whitespace-pre pane): fence
+          // it instead of collapsing newlines into an inline span.
+          if (!e.closest('pre') && e.textContent.includes('\n')) {
+            const raw = e.textContent, fence = ticks(raw), fence3 = '`'.repeat(Math.max(3, fence.length));
+            codeBlocks.push(fence3 + '\n' + raw + (raw.endsWith('\n') ? '' : '\n') + fence3);
+            return block('\u0000CODE' + (codeBlocks.length - 1) + '\u0000');
+          }
           const raw = e.textContent.replace(/\n/g, ' '), fence = ticks(raw);
           const pad = /^`|`$/.test(raw) || (/^ .* $/.test(raw) && /\S/.test(raw)) ? ' ' : '';
           return fence + pad + raw + pad + fence;
@@ -81,8 +110,8 @@
         const value = children(e, cell);
         if (/^H[1-6]$/.test(tag)) return block('#'.repeat(Number(tag[1])) + ' ' + value.trim());
         if (tag === 'BLOCKQUOTE') return block(value.trim().replace(/\n{3,}/g, '\n\n').split('\n').map(s => '> ' + s).join('\n'));
-        if (tag === 'STRONG' || tag === 'B') return '**' + value + '**';
-        if (tag === 'EM' || tag === 'I') return '*' + value + '*';
+        if (tag === 'STRONG' || tag === 'B' || e.hasAttribute('data-d-default-strong')) return '**' + value + '**';
+        if (tag === 'EM' || tag === 'I' || e.getAttribute('data-d-font-style') === 'italic') return '*' + value + '*';
         if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') return '~~' + value + '~~';
         if (tag === 'A') {
           const href = e.getAttribute('href');

@@ -44,7 +44,7 @@ func run() error {
 	cg := chatgpt.New(*port, *profile, *chrome)
 	cg.Background, cg.DedicatedTab = *background, true
 	defer cg.Close()
-	h := &handler{client: cg, model: *model, maxChars: *maxChars, forceThinking: *thinking, statePath: *state, gate: make(chan struct{}, 1)}
+	h := &handler{client: cg, model: *model, maxChars: *maxChars, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
 	if err := h.load(); err != nil {
 		return err
 	}
@@ -148,6 +148,7 @@ type handler struct {
 	model         string
 	maxChars      int
 	statePath     string
+	profileDir    string // Chrome profile dir; scopes the cross-process turn lock
 	forceThinking bool
 	gate          chan struct{} // serializes browser transactions and all state access; cancellation-aware
 	sessions      map[string]*session
@@ -465,8 +466,33 @@ func toolPrompt(req completionsRequest) string {
 		return "No functions available. Do not emit opencode_bridge_call wrappers.\n"
 	}
 	b, _ := json.Marshal(req.Tools)
-	choice, _ := json.Marshal(req.ToolChoice)
-	return toolPreamble + string(b) + "\nTool choice for THIS turn: " + string(choice) + " (none forbids calls; required requires a call; named function requires that function).\n"
+	return toolPreamble + string(b) + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
+}
+
+// toolChoiceText renders req.ToolChoice the way the model must read it. A
+// missing or JSON-null choice is AUTO (the OpenAI default): the model decides
+// per turn. Pasting the raw `null` misleads it into refusing every call with
+// "tool execution is disabled (tool choice: null)" — seen live — so auto is
+// spelled out with explicit permission to call.
+func toolChoiceText(choice any) string {
+	if choice == nil {
+		return "auto (call a function when it helps, otherwise answer directly)"
+	}
+	if s, ok := choice.(string); ok {
+		switch strings.ToLower(s) {
+		case "auto":
+			return "auto (call a function when it helps, otherwise answer directly)"
+		case "none":
+			return "none (do NOT call any function this turn; answer directly)"
+		case "required":
+			return "required (you MUST output an opencode_bridge_call wrapper this turn)"
+		}
+		return s
+	}
+	if b, err := json.Marshal(choice); err == nil {
+		return string(b) + " (you MUST call that named function via an opencode_bridge_call wrapper this turn)"
+	}
+	return "auto (call a function when it helps, otherwise answer directly)"
 }
 
 // toolReminder is the compact per-turn pointer used once a thread already
@@ -481,8 +507,7 @@ func toolReminder(req completionsRequest) string {
 	for _, t := range req.Tools {
 		names = append(names, t.Function.Name)
 	}
-	choice, _ := json.Marshal(req.ToolChoice)
-	return "External functions already taught earlier in this thread (same <opencode_bridge_call>{\"name\":...,\"arguments\":{...}} format, never fenced, arguments a JSON object, no prose with calls). Available now: " + strings.Join(names, ", ") + "\nTool choice for THIS turn: " + string(choice) + ".\n"
+	return "External functions already taught earlier in this thread (same <opencode_bridge_call>{\"name\":...,\"arguments\":{...}} format, never fenced, arguments a JSON object, no prose with calls). Available now: " + strings.Join(names, ", ") + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
 }
 
 // toolsFingerprint identifies the exact tool set, so a changed set is
@@ -507,8 +532,7 @@ const historyEnd = "END HISTORY UPDATE\n"
 const turnIntro = "\nConversation messages for this turn (JSON; system/developer instructions guide your response):\n"
 
 func answerInstruction(req completionsRequest) string {
-	choiceJSON, _ := json.Marshal(req.ToolChoice)
-	return "\nNow produce the next assistant reply for the external client. Tool choice: " + string(choiceJSON) + ". A required/named tool means output the opencode_bridge_call JSON wrapper now, as TEXT for external execution.\n"
+	return "\nNow produce the next assistant reply for the external client. Tool choice: " + toolChoiceText(req.ToolChoice) + ". A required/named tool means output the opencode_bridge_call JSON wrapper now, as TEXT for external execution.\n"
 }
 
 // turn is one ChatGPT submission: a bounded prompt (and its attachments) plus
@@ -838,6 +862,15 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.release()
+	// Cross-process turn lock (after the in-process gate — always this
+	// order): the MCP server drives the same Chrome from another process.
+	unlock, err := chatgpt.LockTurn(r.Context(), h.profileDir)
+	if err != nil {
+		log.Printf("[openai] turn lock: %v", err)
+		apiError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	defer unlock()
 	if h.sessions == nil {
 		h.sessions = map[string]*session{}
 	}

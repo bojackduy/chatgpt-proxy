@@ -96,7 +96,7 @@ func run() error {
 	}
 
 	log.SetOutput(os.Stderr)
-	h := server.NewHandler(cg)
+	h := server.NewHandler(cg, *profile)
 
 	switch *transport {
 	case "stdio":

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+
+	"chatgpt-proxy/internal/chatgpt"
 )
 
 // An explicit resync keeps uncertainty until a NEW user request arrives.
@@ -34,6 +36,13 @@ func (h *handler) resyncSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.release()
+	unlock, err := chatgpt.LockTurn(r.Context(), h.profileDir)
+	if err != nil {
+		log.Printf("[openai] turn lock: %v", err)
+		apiError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	defer unlock()
 	s := h.sessions[id]
 	if s == nil || !s.Dirty || s.URL == "" || !prefix(input.Messages, s.Messages) {
 		apiError(w, 409, errors.New("resync must extend the recorded uncertain session transcript"))

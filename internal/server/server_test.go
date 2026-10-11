@@ -45,7 +45,7 @@ func call(t *testing.T, h *Handler, body string) *mcp.Response {
 }
 
 func TestInitialize(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
 	if resp.Error != nil {
 		t.Fatalf("unexpected error: %+v", resp.Error)
@@ -63,7 +63,7 @@ func TestInitialize(t *testing.T) {
 }
 
 func TestToolsList(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	if resp.Error != nil {
 		t.Fatalf("unexpected error: %+v", resp.Error)
@@ -85,7 +85,7 @@ func TestToolsList(t *testing.T) {
 
 func TestAskChatgptSuccess(t *testing.T) {
 	f := &fakeCG{askText: "hello from chatgpt"}
-	h := NewHandler(f)
+	h := NewHandler(f, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_chatgpt","arguments":{"prompt":"say hi"}}}`)
 	if resp.Error != nil {
 		t.Fatalf("unexpected error: %+v", resp.Error)
@@ -106,7 +106,7 @@ func TestAskChatgptSuccess(t *testing.T) {
 }
 
 func TestAskChatgptEmptyPrompt(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ask_chatgpt","arguments":{"prompt":"  "}}}`)
 	if resp.Error != nil {
 		t.Fatalf("unexpected rpc error: %+v", resp.Error)
@@ -125,7 +125,7 @@ func TestAskChatgptEmptyPrompt(t *testing.T) {
 
 func TestAskChatgptNotLoggedIn(t *testing.T) {
 	f := &fakeCG{askErr: chatgpt.ErrNotLoggedIn}
-	h := NewHandler(f)
+	h := NewHandler(f, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ask_chatgpt","arguments":{"prompt":"hi"}}}`)
 	var res mcp.ToolResult
 	if err := json.Unmarshal(resp.Result, &res); err != nil {
@@ -141,7 +141,7 @@ func TestAskChatgptNotLoggedIn(t *testing.T) {
 
 func TestStatus(t *testing.T) {
 	f := &fakeCG{status: &chatgpt.Status{LoggedIn: true, Composer: true}}
-	h := NewHandler(f)
+	h := NewHandler(f, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"chatgpt_status","arguments":{}}}`)
 	if resp.Error != nil {
 		t.Fatalf("unexpected error: %+v", resp.Error)
@@ -156,7 +156,7 @@ func TestStatus(t *testing.T) {
 }
 
 func TestUnknownMethod(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	resp := call(t, h, `{"jsonrpc":"2.0","id":7,"method":"bogus/method"}`)
 	if resp.Error == nil {
 		t.Fatal("expected rpc error")
@@ -167,7 +167,7 @@ func TestUnknownMethod(t *testing.T) {
 }
 
 func TestNotificationNoResponse(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	out := h.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
 	if out != nil {
 		t.Errorf("expected nil for notification, got %s", out)
@@ -176,7 +176,7 @@ func TestNotificationNoResponse(t *testing.T) {
 
 func TestHTTPPostSSE(t *testing.T) {
 	f := &fakeCG{status: &chatgpt.Status{LoggedIn: true}}
-	h := NewHandler(f)
+	h := NewHandler(f, t.TempDir())
 	srv := httptest.NewServer(h.NewHTTPHandler())
 	defer srv.Close()
 
@@ -202,7 +202,7 @@ func TestHTTPPostSSE(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	h := NewHandler(&fakeCG{})
+	h := NewHandler(&fakeCG{}, t.TempDir())
 	srv := httptest.NewServer(h.NewHTTPHandler())
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/healthz")
