@@ -45,14 +45,16 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	defer cancelRead()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := c.tabCtx(ctx)
+	base, err := c.tabCtx(ctx)
 	if err != nil {
 		return TurnResult{}, err
 	}
 	// Recovery must never reload the active adapter tab. Own a background
 	// target for navigation/readback and close only that target afterwards.
 	var tid target.ID
-	if err := chromedp.Run(c.browser, chromedp.ActionFunc(func(ctx context.Context) error {
+	probe, cancelProbe := requestContext(ctx, base)
+	defer cancelProbe()
+	if err := chromedp.Run(probe, chromedp.ActionFunc(func(ctx context.Context) error {
 		var err error
 		tid, err = target.CreateTarget("about:blank").WithBackground(true).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
 		return err
@@ -60,7 +62,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		return TurnResult{}, err
 	}
 	defer func() {
-		cleanup, done := context.WithTimeout(c.browser, 3*time.Second)
+		cleanup, done := context.WithTimeout(base, 3*time.Second)
 		defer done()
 		_ = chromedp.Run(cleanup, chromedp.ActionFunc(func(ctx context.Context) error {
 			return target.CloseTarget(tid).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
