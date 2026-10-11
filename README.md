@@ -212,6 +212,24 @@ JSON-object arguments against JSON Schema and `tool_choice`, and returns native
 OpenAI `tool_calls`. **OpenCode executes the tools**, then supplies their results
 on the next provider turn. Unknown names, bad JSON, schema violations and missing
 required calls produce an OpenAI-shaped HTTP error, never executable calls.
+Completed protocol failures return HTTP 422 (`invalid_request_error`), including
+streaming requests before any SSE data or tool calls are emitted. Exact rejected
+fingerprints cannot be resubmitted, even after continuation. A distinct new
+ordinary user message must end the authoritative client transcript to continue
+in a fresh thread; v2 may rebuild its system/history or retain failed assistant
+placeholders without preserving the rejected request's byte prefix. Changing
+only schemas, history, or tool results does not authorize continuation. Volatile
+v2 `<system-update>` user-role metadata is not ordinary input; comparison ignores
+it without removing it from the context. Appended undelivered tool calls/results
+cannot be laundered by adding a user message afterward. The new
+thread receives full current tool schemas. Unknown submitted turns still require
+recovery and retain their Dirty journal. Their completion guard also returns
+terminal 422 with the distinct uncertainty/recovery instruction, because installed
+v2 retries 409 indefinitely; this changes classification, not recovery safety.
+Recovery/resync endpoint conflicts still use 409. Explicit per-session project
+setup failures before typing/submission are safe to retry only if no conversation
+URL was reached; they are not unknown submitted turns.
+
 Tool wrappers mixed with prose or Markdown fences are rejected. Ordinary Markdown
 code examples are not executable bridge requests.
 External `$ref` schema downloads are disabled; local schema references work.
@@ -265,7 +283,8 @@ works), but the adapter does **not** forward it verbatim:
   followed by the current request with **current** tool schemas. Unexpected import
   output (including tool wrappers) fails closed and never becomes `tool_calls`.
   The durable synchronized prefix advances only for fully imported messages after
-  acknowledgement; uncertainty keeps the dirty journal and blocks retries (409).
+  acknowledgement; final-turn uncertainty keeps the dirty journal and blocks
+  resubmission (terminal 422 on completion requests).
   Edited/branched/compacted prefixes create a new Project thread, leaving the old
    one untouched. Canonical comparison preserves media and message names while
    normalizing equivalent SDK text/null-content and JSON argument encodings,
@@ -331,7 +350,7 @@ the adapter replays at most ~128k tokens worth of context.
   bounded read-only adoption: if the thread shows the completed answer to the
   exact pending prompt, it is cached and the request continues (exact retries
   hit the duplicate cache with zero resubmissions); otherwise the session
-  keeps returning 409. Pre-submission failures (e.g. navigation that reached
+  returns terminal 422. Pre-submission failures (e.g. navigation that reached
   no conversation) clear the flag so a retry can proceed. Inspect the
   dedicated browser tab and logged thread URL, repair the underlying
   issue, then use the validated recovery or explicit same-session resync described
@@ -350,7 +369,8 @@ Unset (or any other value) keeps today's shared-project behavior byte-for-byte.
   session name.
 - **Eager start:** a new session's first thread is minted in its own project
   from turn one (logged as `decision=fresh-project`) — new sessions never
-  touch the shared project. Explicit resyncs still behave exactly as today.
+  touch the shared project unless proved pre-submission setup fails and invokes
+  the mandatory fallback. Explicit resyncs still behave exactly as today.
 - **Rotation replaces reset-replay:** on the same prefix-mismatch triggers
   that today cause reset-replay (compaction, edits, truncation), the adapter
   opens a fresh working chat in the session's project whose single first turn
@@ -362,13 +382,15 @@ Unset (or any other value) keeps today's shared-project behavior byte-for-byte.
   without a card — see `phase0-report.md`).
 - **Steady state unchanged:** delta continuation, per-thread tool teaching,
   dirty/uncertainty guards, resync and interrupt recovery all keep working.
-- **Fallback mandatory:** any project/chat creation or submission failure
+- **Fallback mandatory:** explicitly proved pre-submission project setup/navigation
+  failure with no reached conversation
   drops back to the shared-project thread for that turn (logged as
   `rotation_fallback` on the mismatch path, `eager_fallback` on first-turn
   minting — the latter only fires pre-submission, so it can never double-send).
   Existing sessions without a stored project stay
-  grandfathered on the shared project. Rotation never 409s where the old path
-  would have proceeded.
+  grandfathered on the shared project. A possibly submitted turn never falls
+  back: its Dirty journal remains protected and completion retries terminate
+  with 422 rather than generating another turn.
 - State gains one field per session (`Project`, the project URL) in
   `~/.chatgpt-proxy/openai-sessions.json`; old state files load unchanged.
 
@@ -658,7 +680,7 @@ restarted once:
   (reminder), then the grounded final answer — all on one Project thread.
 - A navigation failure that reaches no conversation URL clears the dirty journal
   instead of wedging the session (`IsNavigateError` + test); genuinely uncertain
-  turns still 409.
+  turns still remain protected (completion guard now terminal 422).
 
 ### OpenCode-side tuning (required for driver use)
 
@@ -668,7 +690,8 @@ restarted once:
   all later turns reset-replay with full schema re-teach.
 - Disable client timeouts for this provider (`"chunkTimeout": false,
   "timeout": false`): long silent browser turns are normal; a client abort
-  mid-replay wedges the session (409) by design.
+  during the final answer-seeking turn requires recovery when the outcome cannot
+  be adopted. Replay-only interruptions resume safely without executable calls.
 - Quit and restart OpenCode after any config change; sessions keep old config.
 - Consecutive turns on one thread skip the reload (`already on ..., skipping
   reload`); expect ~15-20s short turns, longer when the model writes a lot —

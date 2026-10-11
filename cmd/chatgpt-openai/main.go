@@ -117,11 +117,12 @@ type result struct {
 	Calls     []toolCall
 }
 type session struct {
-	URL         string
-	Messages    []message
-	Fingerprint string
-	Result      result
-	Dirty       bool // an interrupted/failed submitted turn must not be silently retried
+	URL                 string
+	Messages            []message
+	Fingerprint         string
+	RejectedFingerprint string `json:",omitempty"`
+	Result              result
+	Dirty               bool // an interrupted/failed submitted turn must not be silently retried
 	// ToolsFP is the fingerprint of the tool set whose full schemas were last
 	// taught to this thread. The thread holds them server-side afterwards, so
 	// later turns only need a compact reminder (see toolReminder).
@@ -214,7 +215,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 func apiError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": "proxy_error", "code": status}})
+	kind := "proxy_error"
+	if status == http.StatusUnprocessableEntity {
+		kind = "invalid_request_error"
+	}
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": kind, "code": status}})
 }
 func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -926,15 +931,18 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// processing (exact retries hit the duplicate cache below).
 			log.Printf("[openai] session=%s adopted interrupted final turn; continuing request", id)
 		} else {
-			apiError(w, 409, errors.New("session has an uncertain submitted turn; POST /v1/sessions/recover with the same session header and exact original request to validate/cache the stored response without resubmitting"))
+			// Installed v2 retries HTTP409 as provider.internal. This request
+			// cannot safely progress without recovery, so return terminal422
+			// while retaining the exact same uncertainty/adoption protections.
+			apiError(w, 422, errors.New("session has an uncertain submitted turn; POST /v1/sessions/recover with the same session header and exact original request to validate/cache the stored response without resubmitting"))
 			return
 		}
 	}
+	if s.RejectedFingerprint == fingerprint || (s.Phase == "invalid" && s.Fingerprint == fingerprint) {
+		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message to continue in a fresh thread"))
+		return
+	}
 	if s.Fingerprint == fingerprint {
-		if s.Phase == "invalid" {
-			apiError(w, 502, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; exact retries will not resubmit; send a new ordinary user message to continue in a fresh thread"))
-			return
-		}
 		if s.Result.ID == "" {
 			// Older state files did not persist completion metadata. Derive a
 			// stable fallback so legacy cached retries do not regenerate IDs.
@@ -947,14 +955,42 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	start := 0
 	if s.Phase == "invalid" {
 		pending := s.PendingRequest
-		if pending == nil || !prefix(req.Messages, pending.Messages) || len(req.Messages) <= len(pending.Messages) || req.Messages[len(pending.Messages)].Role != "user" {
-			apiError(w, 409, errors.New("rejected model output requires its original transcript followed by a new ordinary user message; no tool calls were delivered"))
+		// v2 rebuilds system/history and retains failed assistant placeholders.
+		// Only a distinct, final ordinary user message may cross this gate;
+		// schemas, tool results, or a changed system prompt alone are not input.
+		last := req.Messages[len(req.Messages)-1]
+		// v2 emits changing <system-update> metadata as a user message.
+		// It is not an ordinary user boundary; ignore it only for comparison,
+		// never remove it from the authoritative context sent to the model.
+		updates := regexp.MustCompile(`(?s)<system-update>.*?</system-update>`)
+		text := strings.TrimSpace(updates.ReplaceAllString(contentText(last), ""))
+		freshUser := pending != nil && last.Role == "user" && text != "" && len(last.ToolCalls) == 0 && last.ToolCallID == ""
+		if pending != nil {
+			for _, old := range pending.Messages {
+				oldText := strings.TrimSpace(updates.ReplaceAllString(contentText(old), ""))
+				if old.Role == "user" && oldText != "" && (strings.Contains(text, oldText) || strings.Contains(oldText, text)) {
+					freshUser = false
+				}
+			}
+			if prefix(req.Messages, pending.Messages) {
+				for _, m := range req.Messages[len(pending.Messages):] {
+					if m.Role == "tool" || len(m.ToolCalls) != 0 || m.ToolCallID != "" {
+						freshUser = false // rejected calls were never delivered
+					}
+				}
+			}
+		}
+		if !freshUser {
+			apiError(w, 422, errors.New("rejected model output requires a distinct new ordinary user message at the end of the authoritative transcript; no tool calls were delivered"))
 			return
 		}
 		// Do not consume the durable rejection gate until the new request has
 		// passed prompt/budget checks and is journaled for submission below.
 		next := *s
 		s = &next
+		if s.RejectedFingerprint == "" {
+			s.RejectedFingerprint = s.Fingerprint // upgrade existing rejected journals
+		}
 		s.URL, s.Messages, s.ToolsFP, s.Fingerprint, s.Result = "", nil, "", "", result{}
 		s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
 	}
@@ -1115,7 +1151,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		log.Printf("[openai] invalid tool protocol session=%s thread=%s", id, url)
-		h.backendError(w, err)
+		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message"))
 		return
 	}
 	out.Reasoning = reasoning

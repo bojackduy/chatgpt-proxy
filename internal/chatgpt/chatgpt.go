@@ -44,15 +44,16 @@ var (
 	ErrNoComposer     = errors.New("chatgpt composer not found (no #prompt-textarea or ProseMirror contenteditable)")
 	ErrNoNewChat      = errors.New("could not find the New chat button")
 	ErrNoResponse     = errors.New("chatgpt did not produce a response in time")
+	ErrProjectSetup   = errors.New("project setup failed before turn submission")
 )
 
-// IsNavigateError reports whether err is a page-navigation failure. All
+// IsNavigateError reports a page-navigation or explicit project-setup failure. All
 // navigate steps run before anything is typed or submitted, so a caller that
 // sees only such an error (and reached no conversation URL) knows provably
 // that nothing was sent and may safely retry instead of treating the turn
 // as uncertain.
 func IsNavigateError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "navigate:")
+	return err != nil && (errors.Is(err, ErrProjectSetup) || strings.Contains(err.Error(), "navigate:"))
 }
 
 // Status describes the current state of the ChatGPT Web tab.
@@ -749,7 +750,7 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (TurnResult
 		case opt.ProjectName != "":
 			p, err := c.ensureProjectNamed(ctx, tab, opt.ProjectName)
 			if err != nil {
-				return TurnResult{}, err
+				return TurnResult{}, errors.Join(ErrProjectSetup, err)
 			}
 			page, projectURL = p, p
 		default:

@@ -291,7 +291,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	out, err := parseAnswer(res.Answer, req)
 	if err != nil {
 		// Model-protocol failure, not infra: behave exactly like the legacy
-		// parse-error path (persist the thread, 502) rather than resubmitting.
+		// parse-error path (persist the thread, terminal 422) rather than resubmitting.
 		s.URL = res.URL
 		if res.ProjectURL != "" {
 			s.Project = res.ProjectURL
@@ -303,7 +303,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 			return true
 		}
 		log.Printf("[openai] invalid tool protocol session=%s lane=%s decision=rotation thread=%s", id, lane, res.URL)
-		h.backendError(w, err)
+		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message"))
 		return true
 	}
 	out.Reasoning = res.Reasoning

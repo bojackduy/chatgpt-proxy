@@ -1,10 +1,18 @@
 # Backlog
 
-## V2 subagent failures: uncertain turns and long waits
+## Shared adapter failures: uncertain turns, rejected continuation and long waits
 
 **Status:** bridge recovery fixes implemented and under verification on
 2026-10-11; exact reported UI session attribution and real General/Explore
 reproduction remain unresolved. This item is not fully complete.
+
+The named-project setup failure is shared by v1/v2 clients, not v2-exclusive.
+The v1 graphify research request is correlated to `ses_ed41e2cc0ffep0eSn7og7zrC8h`:
+the exported 236-byte user message matches both reported GitHub targets, and
+adapter log 23:53–23:56 repeats `Project URL not observed` before replay turn 1/2.
+Explicit pre-submission project-setup errors now activate the existing eager
+and rotation shared-project fallback; no projects are manually created to hide
+the bug. A possibly submitted/unknown failure still cannot fall back.
 
 **Reported symptom:** General ("Implement ActionBox backend MVP") and Explore
 ("Inspect browser ingestion options") both display session ID
@@ -33,10 +41,30 @@ durations are not fully correlated to individual request phases.
 
 **Implemented safeguards:** completed, strictly rejected protocol output delivers
 no partial calls and is durably classified separately from unknown submission.
-Exact retries do not resubmit; continuation requires the original transcript
-followed by a new ordinary user message, in a fresh thread. Unknown outcomes
+Exact retries do not resubmit. The original byte-prefix continuation requirement
+regressed v2's genuine followup: its journal contains a 16-message rejected
+tool-history request while its authoritative session retains failed assistant
+placeholders and a distinct new user message. Agent/system/history rebuilds
+cannot be required to reproduce that prefix. Continuation now requires a distinct
+final ordinary user message (text/string encoding independent); volatile v2
+`<system-update>` metadata is not new input, and appended undelivered tool calls
+or results cannot be made valid by adding a user message afterward. Tool/schema-only
+changes and old user input do not qualify. The authoritative rebuilt transcript
+is imported into a fresh thread with full current schemas; the rejected
+fingerprint remains blocked even after continuation. Completed protocol failures
+and rejected continuation attempts return terminal HTTP 422 with
+`invalid_request_error`, not transient backend 502. Installed v2 2.0.26 was
+verified with a mock provider: 422 terminates after one request, whereas even
+409 `invalid_request_error` retries (seven requests in 45 seconds). The completion
+uncertainty guard therefore also returns terminal 422 with its distinct recovery
+instruction; journal/adoption protections remain unchanged. Recovery/resync
+endpoint conflicts retain 409. A separately correlated new implementation prompt
+in `ses_ed4229…` never reached submission: per-session Project URL discovery
+failed before `askLocked`, but only navigation errors cleared Dirty. Explicit
+project-setup errors are now marked at that pre-submission boundary and allow
+safe retries only when no conversation URL was reached. Unknown outcomes
 remain protected. Rotation/eager fallback is limited to proved pre-submission
-navigation errors; a possibly reached turn is not automatically replayed.
+navigation/project-setup errors; a possibly reached turn is not automatically replayed.
 Recovery navigates only an owned background target under the profile lock,
 expands only the last user bubble's Show more control, and removes UI controls
 structurally (never strips real prompt suffixes). For escaped rich user text,

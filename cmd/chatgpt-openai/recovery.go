@@ -112,6 +112,7 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 func (h *handler) rejectCompleted(s *session, fingerprint string) error {
 	old := *s
 	s.Dirty, s.Phase, s.Fingerprint, s.Result = false, "invalid", fingerprint, result{}
+	s.RejectedFingerprint = fingerprint
 	if err := h.save(); err != nil {
 		*s = old
 		return err
@@ -164,7 +165,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	defer unlock()
 	s := h.sessions[id]
 	if s != nil && s.Phase == "invalid" {
-		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with the original transcript followed by a new ordinary user message"))
+		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with a distinct new ordinary user message at the end of the authoritative transcript"))
 		return
 	}
 	if s == nil || !s.Dirty || s.URL == "" {

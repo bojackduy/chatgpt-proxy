@@ -213,7 +213,7 @@ func TestMalformedCalls(t *testing.T) {
 	h := testHandler(f)
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
 	rejected := weatherReq()
-	if w := request(h, "invalid", rejected); w.Code != 502 || h.sessions["invalid"].Dirty || h.sessions["invalid"].Phase != "invalid" || len(h.sessions["invalid"].Result.Calls) != 0 {
+	if w := request(h, "invalid", rejected); w.Code != 422 || h.sessions["invalid"].Dirty || h.sessions["invalid"].Phase != "invalid" || len(h.sessions["invalid"].Result.Calls) != 0 {
 		t.Fatal("finished malformed output treated as unknown/delivered", w.Code)
 	}
 	loaded := testHandler(f)
@@ -221,23 +221,68 @@ func TestMalformedCalls(t *testing.T) {
 	if err := loaded.load(); err != nil {
 		t.Fatal(err)
 	}
-	if w := request(loaded, "invalid", rejected); w.Code != 502 || len(f.prompts) != 1 {
+	if w := request(loaded, "invalid", rejected); w.Code != 422 || len(f.prompts) != 1 {
 		t.Fatal("invalid retry resubmitted", w.Code)
 	}
 	changedTools := rejected
 	changedTools.Tools = nil
 	changedTools.ToolChoice = "auto"
-	if w := request(loaded, "invalid", changedTools); w.Code != 409 || len(f.prompts) != 1 {
+	if w := request(loaded, "invalid", changedTools); w.Code != 422 || len(f.prompts) != 1 {
 		t.Fatal("schema-only retry bypassed rejected turn", w.Code)
 	}
 	continued := rejected
 	continued.ToolChoice = "auto"
-	continued.Messages = append(append([]message{}, rejected.Messages...), message{Role: "user", Content: "Continue without tools"})
+	// Observed v2 rebuilt shape: changed system, a failed assistant
+	// placeholder, then a genuine ordinary followup (not a strict prefix).
+	continued.Stream = true
+	continued.Messages = append([]message{{Role: "system", Content: "rebuilt v2 system"}}, rejected.Messages...)
+	continued.Messages = append(continued.Messages, message{Role: "assistant", Content: ""})
+	if w := request(loaded, "invalid", continued); w.Code != 422 || len(f.prompts) != 1 {
+		t.Fatal("rebuilt context without new input bypassed rejection", w.Code)
+	}
+	continued.Messages = append(continued.Messages, message{Role: "user", Content: []any{map[string]any{"type": "text", "text": contentText(rejected.Messages[len(rejected.Messages)-1])}}})
+	if w := request(loaded, "invalid", continued); w.Code != 422 || len(f.prompts) != 1 {
+		t.Fatal("same input with changed encoding bypassed rejection", w.Code)
+	}
+	continued.Messages[len(continued.Messages)-1] = message{Role: "user", Content: "<system-update>new time and context metadata</system-update>"}
+	if w := request(loaded, "invalid", continued); w.Code != 422 || len(f.prompts) != 1 {
+		t.Fatal("volatile system-update masqueraded as new input", w.Code)
+	}
+	continued.Messages[len(continued.Messages)-1] = message{Role: "user", Content: "using loopd dude"}
+	toolOnly := continued
+	toolOnly.Messages = append(append([]message{}, continued.Messages...), message{Role: "tool", ToolCallID: "undelivered", Content: "result"})
+	if w := request(loaded, "invalid", toolOnly); w.Code != 422 || len(f.prompts) != 1 || strings.Contains(w.Body.String(), "data:") {
+		t.Fatal("tool continuation emitted calls/SSE or bypassed rejection", w.Code)
+	}
+	toolOnly.Messages = append(append([]message{}, rejected.Messages...), message{Role: "tool", ToolCallID: "undelivered", Content: "result"}, message{Role: "user", Content: "using loopd dude"})
+	if w := request(loaded, "invalid", toolOnly); w.Code != 422 || len(f.prompts) != 1 {
+		t.Fatal("new user laundered an undelivered tool result", w.Code)
+	}
+	blocked := *loaded.sessions["invalid"]
 	if w := request(loaded, "invalid", continued); w.Code != 200 || loaded.sessions["invalid"].Dirty || loaded.sessions["invalid"].Phase != "" {
 		t.Fatal("new ordinary user turn failed", w.Code, w.Body.String())
 	}
 	if f.urls[1] != "" {
 		t.Fatal("new turn reused rejected thread")
+	}
+	n := len(f.prompts)
+	if w := request(loaded, "invalid", rejected); w.Code != 422 || len(f.prompts) != n {
+		t.Fatal("old rejected fingerprint lost after continuation", w.Code)
+	}
+	for _, messages := range [][]message{
+		append(append([]message{}, rejected.Messages...), message{Role: "user", Content: "using loopd dude"}),
+		{{Role: "system", Content: "compacted authoritative context"}, {Role: "user", Content: []any{map[string]any{"type": "text", "text": "<system-update>current metadata</system-update>using loopd dude"}}}},
+	} {
+		state := blocked
+		loaded.sessions["invalid"] = &state
+		f.prompts, f.urls, f.answers = nil, nil, []string{"continued"}
+		continued.Messages = messages
+		if w := request(loaded, "invalid", continued); w.Code != 200 || loaded.sessions["invalid"].Dirty || loaded.sessions["invalid"].Phase != "" || len(f.prompts) != 1 || f.urls[0] != "" || !strings.Contains(f.prompts[0], toolPrompt(continued)) {
+			t.Fatal("strict/compacted new user failed fresh full-schema continuation", w.Code)
+		}
+		if w := request(loaded, "invalid", rejected); w.Code != 422 || len(f.prompts) != 1 {
+			t.Fatal("variant lost rejected fingerprint", w.Code)
+		}
 	}
 }
 func TestSessionsReadinessAndFallback(t *testing.T) {
@@ -271,7 +316,7 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 	if w.Code != 502 || !strings.Contains(w.Body.String(), "proxy_error") {
 		t.Fatal(w)
 	}
-	if request(h, "failed", req).Code != 409 || len(f.prompts) != 1 {
+	if request(h, "failed", req).Code != 422 || len(f.prompts) != 1 {
 		t.Fatal("uncertain turn retried")
 	}
 	if request(h, "empty", completionsRequest{}).Code != 400 {
@@ -291,6 +336,7 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 		{"https://chatgpt.com/c/reached", context.Canceled, true},
 		{"", context.Canceled, true},
 		{"", errors.New("navigate: page load error net::ERR_FAILED"), false},
+		{"", errors.Join(chatgpt.ErrProjectSetup, errors.New("Project URL not observed")), false},
 	} {
 		f := &fakeBackend{err: tc.err, errorURL: tc.url}
 		h := testHandler(f)
@@ -309,22 +355,32 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 }
 
 func TestNavigateFailureDoesNotWedgeFreshSession(t *testing.T) {
-	// A navigation failure before any conversation URL was reached provably
-	// submitted nothing: the session must accept a retry instead of 409.
-	f := &fakeBackend{err: errors.New("navigate: page load error net::ERR_FAILED")}
-	h := testHandler(f)
-	req := weatherReq()
-	if w := request(h, "nav", req); w.Code != 502 {
-		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
-	}
-	if h.sessions["nav"].Dirty {
-		t.Fatal("transient pre-submission failure wedged a fresh session")
-	}
-	f.err = nil
-	f.answers = []string{"unused", weatherAnswer}
-	a := assistant(t, request(h, "nav", req))
-	if len(a.ToolCalls) != 1 || len(f.prompts) != 2 {
-		t.Fatal("retry did not resubmit cleanly", a, len(f.prompts))
+	for _, eager := range []string{"0", "1"} {
+		t.Setenv("CHATGPT_BRIDGE_PROJECT_PER_SESSION", eager)
+		for _, failure := range []error{errors.New("navigate: page load error net::ERR_FAILED"), errors.Join(chatgpt.ErrProjectSetup, errors.New(`Project URL not observed for "OpenCode Bridge — explain/sesed422"`))} {
+			// A navigation failure before any conversation URL was reached provably
+			// submitted nothing: the session must accept a retry instead of 409.
+			f := &fakeBackend{err: failure}
+			h := testHandler(f)
+			req := weatherReq()
+			if w := request(h, "nav", req); w.Code != 502 {
+				t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+			}
+			if h.sessions["nav"].Dirty {
+				t.Fatal("transient pre-submission failure wedged a fresh session")
+			}
+			f.err = nil
+			n := len(f.prompts)
+			if eager == "1" && n != 2 {
+				t.Fatal("proved pre-submission project failure did not fall back once")
+			}
+			f.answers = make([]string, n+1)
+			f.answers[n] = weatherAnswer
+			a := assistant(t, request(h, "nav", req))
+			if len(a.ToolCalls) != 1 || len(f.prompts) != n+1 {
+				t.Fatal("retry did not resubmit cleanly", a, len(f.prompts))
+			}
+		}
 	}
 }
 
@@ -477,7 +533,7 @@ func TestFailedSubmittedThreadURLPersistsForRepair(t *testing.T) {
 	if s := h2.sessions["uncertain"]; !s.Dirty || s.URL != f.errorURL {
 		t.Fatal("repair URL or dirty journal lost", s)
 	}
-	if request(h2, "uncertain", weatherReq()).Code != 409 || len(f.prompts) != 1 {
+	if request(h2, "uncertain", weatherReq()).Code != 422 || len(f.prompts) != 1 {
 		t.Fatal("uncertain submitted thread retried")
 	}
 }
@@ -809,10 +865,10 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 			// chunk's output was never parsed as calls, so resubmission cannot
 			// execute twice. The final fake answer is plain "OK" against a
 			// required tool_choice, so the resumed request must run the full turn
-			// and fail closed on protocol (502) — proving it proceeded safely
+			// and fail closed on protocol (422) — proving it proceeded safely
 			// instead of wedging, without leaking unexecuted calls.
 			w2 := request(h2, "tools-gap", req)
-			if w2.Code != 502 || len(f.prompts) == n {
+			if w2.Code != 422 || len(f.prompts) == n {
 				t.Fatal("interrupted import neither wedged nor safely repeated", w2.Code, len(f.prompts))
 			}
 			if strings.Contains(w2.Body.String(), `"tool_calls"`) {
@@ -822,7 +878,7 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 				t.Fatal("finished rejected final not durably classified")
 			}
 			n = len(f.prompts)
-			if retry := request(h2, "tools-gap", req); retry.Code != 502 || len(f.prompts) != n {
+			if retry := request(h2, "tools-gap", req); retry.Code != 422 || len(f.prompts) != n {
 				t.Fatal("rejected final retry resubmitted", retry.Code)
 			}
 		})

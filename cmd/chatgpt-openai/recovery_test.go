@@ -107,7 +107,7 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 				if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
 					t.Fatal("finished invalid output not safely classified", w.Code)
 				}
-				if retry := request(h, "recover", req); retry.Code != 502 || f.reads != 1 || len(f.prompts) != 0 {
+				if retry := request(h, "recover", req); retry.Code != 422 || f.reads != 1 || len(f.prompts) != 0 {
 					t.Fatal("rejected retry resubmitted or re-read", retry.Code)
 				}
 				return
