@@ -32,6 +32,23 @@
     const source = md || body;
     if (source) {
       const clone = source.cloneNode(true);
+      // Math renderers include both accessible MathML (with the original
+      // TeX annotation) and visual glyphs. Walking both duplicates O(n), and
+      // textContent also flattens superscripts. Capture one source expression
+      // before hidden/accessibility nodes are removed; never dedupe prose.
+      const mathSource = new WeakMap();
+      for (const e of clone.querySelectorAll('.katex, mjx-container, math')) {
+        if (e.parentElement?.closest('.katex, mjx-container, math')) continue;
+        const annotation = e.querySelector('annotation[encoding="application/x-tex"], annotation[encoding="application/x-latex"]');
+        const tex = annotation?.textContent.trim();
+        if (tex) {
+          const display = e.matches('math[display="block"], mjx-container[display="true"]') || !!e.closest('.katex-display');
+          mathSource.set(e, { tex, display });
+        } else if (e.matches('.katex') && e.querySelector('.katex-html')) {
+          // Without a source annotation retain the visual branch only.
+          e.querySelector('.katex-mathml')?.remove();
+        }
+      }
       // Language labels live in the code header, which the cleanup below
       // removes as toolbar UI — capture them first, keyed by wrapper. The
       // current renderer carries no language-* class on <code>; the header
@@ -57,6 +74,8 @@
       const render = (e, cell = false) => {
         if (e.nodeType === Node.TEXT_NODE) return escape(e.textContent.replace(/\s+/g, ' '));
         if (e.nodeType !== Node.ELEMENT_NODE) return '';
+        const math = mathSource.get(e);
+        if (math) return math.display ? block('$$\n' + math.tex + '\n$$') : '$' + math.tex + '$';
         const tag = e.tagName;
         if (tag === 'PRE' || e.matches('[data-markdown-copy="code-block"], [data-d-component="code-block"]')) {
           // Process the outer wrapper once; code text retains indentation and JSON.
@@ -126,7 +145,11 @@
       // Tool-only answers are a literal wire protocol, not Markdown prose.
       // Preserve their JSON (including backslashes) and historical exact ACK.
       const raw = clone.textContent.trim();
-      text = /^(?:<opencode_bridge_call>[\s\S]*<\/opencode_bridge_call>\s*)+$/.test(raw)
+      // Incomplete protocol must reach the adapter unchanged too, so it can
+      // reject it rather than accidentally return escaped successful prose.
+      // Code examples remain Markdown and are never promoted to calls.
+      text = /^<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/.test(raw) &&
+        !clone.querySelector('pre, code, [data-markdown-copy="code-block"], [data-d-component="code-block"]')
         ? raw : children(clone).trim().replace(/\n{3,}/g, '\n\n');
       // Expand after layout normalization, retaining blank lines even in nested
       // lists/quotes (each fenced line inherits its container's indentation).

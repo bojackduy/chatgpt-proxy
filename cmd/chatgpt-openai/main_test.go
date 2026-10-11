@@ -97,12 +97,14 @@ func assistant(t *testing.T, w *httptest.ResponseRecorder) message {
 	return v.Choices[0].Message
 }
 func TestSingleUserToolsRoundtripPersistenceRetry(t *testing.T) {
-	f := &fakeBackend{answers: []string{weatherAnswer, "Hanoi: 25 C"}}
+	args := `{"city": "printf '%s\\n' 'a\\\\b_*'"}`
+	answer := `<opencode\_bridge\_call>{"name":"get_weather","arguments":` + args + `}</opencode\_bridge\_call>`
+	f := &fakeBackend{answers: []string{answer, "Hanoi: 25 C"}}
 	h := testHandler(f)
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
 	req := weatherReq()
 	a := assistant(t, request(h, "session-a", req))
-	if len(a.ToolCalls) != 1 || a.ToolCalls[0].Function.Name != "get_weather" {
+	if len(a.ToolCalls) != 1 || a.ToolCalls[0].Function.Name != "get_weather" || a.ToolCalls[0].Function.Arguments != args || contentText(a) != "" {
 		t.Fatal(a)
 	}
 	if strings.Count(f.prompts[0], "Call weather for Hanoi") != 1 {
@@ -129,7 +131,9 @@ func TestSingleUserToolsRoundtripPersistenceRetry(t *testing.T) {
 	}
 }
 func TestSSEContract(t *testing.T) {
-	f := &fakeBackend{answers: []string{weatherAnswer}}
+	args := `{"city": "printf '%s\\n' 'a\\\\b_*'"}`
+	answer := `<opencode\_bridge\_call>{"name":"get_weather","arguments":` + args + `}</opencode\_bridge\_call>`
+	f := &fakeBackend{answers: []string{answer}}
 	h := testHandler(f)
 	req := weatherReq()
 	req.Stream = true
@@ -162,7 +166,7 @@ func TestSSEContract(t *testing.T) {
 		}
 		for _, c := range v.Choices {
 			for _, call := range c.Delta.ToolCalls {
-				if call.Index == nil || *call.Index != 0 || call.ID == "" || call.Function.Arguments != "{\"city\":\"Hanoi\"}" {
+				if call.Index == nil || *call.Index != 0 || call.ID == "" || call.Function.Arguments != args {
 					t.Fatal(call)
 				}
 				calls++
@@ -179,7 +183,12 @@ func TestSSEContract(t *testing.T) {
 func TestMalformedCalls(t *testing.T) {
 	for _, answer := range []string{"<opencode_bridge_call>{bad}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":\"bad\"}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":null}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"unknown\",\"arguments\":{}}</opencode_bridge_call>", "<opencode_bridge_call>{}", "plain answer", "```tool_call\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hanoi\"}}\n```", "```\n" + weatherAnswer + "\n```", "prose\n" + weatherAnswer} {
 		t.Run(answer, func(t *testing.T) {
-			if _, err := parseAnswer(answer, weatherReq()); err == nil {
+			req := weatherReq()
+			if answer == "<opencode_bridge_call>{}" {
+				answer = `<opencode\_bridge\_call>{}`
+				req.ToolChoice = "auto" // must fail even without required choice
+			}
+			if _, err := parseAnswer(answer, req); err == nil {
 				t.Fatal("accepted invalid call")
 			}
 		})

@@ -687,7 +687,10 @@ func safeCut(s string, n int) int {
 	return n
 }
 
-var toolBlock = regexp.MustCompile(`(?s)<opencode_bridge_call>\s*(.*?)\s*</opencode_bridge_call>`)
+// Accept only the known Markdown-escaped delimiter variant; JSON is never
+// unescaped as Markdown. Both variants still require complete wrappers.
+var toolBlock = regexp.MustCompile(`(?s)<opencode\\?_bridge\\?_call>\s*(.*?)\s*</opencode\\?_bridge\\?_call>`)
+var toolMarker = regexp.MustCompile(`<\/?opencode\\?_bridge\\?_call`)
 var toolName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 type localSchemas struct{}
@@ -758,12 +761,11 @@ func parseAnswer(answer string, req completionsRequest) (result, error) {
 		if err := allowed[v.Name].Validate(args); err != nil {
 			return result{}, fmt.Errorf("tool %s arguments: %w", v.Name, err)
 		}
-		b, _ := json.Marshal(args)
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", answer, i)))
-		out.Calls = append(out.Calls, toolCall{ID: fmt.Sprintf("call_%x", sum[:12]), Type: "function", Function: callFunction{Name: v.Name, Arguments: string(b)}})
+		out.Calls = append(out.Calls, toolCall{ID: fmt.Sprintf("call_%x", sum[:12]), Type: "function", Function: callFunction{Name: v.Name, Arguments: string(v.Arguments)}})
 		out.Text = strings.Replace(out.Text, m[0], "", 1)
 	}
-	if strings.Contains(out.Text, "<opencode_bridge_call") || strings.Contains(out.Text, "</opencode_bridge_call") {
+	if toolMarker.MatchString(out.Text) {
 		return result{}, errors.New("incomplete opencode_bridge_call wrapper")
 	}
 	out.Text = strings.TrimSpace(out.Text)
