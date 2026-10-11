@@ -68,6 +68,19 @@
       // literal protocol tags without ever interpreting them as HTML elements.
       const ticks = raw => '`'.repeat(Math.max(0, ...(raw.match(/`+/g) || []).map(s => s.length)) + 1);
       const escape = raw => raw.replace(/\\/g, '\\\\').replace(/([`*_\[\]~])/g, '\\$1');
+      // Deliberately small TeX vocabulary, only for annotated math. Unknown
+      // syntax keeps the entire source verbatim in code, never a lossy mixture.
+      const plainMath = tex => {
+        const commands = {le:'≤', leq:'≤', ge:'≥', geq:'≥', ne:'≠', neq:'≠',
+          ldots:'…', cdots:'…', quad:' ', qquad:'  ', times:'×', cdot:'·',
+          alpha:'α', beta:'β', gamma:'γ', delta:'δ', theta:'θ', pi:'π', sigma:'σ',
+          infty:'∞', pm:'±', to:'→', in:'∈'};
+        const unknown = [...tex.matchAll(/\\([a-zA-Z]+|.)/g)].some(m =>
+          !(m[1] in commands) && ![' ', ',', ';', ':'].includes(m[1]));
+        if (unknown) { const fence = ticks(tex); return fence + ' ' + tex + ' ' + fence; }
+        return escape(tex.replace(/\\([a-zA-Z]+|.)(\s*)/g, (_, c, space) =>
+          (commands[c] || ' ') + (['quad', 'qquad', ' ', ',', ';', ':'].includes(c) ? '' : space)).trim());
+      };
       const children = (e, cell = false) => [...e.childNodes].map(n => render(n, cell)).join('');
       const block = s => '\n\n' + s + '\n\n';
       const codeBlocks = [];
@@ -75,8 +88,39 @@
         if (e.nodeType === Node.TEXT_NODE) return escape(e.textContent.replace(/\s+/g, ' '));
         if (e.nodeType !== Node.ELEMENT_NODE) return '';
         const math = mathSource.get(e);
-        if (math) return math.display ? block('$$\n' + math.tex + '\n$$') : '$' + math.tex + '$';
+        if (math) return math.display ? block(plainMath(math.tex)) : plainMath(math.tex);
         const tag = e.tagName;
+        // Observed ChatGPT semantic row component (HTML/CSS, not an image).
+        // Only compact leaf-content rows; lists/tables/code retain their layout.
+        if (e.matches('[data-d-component="row"][data-d-direction="row"]') &&
+            !e.querySelector('pre, ul, ol, table, blockquote, h1, h2, h3, h4, h5, h6, [data-d-component="code-block"], [data-markdown-copy="code-block"]') &&
+            ![...e.querySelectorAll('code')].some(n => n.textContent.includes('\n'))) {
+          // Nested comparison rows use spaces, outer label/caption rows a list.
+          const nested = !!e.parentElement?.closest('[data-d-component="row"][data-d-direction="row"]');
+          const flat = [...e.childNodes].map(n => render(n, cell).trim().replace(/\s*\n+\s*/g, ' ')).filter(Boolean).join(nested ? ' ' : ' — ');
+          return nested ? flat : '\n- ' + flat + '\n';
+        }
+        if (tag === 'IMG' || tag.toLowerCase() === 'svg' || tag === 'CANVAS') {
+          // Decorative icon in an observed textual row: the caption carries
+          // its meaning. No inference from its danger/success color.
+          if (e.matches('[data-d-component="icon"]') && e.closest('[data-d-component="row"]') &&
+              !e.hasAttribute('aria-label') && !e.hasAttribute('aria-labelledby') && !e.querySelector('title, desc, text')) return '';
+          const description = e.getAttribute('alt') || e.getAttribute('aria-label') ||
+            (e.getAttribute('aria-labelledby') || '').split(/\s+/).map(id =>
+              [...clone.querySelectorAll('[id]')].find(n => n.id === id)?.textContent || '').join(' ').trim() ||
+            [...e.querySelectorAll('title, desc, text')].map(n => n.textContent.trim()).filter(Boolean).join('; ');
+          // Authenticated/signed, relative, data/blob and local URLs are not
+          // portable artifacts. Do not expose tokens or fabricate file links.
+          let link = '';
+          try {
+            const url = new URL(e.getAttribute('src') || '');
+            if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash &&
+              url.hostname.includes('.') && !/^(?:\d+\.\d+\.\d+\.\d+$|\[)|(?:^|\.)(?:localhost|local|internal)$/.test(url.hostname) &&
+              !/(?:^|\.)(?:chatgpt\.com|openai\.com|oaiusercontent\.com)$/.test(url.hostname)) link = ' [source](<' + url.href + '>)';
+          } catch (_) {}
+          return block('[' + (tag === 'IMG' ? 'Image' : tag === 'CANVAS' ? 'Canvas' : 'SVG') + ': ' +
+            (description ? escape(description) : 'no accessible description; visual content not extracted') + ']' + link);
+        }
         if (tag === 'PRE' || e.matches('[data-markdown-copy="code-block"], [data-d-component="code-block"]')) {
           // Process the outer wrapper once; code text retains indentation and JSON.
           const code = e.querySelector('code');

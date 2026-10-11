@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/chromedp/chromedp"
 	"strings"
 	"testing"
@@ -79,8 +80,19 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 	}
 	t.Run("rich Markdown", func(t *testing.T) {
 		math := probe(`<p>Potentially <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>O</mi><mo>(</mo><msup><mi>n</mi><mn>2</mn></msup><mo>)</mo></mrow><annotation encoding="application/x-tex">O(n^2)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">O(n^2)</span></span>. Linear <span class="katex"><span class="katex-mathml"><math><semantics><mrow>O(n)</mrow><annotation encoding="application/x-tex">O(n)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">O(n)</span></span>.</p><span class="katex-display"><span class="katex"><span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">x^2 + y^2</annotation></semantics></math></span><span class="katex-html">DUPLICATE GLYPHS</span></span></span><p>Repeat O(n) O(n) intentionally.</p>`)
-		if math != "Potentially $O(n^2)$. Linear $O(n)$.\n\n$$\nx^2 + y^2\n$$\n\nRepeat O(n) O(n) intentionally." {
+		if math != "Potentially O(n^2). Linear O(n).\n\nx^2 + y^2\n\nRepeat O(n) O(n) intentionally." {
 			t.Fatalf("math duplicated or source/prose lost: %q", math)
+		}
+		for _, tc := range []struct{ tex, want string }{
+			{`R(i+t)<R(j+t)\qquad 0\le t\le k`, "R(i+t)<R(j+t)  0≤ t≤ k"},
+			{`j,\ j+1,\ \ldots,\ j+k`, "j, j+1, …, j+k"},
+			{`x_{i+1}^{2} \geq \alpha`, `x\_{i+1}^{2} ≥ α`},
+			{`\frac{a}{b} + \unknown{x}`, "` \\frac{a}{b} + \\unknown{x} `"},
+		} {
+			body := `<span class="katex-display"><span class="katex"><math><semantics><annotation encoding="application/x-tex">` + strings.ReplaceAll(tc.tex, "<", "&lt;") + `</annotation></semantics></math><span class="katex-html">DUPLICATE</span></span></span>`
+			if got := probe(body); got != tc.want {
+				t.Fatalf("terminal math %q: got %q want %q", tc.tex, got, tc.want)
+			}
 		}
 		got := probe(`<h1>Title</h1><h4>Detail</h4><p>A <strong>bold</strong>, <em>soft</em>, <del>gone</del> <code>a` + "`" + `b</code> and <a href="https://example.com/a(b)?q=x&amp;y=2" title="a &quot;quote&quot;">[link]</a>.<br>Next</p><ul><li>First<ul><li>Nested</li></ul></li><li>Second</li></ul><ol start="3"><li>Third</li><li>Fourth</li></ol><blockquote><p>Quote</p><p>More</p></blockquote><table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody><tr><td>A|B</td><td><code>x|y</code><br>next</td></tr></tbody></table><hr><div role="toolbar">PRIVATE TOOLBAR</div><div data-thinking>PRIVATE THOUGHT</div><span hidden>PRIVATE HIDDEN</span>`)
 		for _, want := range []string{"# Title", "#### Detail", "**bold**", "*soft*", "~~gone~~", "``a`b``", `[\[link\]](<https://example.com/a(b)?q=x&y=2> "a \"quote\"")`, "  \nNext", "- First\n  \n  - Nested", "3. Third\n4. Fourth", "> Quote\n> \n> More", "| Name | Value |\n| --- | --- |\n| A\\|B | `x\\|y`<br>next |", "\n\n---"} {
@@ -92,6 +104,39 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			if strings.Contains(got, forbidden) {
 				t.Errorf("leaked %q: %s", forbidden, got)
 			}
+		}
+		got = probe(`<img alt="Comparison diagram" src="https://example.com/diagram.png"><img src="https://chatgpt.com/backend-api/files/x?token=PRIVATE"><svg role="img"><title>Elimination</title><text>rotation 4 eliminated</text></svg><canvas></canvas><p>Literal \le in prose <code>\qquad O(n^2)</code>.</p>`)
+		for _, want := range []string{
+			"[Image: Comparison diagram] [source](<https://example.com/diagram.png>)",
+			"[Image: no accessible description; visual content not extracted]",
+			"[SVG: Elimination; rotation 4 eliminated]", "[Canvas: no accessible description; visual content not extracted]",
+			"Literal \\\\le in prose `\\qquad O(n^2)`.",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing fallback %q: %s", want, got)
+			}
+		}
+		if strings.Contains(got, "PRIVATE") {
+			t.Fatal("authenticated visual URL leaked")
+		}
+		// Semantic attributes/nesting from the inspected real comparison card;
+		// ordinary div paragraphs must not be flattened along with these rows.
+		card := `<div data-d-component="box"><p>The same mismatch survives when both starts shift.</p>`
+		for i, pair := range [][2]string{{"abac", "abad"}, {"bac", "bad"}, {"ac", "ad"}, {"c", "d"}} {
+			label := fmt.Sprintf("t = %d", i)
+			caption := fmt.Sprintf("Rotation %d beats rotation %d", i, i+4)
+			card += `<div data-d-component="row" data-d-direction="row"><div data-d-component="box"><p>` + label + `</p></div><div data-d-component="box"><div data-d-component="row" data-d-direction="row"><p>` + pair[0] + `</p><p>&lt;</p><p>` + pair[1] + `</p></div><p>` + caption + `</p></div><svg data-d-component="icon"><path d="M5.636 5.636"></path></svg></div>`
+		}
+		card += `<p><strong>Four rotations eliminated after one comparison spanning four characters.</strong></p></div><div><p>Separate paragraph.</p><p>Still separate.</p></div>`
+		got = probe(card)
+		for i, comparison := range []string{"abac < abad", "bac < bad", "ac < ad", "c < d"} {
+			want := fmt.Sprintf("- t = %d — %s Rotation %d beats rotation %d", i, comparison, i, i+4)
+			if !strings.Contains(got, want) {
+				t.Errorf("comparison row missing %q: %s", want, got)
+			}
+		}
+		if !strings.Contains(got, "Separate paragraph.\n\nStill separate.") || strings.Contains(got, "[SVG:") {
+			t.Fatalf("card grouping leaked icon or merged paragraphs: %s", got)
 		}
 	})
 	t.Run("code whitespace and safe fences", func(t *testing.T) {
