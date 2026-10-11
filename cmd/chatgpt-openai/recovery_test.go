@@ -61,6 +61,23 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 	if err := loaded.load(); err != nil || loaded.sessions["recover"].Dirty {
 		t.Fatal("recovery not durable", err)
 	}
+	// Normal completions also adopt the exact interrupted turn once and cache
+	// stable call IDs; the subsequent consumer tool result is a delta, not replay.
+	f2 := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{"weather observed"}}, answer: weatherAnswer, expected: "exact pending prompt"}
+	h2 := testHandler(f2.fakeBackend)
+	h2.client = f2
+	h2.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f2.expected}
+	a := assistant(t, request(h2, "auto", req))
+	b := assistant(t, request(h2, "auto", req))
+	if f2.reads != 1 || len(f2.prompts) != 0 || len(a.ToolCalls) != 1 || a.ToolCalls[0].ID != b.ToolCalls[0].ID || h2.sessions["auto"].Dirty {
+		t.Fatal("auto-adoption missed stable cache")
+	}
+	follow := req
+	follow.ToolChoice = "auto"
+	follow.Messages = append(append([]message{}, req.Messages...), a, message{Role: "tool", ToolCallID: a.ToolCalls[0].ID, Content: "fixture result"})
+	if w := request(h2, "auto", follow); w.Code != 200 || len(f2.prompts) != 1 || f2.urls[0] != "https://chatgpt.com/c/stored" || f2.reads != 1 {
+		t.Fatal("valid recovered tool loop replayed", w.Code)
+	}
 }
 func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 	for _, mode := range []string{"mismatch", "invalid-tools", "invalid-answer", "unavailable", "save-failure"} {
@@ -86,6 +103,15 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 				h.statePath = t.TempDir() // cannot rename file over directory
 			}
 			w := recoveryRequest(h, &req)
+			if mode == "invalid-answer" {
+				if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
+					t.Fatal("finished invalid output not safely classified", w.Code)
+				}
+				if retry := request(h, "recover", req); retry.Code != 502 || f.reads != 1 || len(f.prompts) != 0 {
+					t.Fatal("rejected retry resubmitted or re-read", retry.Code)
+				}
+				return
+			}
 			if w.Code == 200 || !h.sessions["recover"].Dirty || len(f.prompts) != 0 {
 				t.Fatal("ambiguous recovery cleared/resubmitted", w.Code)
 			}

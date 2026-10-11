@@ -46,10 +46,12 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 			strings.Contains(msg, "ambiguous multiple assistant")
 	}
 	deadline := time.Now().Add(90 * time.Second)
+	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	defer cancel()
 	var res chatgpt.TurnResult
 	for {
 		var err error
-		res, err = backend.ReadThreadTurn(r.Context(), s.URL, s.PendingPrompt)
+		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt)
 		if err == nil {
 			break
 		}
@@ -63,15 +65,22 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 		}
 		timer := time.NewTimer(5 * time.Second)
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			timer.Stop()
 			return false
 		case <-timer.C:
 		}
 	}
 	out, err := parseAnswer(res.Answer, *pending)
-	if err != nil || (out.Text == "" && len(out.Calls) == 0) {
-		log.Printf("[openai] session=%s adopted answer unusable: %v", id, err)
+	if err != nil {
+		if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
+			return false
+		}
+		log.Printf("[openai] session=%s completed stored output rejected; no calls delivered", id)
+		return true
+	}
+	if out.Text == "" && len(out.Calls) == 0 {
+		log.Printf("[openai] session=%s adopted answer empty", id)
 		return false
 	}
 	out.Reasoning = res.Reasoning
@@ -96,6 +105,27 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 	}
 	log.Printf("[openai] session=%s adopted interrupted final turn tool_calls=%d answer_bytes=%d", id, len(out.Calls), len(res.Answer))
 	return true
+}
+
+// A finished, bound response that failed strict validation cannot have delivered
+// partial calls. Retain its fingerprint so exact retries never resubmit it.
+func (h *handler) rejectCompleted(s *session, fingerprint string) error {
+	old := *s
+	s.Dirty, s.Phase, s.Fingerprint, s.Result = false, "invalid", fingerprint, result{}
+	if err := h.save(); err != nil {
+		*s = old
+		return err
+	}
+	return nil
+}
+
+func requestFingerprint(req completionsRequest) string {
+	b, _ := json.Marshal(struct {
+		Messages []message
+		Tools    []toolDef
+		Choice   any
+	}{req.Messages, req.Tools, req.ToolChoice})
+	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
 // Recovery never emits executable calls, never submits, and never clears an
@@ -133,6 +163,10 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 	s := h.sessions[id]
+	if s != nil && s.Phase == "invalid" {
+		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with the original transcript followed by a new ordinary user message"))
+		return
+	}
 	if s == nil || !s.Dirty || s.URL == "" {
 		apiError(w, 409, errors.New("no uncertain stored thread for this session"))
 		return
@@ -143,6 +177,10 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if req == nil || len(req.Messages) == 0 {
 		apiError(w, 409, errors.New("legacy journal requires exact original completion request including tools"))
+		return
+	}
+	if supplied != nil && requestFingerprint(*supplied) != requestFingerprint(*req) {
+		apiError(w, 409, errors.New("supplied request does not match the exact original pending request"))
 		return
 	}
 	prompt := s.PendingPrompt
@@ -170,7 +208,15 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := parseAnswer(res.Answer, *req)
 	if err != nil {
-		apiError(w, 409, err)
+		// Retain the bound original request for the new-user continuation gate.
+		old := *s
+		s.PendingRequest, s.PendingPrompt = req, prompt
+		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
+			*s = old
+			apiError(w, 500, serr)
+			return
+		}
+		apiError(w, 422, errors.New("completed stored output failed strict protocol validation; no tool calls were delivered; continue with a new ordinary user message"))
 		return
 	}
 	if out.Text == "" && len(out.Calls) == 0 {
@@ -191,7 +237,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	recovered := *s
 	recovered.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
-	recovered.Fingerprint, recovered.Result, recovered.Dirty = fp, out, false
+	recovered.Fingerprint, recovered.Result, recovered.Dirty, recovered.Phase = fp, out, false, ""
 	recovered.ToolsFP = toolsFingerprint(req.Tools)
 	recovered.PendingRequest, recovered.PendingPrompt = nil, ""
 	h.sessions[id] = &recovered

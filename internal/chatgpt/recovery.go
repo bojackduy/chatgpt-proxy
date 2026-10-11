@@ -1,11 +1,17 @@
 package chatgpt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
+	"github.com/yuin/goldmark"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,37 +32,43 @@ func firstDiffByte(a, b string) int {
 	return n
 }
 
-// windowAt returns ±40 bytes around off for mismatch evidence logging.
-func windowAt(s string, off int) string {
-	lo := off - 40
-	if lo < 0 {
-		lo = 0
-	}
-	hi := off + 40
-	if hi > len(s) {
-		hi = len(s)
-	}
-	return s[lo:hi]
-}
-
-// ReadThreadTurn only reads an existing finished turn. It validates against
-// the RENDERED page (the same representation the bridge normally extracts)
-// instead of the backend mapping API, which proved unreliable: the mapping
-// walk disagreed with the visibly rendered turn. The thread's last user
-// bubble must match the pending prompt (whitespace-normalized; rendered text
-// reflows), and a completed assistant body must follow it. Anything else
-// fails closed for a bounded retry or manual inspection.
+// ReadThreadTurn only reads an existing finished turn in an owned target. The
+// last rendered user bubble (or its exact ID-bound original text node) must
+// equal the full normalized pending prompt. Never walk the backend mapping to
+// guess the latest branch; only decode declared serialization for that DOM ID.
+// A completed assistant body must follow it. Anything else fails closed.
 func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnResult, error) {
 	if !threadPattern.MatchString(url) || prompt == "" {
 		return TurnResult{}, errors.New("recovery requires a stored thread and exact original prompt")
 	}
+	ctx, cancelRead := context.WithTimeout(ctx, 90*time.Second)
+	defer cancelRead()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tab, err := c.tabCtx(ctx)
+	_, err := c.tabCtx(ctx)
 	if err != nil {
 		return TurnResult{}, err
 	}
-	tab, cancel := requestContext(ctx, tab)
+	// Recovery must never reload the active adapter tab. Own a background
+	// target for navigation/readback and close only that target afterwards.
+	var tid target.ID
+	if err := chromedp.Run(c.browser, chromedp.ActionFunc(func(ctx context.Context) error {
+		var err error
+		tid, err = target.CreateTarget("about:blank").WithBackground(true).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
+		return err
+	})); err != nil {
+		return TurnResult{}, err
+	}
+	defer func() {
+		cleanup, done := context.WithTimeout(c.browser, 3*time.Second)
+		defer done()
+		_ = chromedp.Run(cleanup, chromedp.ActionFunc(func(ctx context.Context) error {
+			return target.CloseTarget(tid).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
+		}))
+	}()
+	owned, closeOwned := chromedp.NewContext(c.browser, chromedp.WithTargetID(tid))
+	defer closeOwned()
+	tab, cancel := requestContext(ctx, owned)
 	defer cancel()
 	nav, done := context.WithTimeout(tab, 45*time.Second)
 	defer done()
@@ -66,6 +78,17 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
 		return TurnResult{}, err
 	}
+	// Expand only the last user bubble's exact UI control; never a send,
+	// regenerate, edit, or global page button. React may update asynchronously.
+	var expanded bool
+	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryExpandJS, &expanded)); err != nil {
+		return TurnResult{}, err
+	}
+	if expanded {
+		if err := pause(tab, 200*time.Millisecond); err != nil {
+			return TurnResult{}, err
+		}
+	}
 	// Correlate in the rendered DOM: the last "You said:" bubble must match
 	// the pending prompt (whitespace-normalized; rendered text reflows), and
 	// a "ChatGPT said:" section must follow it, so a stale earlier answer can
@@ -73,9 +96,53 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	// rendered representation as the normal path.
 	var corr struct {
 		User       string `json:"user"`
+		UserID     string `json:"userID"`
 		AnswerNext bool   `json:"answerNext"`
+		Answers    int    `json:"answers"`
 	}
-	corrJS := `(() => {
+	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil {
+		return TurnResult{}, err
+	}
+	normSpace := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	want := normSpace(prompt)
+	userText := corr.User
+	if userText != want && corr.UserID != "" {
+		// The actual DOM-bound node, never a latest/branch mapping walk. The
+		// composer stores plain paragraphs as escaped CommonMark. Decode that
+		// declared format with a real parser, not guessed slash/prefix stripping.
+		if original, err := originalUserText(tab, corr.UserID); err == nil {
+			userText = normSpace(original)
+		}
+	}
+	if userText == "" || userText != want {
+		off := firstDiffByte(userText, want)
+		log.Printf("[chatgpt] adoption user-bubble mismatch rendered=%dB want=%dB diffoff=%d", len(userText), len(want), off)
+		return TurnResult{}, fmt.Errorf("stored user prompt does not exactly match original request (rendered %dB want %dB)", len(userText), len(want))
+	}
+	if !corr.AnswerNext {
+		return TurnResult{}, errors.New("current response is not finished and nonempty")
+	}
+	if corr.Answers != 1 {
+		return TurnResult{}, errors.New("ambiguous multiple assistant responses after stored user prompt")
+	}
+	visible, err := responseProbe(tab, nil)
+	if err != nil {
+		return TurnResult{}, err
+	}
+	if visible.Last == "" || visible.StopBtn || visible.ErrorText || visible.ContinueBtn || !visible.Complete {
+		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
+	}
+	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
+}
+
+const recoveryExpandJS = `(() => {
+	const h = [...document.querySelectorAll('h4')].filter(e => (e.textContent || '').trim() === 'You said:').at(-1);
+	const bs = [...(h?.nextElementSibling?.querySelectorAll('button') || [])].filter(b => (b.textContent || '').trim() === 'Show more');
+	if (bs.length !== 1) return false;
+	bs[0].click(); return true;
+})()`
+
+const recoveryUserJS = `(() => {
 	  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
 	  const h4s = [...document.querySelectorAll('h4')];
 	  let ui = -1;
@@ -85,51 +152,60 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	  if (ui < 0) return {user: '', answerNext: false};
 	  let el = h4s[ui].nextElementSibling, parts = [], next = false;
 	  while (el && el.tagName !== 'H4') {
-	    parts.push(el.innerText || '');
+	    const clone = el.cloneNode(true);
+	    for (const b of clone.querySelectorAll('button, [role="toolbar"], [aria-hidden="true"], [data-markdown-copy="exclude"]')) b.remove();
+	    for (const b of clone.querySelectorAll('br')) b.replaceWith(document.createTextNode('\n'));
+	    for (const b of clone.querySelectorAll('p')) b.append(document.createTextNode('\n'));
+	    parts.push(clone.textContent || '');
 	    el = el.nextElementSibling;
 	  }
+	  let answers = 0;
 	  for (let j = ui + 1; j < h4s.length; j++) {
-	    if ((h4s[j].textContent || '').trim() === 'ChatGPT said:') { next = true; break; }
+	    if ((h4s[j].textContent || '').trim() === 'ChatGPT said:') { next = true; answers++; }
 	  }
-	  return {user: norm(parts.join('\n')), answerNext: next};
+	  const h = h4s[ui];
+	  const owner = h.closest('[data-message-id], [data-chatgpt-search-message-ids], [data-turn-key]');
+	  const userID = owner?.getAttribute('data-message-id') || owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-turn-key') || '';
+	  return {user: norm(parts.join('\n')), userID, answerNext: next, answers};
 	})()`
-	if err := chromedp.Run(tab, chromedp.Evaluate(corrJS, &corr)); err != nil {
-		return TurnResult{}, err
+
+func originalUserText(tab context.Context, id string) (string, error) {
+	var source struct {
+		Text     string
+		Markdown bool
 	}
-	normSpace := func(s string) string {
-		return strings.Join(strings.Fields(s), " ")
+	js := fmt.Sprintf(`(async () => {
+	  const id = %s;
+	  if (!/^[a-zA-Z0-9-]+$/.test(id)) return {};
+	  const thread = location.pathname.split('/c/')[1];
+	  if (!thread) return {};
+	  const auth = await (await fetch('/api/auth/session')).json();
+	  if (!auth.accessToken) return {};
+	  const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers:{Authorization:'Bearer ' + auth.accessToken}});
+	  if (!r.ok) return {};
+	  const m = (await r.json()).mapping?.[id]?.message;
+	  if (m?.id !== id || m.author?.role !== 'user' || m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return {};
+	  return {Text:m.content.parts[0], Markdown:m.metadata?.serialization_metadata?.render_format === 'markdown'};
+	})()`, strconv.Quote(id))
+	if err := chromedp.Run(tab, chromedp.Evaluate(js, &source, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
+		return "", err
 	}
-	want := normSpace(prompt)
-	// ChatGPT collapses long user bubbles with a trailing expander whose
-	// label leaks into innerText (proven live: a byte-identical 1068B prompt
-	// rendered as 1082B with a 14B " … Show more" suffix). Strip one trailing
-	// occurrence before comparing — a submitted prompt never contains it, so
-	// the binding to this exact turn stays intact.
-	userText := corr.User
-	for _, suffix := range []string{" … Show more", " … Show less", "... Show more", "... Show less"} {
-		if strings.HasSuffix(userText, suffix) {
-			userText = strings.TrimSuffix(userText, suffix)
-			break
-		}
+	if source.Text == "" {
+		return "", errors.New("DOM-bound original user message unavailable")
 	}
-	if userText == "" || userText != want {
-		// Evidence for the inevitable near-miss: log WHERE the rendered
-		// bubble first diverges (byte offset + surrounding windows) so the
-		// transform can be identified instead of guessed. Still fails
-		// closed — this changes no decision, only debuggability.
-		off := firstDiffByte(userText, want)
-		log.Printf("[chatgpt] adoption user-bubble mismatch rendered=%dB want=%dB diffoff=%d renderedctx=%q wantctx=%q", len(userText), len(want), off, windowAt(userText, off), windowAt(want, off))
-		return TurnResult{}, fmt.Errorf("stored user prompt does not exactly match original request (rendered %dB want %dB)", len(userText), len(want))
+	if !source.Markdown {
+		return source.Text, nil
 	}
-	if !corr.AnswerNext {
-		return TurnResult{}, errors.New("current response is not finished and nonempty")
+	var rendered bytes.Buffer
+	if err := goldmark.New().Convert([]byte(source.Text), &rendered); err != nil {
+		return "", err
 	}
-	visible, err := responseProbe(tab, nil)
-	if err != nil {
-		return TurnResult{}, err
+	if bytes.Contains(rendered.Bytes(), []byte("<img")) {
+		return "", errors.New("serialized user source contains non-text image content")
 	}
-	if visible.Last == "" || visible.StopBtn || visible.ErrorText {
-		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
-	}
-	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
+	var text string
+	// Detached parse only: no HTML, scripts, links or resources enter the page.
+	decode := fmt.Sprintf(`(() => {const d = new DOMParser().parseFromString(%s, 'text/html');for(const e of d.querySelectorAll('br'))e.replaceWith(d.createTextNode('\n'));for(const e of d.querySelectorAll('p'))e.append(d.createTextNode('\n'));return d.body.textContent || '';})()`, strconv.Quote(rendered.String()))
+	err := chromedp.Run(tab, chromedp.Evaluate(decode, &text))
+	return text, err
 }

@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/chromedp/chromedp"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -160,6 +163,54 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			if got := probe(`<p>` + plain + `</p>`); got != plain {
 				t.Fatalf("plain answer changed: %q", got)
 			}
+		}
+	})
+	t.Run("exact collapsed user recovery and bound serialized source", func(t *testing.T) {
+		full := strings.Repeat("Long literal prompt_* with JSON \\\"quoted\\\".\n", 2200) + " … Show more"
+		set(`<div data-turn-key="fixture-user"><h4>You said:</h4><div><span class="text">truncated prefix</span><button onclick="this.parentElement.querySelector('.text').textContent=window.__full;this.textContent='Show less'">Show more</button><button aria-label="Copy message">Copy</button></div></div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div>finished</div></div>`)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__full = `+quoteJS(full), nil)); err != nil {
+			t.Fatal(err)
+		}
+		var expanded bool
+		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryExpandJS, &expanded)); err != nil || !expanded {
+			t.Fatal("scoped expansion failed", err)
+		}
+		var corr struct {
+			User, UserID string
+			Answers      int
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != strings.Join(strings.Fields(full), " ") || corr.UserID != "fixture-user" || corr.Answers != 1 {
+			t.Fatal("full exact binding or literal UI suffix lost", err)
+		}
+		set(`<div><h4>You said:</h4><div>old matching prompt</div><h4>ChatGPT said:</h4><div>old answer</div><h4>You said:</h4><div>genuinely different prompt</div><h4>ChatGPT said:</h4><div>new answer</div></div>`)
+		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != "genuinely different prompt" || corr.User == "old matching prompt" {
+			t.Fatal("stale prompt binding", err)
+		}
+		// The fallback reads only the exact DOM identity, not the latest node.
+		var messageID atomic.Value
+		messageID.Store("fixture-user")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/api/auth/session":
+				_, _ = w.Write([]byte(`{"accessToken":"fixture-token"}`))
+			case "/backend-api/conversation/fixture":
+				_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"fixture-user": map[string]any{"message": map[string]any{"id": messageID.Load(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{`\<wire\> \*literal\* [https://example.com](https://example.com) &#x20; \"quoted\"`}}, "metadata": map[string]any{"serialization_metadata": map[string]any{"render_format": "markdown"}}}}}})
+			default:
+				_, _ = w.Write([]byte(`{}`))
+			}
+		}))
+		defer server.Close()
+		if err := chromedp.Run(tab, chromedp.Navigate(server.URL+"/c/fixture")); err != nil {
+			t.Fatal(err)
+		}
+		text, err := originalUserText(tab, "fixture-user")
+		if err != nil || strings.Join(strings.Fields(text), " ") != `<wire> *literal* https://example.com "quoted"` {
+			t.Fatal("declared markdown did not decode exactly", err)
+		}
+		messageID.Store("different-node")
+		if _, err := originalUserText(tab, "fixture-user"); err == nil {
+			t.Fatal("mismatched backend identity accepted")
 		}
 	})
 }

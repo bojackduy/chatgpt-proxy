@@ -7,6 +7,7 @@ require (
 	github.com/chromedp/chromedp v0.16.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
+	github.com/yuin/goldmark v1.7.13
 	golang.org/x/sys v0.47.0
 )
 

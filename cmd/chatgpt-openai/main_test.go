@@ -207,6 +207,38 @@ func TestMalformedCalls(t *testing.T) {
 	if _, err := parseAnswer(weatherAnswer, weatherReq()); err != nil {
 		t.Fatal(err)
 	}
+	// A completely received invalid response delivers no partial calls, is
+	// durable across restart, and exact retries do not submit or execute again.
+	f := &fakeBackend{answers: []string{weatherAnswer + "\n<opencode_bridge_call>{", "ACK", "continued"}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	rejected := weatherReq()
+	if w := request(h, "invalid", rejected); w.Code != 502 || h.sessions["invalid"].Dirty || h.sessions["invalid"].Phase != "invalid" || len(h.sessions["invalid"].Result.Calls) != 0 {
+		t.Fatal("finished malformed output treated as unknown/delivered", w.Code)
+	}
+	loaded := testHandler(f)
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	if w := request(loaded, "invalid", rejected); w.Code != 502 || len(f.prompts) != 1 {
+		t.Fatal("invalid retry resubmitted", w.Code)
+	}
+	changedTools := rejected
+	changedTools.Tools = nil
+	changedTools.ToolChoice = "auto"
+	if w := request(loaded, "invalid", changedTools); w.Code != 409 || len(f.prompts) != 1 {
+		t.Fatal("schema-only retry bypassed rejected turn", w.Code)
+	}
+	continued := rejected
+	continued.ToolChoice = "auto"
+	continued.Messages = append(append([]message{}, rejected.Messages...), message{Role: "user", Content: "Continue without tools"})
+	if w := request(loaded, "invalid", continued); w.Code != 200 || loaded.sessions["invalid"].Dirty || loaded.sessions["invalid"].Phase != "" {
+		t.Fatal("new ordinary user turn failed", w.Code, w.Body.String())
+	}
+	if f.urls[1] != "" {
+		t.Fatal("new turn reused rejected thread")
+	}
 }
 func TestSessionsReadinessAndFallback(t *testing.T) {
 	f := &fakeBackend{}
@@ -251,6 +283,29 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 		t.Fatal("readiness backend failure must be 503", ready)
 	}
 	f.err = nil
+	for _, tc := range []struct {
+		url     string
+		err     error
+		handled bool
+	}{
+		{"https://chatgpt.com/c/reached", context.Canceled, true},
+		{"", context.Canceled, true},
+		{"", errors.New("navigate: page load error net::ERR_FAILED"), false},
+	} {
+		f := &fakeBackend{err: tc.err, errorURL: tc.url}
+		h := testHandler(f)
+		s := &session{URL: "https://chatgpt.com/c/old"}
+		w := httptest.NewRecorder()
+		if handled := h.serveRotation(w, httptest.NewRequest("POST", "/v1/chat/completions", nil), "rotate", "main", weatherReq(), s); handled != tc.handled || len(f.prompts) != 1 {
+			t.Fatal("rotation retried uncertain turn", handled)
+		}
+		if tc.handled && (!s.Dirty || s.Phase != "final" || s.URL != tc.url || w.Code != 502) {
+			t.Fatal("rotation lost uncertain target", s, w.Code)
+		}
+		if !tc.handled && (s.Dirty || s.URL != "https://chatgpt.com/c/old") {
+			t.Fatal("pre-submit fallback lost snapshot")
+		}
+	}
 }
 
 func TestNavigateFailureDoesNotWedgeFreshSession(t *testing.T) {
@@ -763,8 +818,12 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 			if strings.Contains(w2.Body.String(), `"tool_calls"`) {
 				t.Fatal("unexecuted call leaked", w2.Body.String())
 			}
-			if !h2.sessions["tools-gap"].Dirty {
-				t.Fatal("failed final did not keep dirty journal")
+			if h2.sessions["tools-gap"].Dirty || h2.sessions["tools-gap"].Phase != "invalid" {
+				t.Fatal("finished rejected final not durably classified")
+			}
+			n = len(f.prompts)
+			if retry := request(h2, "tools-gap", req); retry.Code != 502 || len(f.prompts) != n {
+				t.Fatal("rejected final retry resubmitted", retry.Code)
 			}
 		})
 	}

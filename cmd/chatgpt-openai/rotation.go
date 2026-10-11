@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -259,14 +260,27 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		Attachments: atts, Thinking: thinking,
 	})
 	if err != nil {
-		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=%v; using shared-project reset-replay", id, lane, err)
+		if res.URL != "" || !chatgpt.IsNavigateError(err) {
+			s.URL = res.URL
+			if serr := h.save(); serr != nil {
+				h.backendError(w, serr)
+				return true
+			}
+			h.backendError(w, err)
+			return true // submission may have happened: no automatic reset-replay
+		}
+		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=pre_submission_navigation; using shared-project reset-replay", id, lane)
 		restore()
 		return false
 	}
 	if res.URL == "" || !strings.Contains(res.URL, "/c/") {
-		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=no_thread_url; using shared-project reset-replay", id, lane)
-		restore()
-		return false
+		s.URL = ""
+		if serr := h.save(); serr != nil {
+			h.backendError(w, serr)
+			return true
+		}
+		h.backendError(w, errors.New("rotation returned no persistent thread URL; submission cannot be safely replayed"))
+		return true
 	}
 	b, _ := json.Marshal(struct {
 		Messages []message
@@ -284,7 +298,10 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		} else if projectURL != "" {
 			s.Project = projectURL
 		}
-		_ = h.save()
+		if serr := h.rejectCompleted(s, fingerprint); serr != nil {
+			h.backendError(w, serr)
+			return true
+		}
 		log.Printf("[openai] invalid tool protocol session=%s lane=%s decision=rotation thread=%s", id, lane, res.URL)
 		h.backendError(w, err)
 		return true
@@ -334,7 +351,7 @@ func (h *handler) eagerThreadTurn(r *http.Request, id, lane string, req completi
 		}
 	}
 	res, err := h.client.AskThreadTurn(r.Context(), opt)
-	if err != nil && eager && res.URL == "" && s.URL == "" {
+	if err != nil && eager && res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err) {
 		log.Printf("[openai] session=%s lane=%s eager_fallback reason=%v; using shared project", id, lane, err)
 		eager = false
 		res, err = h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{Prompt: t.prompt, URL: page, Attachments: t.atts, Thinking: thinking})

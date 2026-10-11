@@ -135,6 +135,8 @@ type session struct {
 	// "final" means the answer-seeking turn may have executed with unknown
 	// outcome — requires read-only adoption or 409. "" (legacy/unknown) is
 	// treated as "final", the conservative choice.
+	// "invalid" means a finished output failed strict validation and no calls
+	// were delivered; exact retries fail without resubmitting.
 	Phase          string    `json:",omitempty"`
 	ResyncMessages []message `json:",omitempty"`
 	ResyncFrom     string    `json:",omitempty"`
@@ -929,6 +931,10 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.Fingerprint == fingerprint {
+		if s.Phase == "invalid" {
+			apiError(w, 502, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; exact retries will not resubmit; send a new ordinary user message to continue in a fresh thread"))
+			return
+		}
 		if s.Result.ID == "" {
 			// Older state files did not persist completion metadata. Derive a
 			// stable fallback so legacy cached retries do not regenerate IDs.
@@ -939,6 +945,19 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := 0
+	if s.Phase == "invalid" {
+		pending := s.PendingRequest
+		if pending == nil || !prefix(req.Messages, pending.Messages) || len(req.Messages) <= len(pending.Messages) || req.Messages[len(pending.Messages)].Role != "user" {
+			apiError(w, 409, errors.New("rejected model output requires its original transcript followed by a new ordinary user message; no tool calls were delivered"))
+			return
+		}
+		// Do not consume the durable rejection gate until the new request has
+		// passed prompt/budget checks and is journaled for submission below.
+		next := *s
+		s = &next
+		s.URL, s.Messages, s.ToolsFP, s.Fingerprint, s.Result = "", nil, "", "", result{}
+		s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
+	}
 	url := s.URL
 	decision := "fresh"
 	if url != "" {
@@ -956,8 +975,8 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			decision, start, url = "reset-replay", 0, ""
 			// Flag-gated project-per-session: rotate into the session's
 			// dedicated project instead of reset-replaying. serveRotation
-			// returns false on any infra failure, falling back to the legacy
-			// reset-replay below; it never fails closed.
+			// falls back only on a proved pre-submission navigation failure;
+			// a possibly submitted turn remains protected.
 			if projectPerSessionEnabled() && id != "" && !resync {
 				if h.serveRotation(w, r, id, lane, req, s) {
 					return
@@ -1090,7 +1109,10 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.URL = url
 		if id != "" {
-			_ = h.save()
+			if serr := h.rejectCompleted(s, fingerprint); serr != nil {
+				h.backendError(w, serr)
+				return
+			}
 		}
 		log.Printf("[openai] invalid tool protocol session=%s thread=%s", id, url)
 		h.backendError(w, err)

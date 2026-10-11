@@ -2,7 +2,9 @@
 
 ## V2 subagent failures: uncertain turns and long waits
 
-**Status:** investigation deferred; no fix implemented for this report.
+**Status:** bridge recovery fixes implemented and under verification on
+2026-10-11; exact reported UI session attribution and real General/Explore
+reproduction remain unresolved. This item is not fully complete.
 
 **Reported symptom:** General ("Implement ActionBox backend MVP") and Explore
 ("Inspect browser ingestion options") both display session ID
@@ -16,6 +18,35 @@ to elapsed time; the original submission failure has not been correlated.
 A separate session had an incomplete tool wrapper followed by recovery comparing
 a 10,154-byte rendered prompt with a 90,499-byte submitted prompt. Do not
 attribute that separate failure to these subagents without evidence.
+
+**Proved scope:** the local adapter is launchd `com.chatgpt-proxy.openai` on
+127.0.0.1:8788 with state in `~/.chatgpt-proxy/openai-sessions.json` and Chrome
+profile `~/.chatgpt-proxy` on CDP 9222. Core v2 supplies `X-Session-Id` and
+`x-session-affinity` from its actual session ID; agent names do not separate
+main-lane journals. In the correlated `ses_ed62e2…` session, rotation submitted
+at 18:57:31 and a completed response failed strict tool-wrapper parsing at
+18:58:05. Subsequent retries read the same Dirty final journal, not a new
+generation. Recovery's 90-second wall-clock check previously did not bound
+individual browser reads; it now supplies an actual context deadline. Queueing
+and client retry/backoff can add elapsed time, but the reported 3m/17m54s UI
+durations are not fully correlated to individual request phases.
+
+**Implemented safeguards:** completed, strictly rejected protocol output delivers
+no partial calls and is durably classified separately from unknown submission.
+Exact retries do not resubmit; continuation requires the original transcript
+followed by a new ordinary user message, in a fresh thread. Unknown outcomes
+remain protected. Rotation/eager fallback is limited to proved pre-submission
+navigation errors; a possibly reached turn is not automatically replayed.
+Recovery navigates only an owned background target under the profile lock,
+expands only the last user bubble's Show more control, and removes UI controls
+structurally (never strips real prompt suffixes). For escaped rich user text,
+the exact DOM turn identity binds one backend user node; only its declared
+CommonMark serialization is parsed. Full normalized equality with the original
+pending prompt is still mandatory—no prefix matching or guessed unescaping.
+An isolated probe decoded the full live 91,925-byte serialized source to exactly
+the original 90,499-byte normalized prompt. Prompt windows and credentials are
+not logged. Live adoption/deployment status belongs in the goal evidence, not
+an assertion that the uncorrelated reported subagents are fixed.
 
 **Investigation scope:**
 - Correlate parent/child session IDs, outgoing identity headers, resolved adapter
