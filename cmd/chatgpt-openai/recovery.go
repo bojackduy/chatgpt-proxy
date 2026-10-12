@@ -24,7 +24,7 @@ type recoveryBackend interface {
 // the adopted transcript (Dirty and Phase cleared) and returns true; the
 // caller then falls through to normal request processing, so exact retries
 // hit the duplicate cache. On any failure it returns false and the caller
-// keeps the 409. It never submits, never executes tools, and never clears an
+// keeps terminal uncertainty. It never submits, never executes tools, and never clears an
 // ambiguous journal.
 func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bool {
 	pending := s.PendingRequest
@@ -95,12 +95,13 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", id, fp, i)))
 		out.Calls[i].ID = fmt.Sprintf("call_%x", sum[:12])
 	}
+	old := *s
 	s.Messages = append(append([]message{}, pending.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	s.Fingerprint, s.Result, s.Dirty, s.Phase = fp, out, false, ""
 	s.ToolsFP = toolsFingerprint(pending.Tools)
 	s.PendingRequest, s.PendingPrompt = nil, ""
 	if err := h.save(); err != nil {
-		s.Dirty = true
+		*s = old // retain the original pending binding if adoption was not durable
 		return false
 	}
 	log.Printf("[openai] session=%s adopted interrupted final turn tool_calls=%d answer_bytes=%d", id, len(out.Calls), len(res.Answer))

@@ -166,8 +166,8 @@ const recoveryUserJS = `(() => {
 	    if ((h4s[j].textContent || '').trim() === 'ChatGPT said:') { next = true; answers++; }
 	  }
 	  const h = h4s[ui];
-	  const owner = h.closest('[data-message-id], [data-chatgpt-search-message-ids], [data-turn-key]');
-	  const userID = owner?.getAttribute('data-message-id') || owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-turn-key') || '';
+	  const owner = h.nextElementSibling?.closest('[data-message-id], [data-chatgpt-search-message-ids]') || h.closest('[data-message-id], [data-chatgpt-search-message-ids], [data-turn-key]');
+	  const userID = (owner?.getAttribute('data-message-id') || owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-turn-key') || '').trim().split(/\s+/).at(-1);
 	  return {user: norm(parts.join('\n')), userID, answerNext: next, answers};
 	})()`
 

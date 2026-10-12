@@ -786,7 +786,10 @@ func parseAnswer(answer string, req completionsRequest) (result, error) {
 }
 
 func sessionID(r *http.Request) string {
-	for _, name := range []string{"X-Session-Id", "x-opencode-session", "x-session-affinity"} {
+	// Installed v2 sends the actual child in x-opencode-session-id, while
+	// X-Session-Id, x-opencode-session and affinity retain the root session.
+	// Affinity is a routing hint, not the authoritative transcript identity.
+	for _, name := range []string{"x-opencode-session-id", "X-Session-Id", "x-opencode-session", "x-session-affinity"} {
 		if id := r.Header.Get(name); id != "" {
 			return id
 		}
@@ -884,6 +887,33 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		h.sessions = map[string]*session{}
 	}
 	s := h.sessions[id]
+	// Preserve pre-upgrade rejection/uncertainty when a v2 child was journaled
+	// under its root affinity ID. Bind only an exact authoritative transcript
+	// prefix (including delivered call IDs/results), never user-text similarity.
+	// Keep the old journal intact: it may also contain a poisoned parent state.
+	legacyID := r.Header.Get("X-Session-Id")
+	if s == nil && lane == "main" && id != "" && id == r.Header.Get("x-opencode-session-id") && legacyID != id {
+		old := h.sessions[legacyID]
+		if old != nil && (old.Phase == "invalid" || old.Dirty) && old.PendingRequest != nil {
+			withoutSystem := func(messages []message) []message {
+				out := []message{}
+				for _, m := range messages {
+					if m.Role != "system" {
+						out = append(out, m)
+					}
+				}
+				return out
+			}
+			pending := withoutSystem(old.PendingRequest.Messages)
+			if len(pending) > 0 && prefix(withoutSystem(req.Messages), pending) {
+				inherited := *old
+				s = &inherited
+				h.sessions[id] = s
+				h.save()
+				log.Printf("[openai] session=%s bound legacy pending transcript from=%s phase=%s", id, legacyID, s.Phase)
+			}
+		}
+	}
 	if id == "" || s == nil {
 		s = &session{}
 	}
@@ -934,7 +964,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// Installed v2 retries HTTP409 as provider.internal. This request
 			// cannot safely progress without recovery, so return terminal422
 			// while retaining the exact same uncertainty/adoption protections.
-			apiError(w, 422, errors.New("session has an uncertain submitted turn; POST /v1/sessions/recover with the same session header and exact original request to validate/cache the stored response without resubmitting"))
+			apiError(w, 422, errors.New("session has an uncertain submitted turn; switching models does not resolve it. POST /v1/sessions/recover with the same session header and exact original request for read-only validation/cache; do not resubmit the original turn. If the original browser response cannot be verified, explicitly POST /v1/sessions/resync with the recorded completed transcript and tool results, then send a new user message; historical tools will not be rerun"))
 			return
 		}
 	}
@@ -1176,7 +1206,14 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	h.respond(w, req, out)
 }
 func (h *handler) backendError(w http.ResponseWriter, err error) {
-	log.Printf("[openai] BACKEND FAILURE: %v; REPAIR: check CDP port/profile login, composer/send/assistant DOM selectors, ChatGPT page alerts; uncertain sessions return 409", err)
+	log.Printf("[openai] BACKEND FAILURE: %v; REPAIR: check CDP port/profile login, composer/send/assistant DOM selectors, ChatGPT page alerts; uncertain completion requests require read-only recovery", err)
+	if errors.Is(err, chatgpt.ErrMissingAnswer) {
+		// Generation was observed but no answer can be delivered. A 5xx makes
+		// installed hosts retry an already-submitted turn. Keep its journal;
+		// lack of rendered text is not proof that the model generated nothing.
+		apiError(w, 422, err)
+		return
+	}
 	apiError(w, 502, err)
 }
 func (h *handler) respond(w http.ResponseWriter, req completionsRequest, out result) {

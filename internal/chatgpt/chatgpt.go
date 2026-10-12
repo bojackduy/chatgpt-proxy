@@ -44,6 +44,7 @@ var (
 	ErrNoComposer     = errors.New("chatgpt composer not found (no #prompt-textarea or ProseMirror contenteditable)")
 	ErrNoNewChat      = errors.New("could not find the New chat button")
 	ErrNoResponse     = errors.New("chatgpt did not produce a response in time")
+	ErrMissingAnswer  = errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread/rendering and recover the pending turn; no automatic resubmission")
 	ErrProjectSetup   = errors.New("project setup failed before turn submission")
 )
 
@@ -1011,7 +1012,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 			return "", "", errors.New("ChatGPT reported a page error; inspect the stored thread before recovery; no automatic resubmission")
 		}
 		if empty.expired(st, time.Now()) {
-			return "", "", errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread/rendering and recover the pending turn; no automatic resubmission")
+			return "", "", ErrMissingAnswer
 		}
 		if st.StopBtn {
 			stablePolls = 0

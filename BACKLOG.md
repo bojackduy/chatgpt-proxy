@@ -1,10 +1,167 @@
 # Backlog
 
+## 2026-10-12 missing answer: complete null-DIL tool-wrapper rendering
+
+**Fixed and deployed; pending answer recovered read-only.** The ordinary user
+correction `I said using loopd goal, not subagent` is in the exact final pending
+request for `ses_ed4229edfffeKXMTeqPnY2q5y1`. At local 11:00–11:03 three inert
+history imports returned ACK; the final turn stopped generating but extracted
+zero bytes. This is distinct from the earlier child/header rejection below.
+Owned background inspection under the profile turn lock found the final H4
+assistant identity `e267b0ed…` fresh and complete, with an empty DIL response root,
+no stop/continue control or page alert. Its exact DOM-ID-bound stored source is a
+finished final 3,374-byte literal tool wrapper. DIL metadata reports
+`invalid_tag_syntax`/`recovered_parse`, an empty fallbackMarkdown and renderer code
+returning null. It is not evidence of an empty model response, stale ACK adoption,
+a missing heading selector, quota/refusal, or a prompt that never submitted.
+
+The shared response probe now reads only this observed complete empty null-DIL
+wrapper case: exact fresh DOM ID, finished final source, declared ancestry to the
+latest DOM user, diagnostic metadata and an unchanged DOM boundary after the
+read. No renderer code or tool is executed; ordinary Markdown remains DOM-only.
+Existing Markdown/math/card serialization and adapter JSON/schema validation are
+unchanged. Recovery now obtains the actual last-user ID from the heading's
+adjacent bubble, allowing declared Markdown source decoding to prove the full
+original prompt despite UI reflow. Unknown/empty responses remain protected,
+never guessed or resubmitted. Missing-answer failures are terminal HTTP422 before
+SSE instead of the previous first-failure502; journals remain dirty until proved
+recovery. Truly retryable pre-submit infra failures retain their prior behavior.
+The actual installed opencode2 v2.0.26 executable classifies408/409/5xx as
+ProviderInternal (retryable) and other4xx, including422, as InvalidRequest
+(terminal); this was checked in the installed bundle, not inferred from a dev
+checkout or the separate Homebrew opencode v1 executable.
+
+Existing DOM/error tests were strengthened (no new test files/functions) for the
+captured duplicate IDs and sibling user bubble, byte-identical source JSON,
+stale baseline, wrong final/role/status/ancestry, reasoning-only/no assistant,
+generation in progress, normal rendered answer priority, terminal422 before SSE,
+retained exact journal and zero repeated submissions. Full Go vet/test/build
+passed; both binaries were atomically installed at an idle ready boundary under
+the profile lock, with ready=true before/after launchd restart and matching hashes.
+POST /v1/sessions/recover returned200, validated/cached one call without executing
+it, and cleared only this proved pending journal. No original completion request
+was replayed. Whether the user's client consumes the cache is unknown; retry the
+exact original request to receive it, or deliberately continue on the currently
+selected model with reviewed context. Current local host metadata shows a later
+model switch/continuation, but does not retain the original trigger/error message;
+it is not proof that the recovered cache was consumed. Other dirty sessions are
+unrelated and untouched. Evidence/artifacts: loopd goal `6f129324…`.
+
+## Model-switch continuation after a canceled browser turn
+
+**Status (2026-10-12):** cause correlated, safety/durability regression fixed and
+deployed; the original canceled turn is still unverified, not automatically
+recovered. Completed Muse work does not prove a pending ChatGPT answer finished.
+
+The current `ses_ed4229…` journal is a later turn than the earlier null-DIL
+recovery above: 112 saved messages, 113 pending messages, 12 tools, and a
+3,099-byte pending browser prompt. Its final message is a delivered tool result,
+not the later switch-back user question. Logs establish typing at 15:28:03,
+submission at 15:28:04, answer wait at 15:28:08, and client-context cancellation
+at 15:33:01. Therefore it cannot use the proved pre-submission retry path.
+The last DOM-bound user source readback normalizes to 1,473 bytes versus the
+original prompt's 3,096 bytes; original completion/delivery remains unknown.
+The exact reason that submission did not yield a matching stored user source
+is not established. Do not reinterpret this as a navigation failure or clear it
+because the alternative provider completed.
+
+Authenticated local host metadata confirms Muse completion/idle, switch back,
+a distinct ten-byte ordinary user message, and `provider.invalid-request` with
+actual HTTP 422 (not a retryable completion 409). Diagnostics retain IDs, sizes,
+hashes, phases and times, not private prompt/tool contents. Existing adoption
+already reads the **original** pending prompt and original schemas, then imports
+expanded completed alternative-provider exchanges inertly before the fresh
+request with current schemas. No model-specific random identity or tool replay
+is needed. The terminal error now explains that an unverifiable browser turn
+requires explicit authoritative-transcript resync, not resubmission.
+
+One additional defect was found: automatic adoption mutated its in-memory
+journal before saving and, on a failed save, discarded the original pending
+binding. It now restores the entire previous journal on that failure. Existing
+recovery tests were extended (no new bridge test files/functions) for two failed
+save/read-only retries, the actual pending tool-result role, current child/root
+headers, untouched parent uncertainty, stable original call IDs, changed current
+tool schemas, inert completed Muse calls, one fresh request, and restart-safe
+duplicate caching. Different/ambiguous source and rejected/metadata-only guards
+remain strict; formatting/media and replay/resync regressions remain covered.
+
+`go vet ./...`, `go test ./...`, `go build ./cmd/...` and both named binaries
+passed. Installed at an exclusive idle profile-lock boundary; readiness was true
+before and after launchd restart. OpenAI binary SHA256 begins `0f5e13e97887…`;
+MCP binary remains `5021c726d41d…`, matching the staged build. Existing running
+MCP processes were not interrupted. Evidence: goal `aebcf238…` (`audit.json`,
+`verification.log`, `deployment.json`, `live-probe.json`). A harmless browser-backed
+installed-adapter HTTP probe succeeded: initial marker, synthetic completed
+Muse-shaped call/result history, changed current schema with tool choice none,
+correct recalled marker, zero executable calls, identical duplicate cache,
+clean eight-message child journal and no root-affinity journal. This is live
+adapter catchup coverage, **not** an actual installed-host/Muse provider switch
+and not recovery of the original uncertain turn.
+
+**Safe continuation:** preserve the canceled journal. Only an exact, completed,
+DOM/source-bound original response can authorize read-only recovery/cache; then
+the exact original request obtains stable cached calls without browser replay.
+If that response cannot be verified, review the completed client transcript and
+tool results and explicitly arm `/v1/sessions/resync` with the same authoritative
+session header, followed by a new user message. Do not replay the original task,
+execute historical tools, or globally clear Dirty. Automatic recovery of the
+reported session is still blocked on that verification/review boundary.
+
 ## Shared adapter failures: uncertain turns, rejected continuation and long waits
 
 **Status:** bridge recovery fixes implemented and under verification on
 2026-10-11; exact reported UI session attribution and real General/Explore
 reproduction remain unresolved. This item is not fully complete.
+
+**2026-10-12 confirmed mobile-subagent root cause:** the actual child
+`ses_ed37aa…` has a 1,896-byte user message and eleven delivered call IDs exactly
+matching the 15-message rejected request stored under parent `ses_ed4229…`.
+Installed v2.0.26 was exercised with an isolated harmless subagent and mock SSE
+provider: `x-opencode-session-id` identifies the child, but `X-Session-Id`,
+`x-opencode-session` and `x-session-affinity` retain the parent/root. The adapter
+previously prioritized `X-Session-Id`, replacing the parent's journal with child
+history. A child protocol rejection consequently blocked the parent's legitimate
+already-delivered subagent-result continuation. This is not evidence that the
+parent needs a new ordinary user message, nor a reason to permit arbitrary tool
+results after rejected model calls.
+
+Identity resolution now prioritizes the actual `x-opencode-session-id`; legacy
+precedence is unchanged when it is absent. Existing rejected-state tests cover
+the real header envelope and child role shape, byte-identical parent isolation,
+no browser submission on exact child retry, restart persistence, and a parent's
+known-delivered tool continuation. Both binaries were rebuilt and installed
+under the profile turn lock with readiness true before/after launchd restart.
+Actual installed v2.0.26 browser-backed General subagent completed in an isolated
+private host: parent `ses_ed20e71…`, child `ses_ed20db86…`, separate clean journals
+and separate ChatGPT threads. The parent's delivered `subagent` call completed
+with the child's marker answer and the parent consumed its result and completed
+its own marker answer. This proves a real harmless subagent flow, not merely a
+parent-user fixture; broader Explore/long-running implementation remains untested.
+Historical poisoned journals were not cleared. A corrected child identity now
+inherits an old root-key rejection/uncertainty only when its authoritative
+non-system transcript exactly extends the old pending transcript, including
+call IDs/results (canonical SDK encoding, not user substring similarity).
+Tests prove transformed retries, fabricated appended results, persisted aliases,
+and uncertain submitted turns cannot resubmit; a genuinely distinct task can
+start independently. Old parent history cannot be reconstructed from overwritten
+journals, so no automatic ActionBox replay or child reset is attempted. Review
+already completed work and send explicit fresh context/new user instruction;
+do not blindly retry the rejected task or clear its journal. Read-only source
+diagnostics in an owned background target bound one user message exactly to the
+stored pending prompt, then inspected every declared final-response ancestry
+without selecting a latest branch or adopting a response. Original source answer
+`0ed28662…` (809 bytes, created 1791748442.924946) contains one authorized,
+schema-valid `shell` call plus 519 bytes of non-wrapper commentary. Its subsequent
+final continuation `73662c14…` (307 bytes, created 1791748496.410343, parent is the
+first answer) also contains one valid `shell` call plus 17 non-wrapper bytes.
+Both precede the child's protocol rejection at 1791748507792. Mixing commentary
+with executable bridge calls violates the existing strict protocol; neither
+response should execute. Escaped wrapper markers are already supported and are
+not the established defect. Existing child isolation test now uses a redacted
+schema-valid call plus commentary to reproduce this actual failure shape, and
+proves zero delivered child calls. Full raw prompts/arguments/results are not
+added to diagnostic logs. Current rejection/uncertainty recovery remains strict;
+diagnostic source inspection is not an adoption authority.
 
 The named-project setup failure is shared by v1/v2 clients, not v2-exclusive.
 The v1 graphify research request is correlated to `ses_ed41e2cc0ffep0eSn7og7zrC8h`:

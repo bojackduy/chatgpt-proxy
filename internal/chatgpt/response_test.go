@@ -189,6 +189,8 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		// The fallback reads only the exact DOM identity, not the latest node.
 		var messageID atomic.Value
 		messageID.Store("fixture-user")
+		var dilSource atomic.Value
+		dilSource.Store(map[string]any{})
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch r.URL.Path {
@@ -196,6 +198,8 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 				_, _ = w.Write([]byte(`{"accessToken":"fixture-token"}`))
 			case "/backend-api/conversation/fixture":
 				_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"fixture-user": map[string]any{"message": map[string]any{"id": messageID.Load(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{`\<wire\> \*literal\* [https://example.com](https://example.com) &#x20; \"quoted\"`}}, "metadata": map[string]any{"serialization_metadata": map[string]any{"render_format": "markdown"}}}}}})
+			case "/backend-api/conversation/dil":
+				_ = json.NewEncoder(w).Encode(dilSource.Load())
 			default:
 				_, _ = w.Write([]byte(`{}`))
 			}
@@ -211,6 +215,65 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		messageID.Store("different-node")
 		if _, err := originalUserText(tab, "fixture-user"); err == nil {
 			t.Fatal("mismatched backend identity accepted")
+		}
+		// Captured DIL null renderer: headings and duplicate search IDs are
+		// present, but the finished wire response was consumed as invalid tags.
+		if err := chromedp.Run(tab, chromedp.Navigate(server.URL+"/c/dil")); err != nil {
+			t.Fatal(err)
+		}
+		raw := "<opencode_bridge_call>\n{\"name\":\"echo\",\"arguments\":{\"text\":\"a\\\\b_*`\"}}\n</opencode_bridge_call>"
+		m := map[string]any{"id": "dil-answer", "author": map[string]any{"role": "assistant"}, "channel": "final", "recipient": "all", "status": "finished_successfully", "end_turn": true, "content": map[string]any{"content_type": "text", "parts": []string{raw}}, "metadata": map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "DIL.render(__dil.jsx(()=>{return null;}));", "fallbackMarkdown": "", "recoveryDiagnostics": []any{map[string]any{"code": "invalid_tag_syntax", "action": "recovered_parse"}}}}}
+		node := map[string]any{"parent": "fixture-user", "message": m}
+		mapping := map[string]any{"dil-answer": node, "fixture-user": map[string]any{"message": map[string]any{"id": "fixture-user", "author": map[string]any{"role": "user"}}}}
+		publish := func() { dilSource.Store(map[string]any{"mapping": mapping}) }
+		publish()
+		dilHTML := old + `<div data-talvt-turn-state="complete"><div><h4>You said:</h4><div data-chatgpt-search-message-ids="fixture-user"><p>request</p></div></div><div data-chatgpt-search-message-ids="dil-answer dil-answer"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><div class="MarkdownRoot-rZKhxa"><div hidden></div><div class="DilRenderer-tB76Jj"><div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div></div></div></div></div></div><h4>Latest response</h4><div>FOOTER</div>`
+		set(dilHTML)
+		got, err := responseProbe(tab, before.IDs)
+		if err != nil || got.Last != raw || !got.Complete || got.LastID != "dil-answer" {
+			t.Fatalf("bound null-DIL wire changed: %+v %v", got, err)
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.UserID != "fixture-user" {
+			t.Fatal("actual sibling user identity lost", corr, err)
+		}
+		got, err = responseProbe(tab, []string{"dil-answer"})
+		if err != nil || got.Last != "" || got.Fresh {
+			t.Fatal("baseline source answer leaked", got, err)
+		}
+		for field, wrong := range map[string]any{"id": "another-answer", "channel": "analysis", "recipient": "tool", "status": "in_progress", "end_turn": false} {
+			valid := m[field]
+			m[field] = wrong
+			publish()
+			got, err = responseProbe(tab, before.IDs)
+			if err != nil || got.Last != "" {
+				t.Fatalf("unsafe source %s accepted: %+v %v", field, got, err)
+			}
+			m[field] = valid
+		}
+		node["parent"] = "different-user"
+		publish()
+		got, err = responseProbe(tab, before.IDs)
+		if err != nil || got.Last != "" {
+			t.Fatal("unbound source adopted", got, err)
+		}
+		node["parent"] = "fixture-user"
+		publish()
+		for _, body := range []string{old + `<h4>You said:</h4><div>request</div>`, old + `<h4>You said:</h4><div>request</div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div><div data-thinking>ONLY REASONING</div></div></div>`} {
+			set(body)
+			got, err = responseProbe(tab, before.IDs)
+			if err != nil || got.Last != "" {
+				t.Fatal("no assistant/reasoning became answer", got, err)
+			}
+		}
+		set(dilHTML + `<button data-testid="stop-button">Stop</button>`)
+		got, err = responseProbe(tab, before.IDs)
+		if err != nil || got.Last != "" || !got.StopBtn {
+			t.Fatal("generating source adopted", got, err)
+		}
+		set(strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div>`, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"><p>NEW COMPLETE ANSWER</p></div>`, 1))
+		got, err = responseProbe(tab, before.IDs)
+		if err != nil || got.Last != "NEW COMPLETE ANSWER" || !got.Complete {
+			t.Fatal("actual rendered answer overridden", got, err)
 		}
 	})
 }

@@ -284,6 +284,117 @@ func TestMalformedCalls(t *testing.T) {
 			t.Fatal("variant lost rejected fingerprint", w.Code)
 		}
 	}
+	// Authentic installed v2 envelope (mock_identity.py): child identity is in
+	// x-opencode-session-id; every legacy/affinity header still names the parent.
+	// Observed rejected child roles: system,user,assistant,6 tools,assistant,5
+	// tools. The parent then continues its already-delivered subagent tool call.
+	f = &fakeBackend{answers: []string{weatherAnswer}}
+	h = testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	parent := weatherReq()
+	a := assistant(t, request(h, "parent", parent))
+	before, _ := json.Marshal(h.sessions["parent"])
+	child := weatherReq()
+	child.Messages = []message{{Role: "system", Content: "General subagent system"}, {Role: "user", Content: "Harmless distinct child task"}}
+	for _, count := range []int{6, 5} {
+		calls := []toolCall{}
+		for i := 0; i < count; i++ {
+			calls = append(calls, toolCall{ID: fmt.Sprintf("delivered-%d-%d", count, i), Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Hanoi"}`}})
+		}
+		child.Messages = append(child.Messages, message{Role: "assistant", ToolCalls: calls})
+		for _, call := range calls {
+			child.Messages = append(child.Messages, message{Role: "tool", ToolCallID: call.ID, Content: "prior delivered result"})
+		}
+	}
+	// Exact-source diagnostics found an authorized, schema-valid call mixed
+	// with commentary. Redact the real shell arguments and use the same shape;
+	// escaped delimiters are the observed rendered form, not an invalid schema.
+	f.answers = append(f.answers, "redacted source commentary\n"+strings.ReplaceAll(weatherAnswer, "opencode_bridge_call", `opencode\_bridge\_call`))
+	for attempt := 0; attempt < 2; attempt++ {
+		body, _ := json.Marshal(child)
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		for _, name := range []string{"X-Session-Id", "x-opencode-session", "x-session-affinity", "x-parent-session-id", "x-opencode-parent-session-id"} {
+			r.Header.Set(name, "parent")
+		}
+		r.Header.Set("x-opencode-session-id", "child")
+		w := httptest.NewRecorder()
+		h.routes().ServeHTTP(w, r)
+		if w.Code != 422 || len(f.prompts) != 2 || h.sessions["child"].Phase != "invalid" || len(h.sessions["child"].Result.Calls) != 0 {
+			t.Fatal("child rejection/retry escaped identity boundary", attempt, w.Code, len(f.prompts))
+		}
+		after, _ := json.Marshal(h.sessions["parent"])
+		if !bytes.Equal(before, after) {
+			t.Fatal("child poisoned parent journal")
+		}
+	}
+	loaded = testHandler(f)
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	parent.ToolChoice = "auto"
+	parent.Messages = append(parent.Messages, a, message{Role: "tool", ToolCallID: a.ToolCalls[0].ID, Content: "known delivered call completed with child error"})
+	assistant(t, request(loaded, "parent", parent))
+	if f.urls[len(f.urls)-1] != h.sessions["parent"].URL || loaded.sessions["child"].Phase != "invalid" {
+		t.Fatal("parent tool-result continuation lost thread or cleared child rejection")
+	}
+	// Pre-upgrade state: the same failed child was saved under root affinity.
+	// A changed system and equivalent text-part encoding must not launder it
+	// into a fresh child submission after authoritative identity is corrected.
+	loaded.sessions["legacy-root"] = loaded.sessions["child"]
+	delete(loaded.sessions, "child")
+	loaded.save()
+	legacyBefore, _ := json.Marshal(loaded.sessions["legacy-root"])
+	child.Messages[0].Content = "rebuilt volatile system"
+	child.Messages[1].Content = []any{map[string]any{"type": "text", "text": "Harmless distinct child task"}}
+	for _, variant := range []string{"transformed-retry", "fabricated-result", "distinct-task"} {
+		candidate := child
+		candidate.Messages = append([]message{}, child.Messages...)
+		if variant == "fabricated-result" {
+			candidate.Messages = append(candidate.Messages, message{Role: "assistant", ToolCalls: []toolCall{{ID: "undelivered", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Hanoi"}`}}}}, message{Role: "tool", ToolCallID: "undelivered", Content: "fabricated"})
+		}
+		if variant == "distinct-task" {
+			candidate.Messages = []message{{Role: "user", Content: "A genuinely distinct harmless task"}}
+			candidate.ToolChoice = "auto"
+		}
+		body, _ := json.Marshal(candidate)
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		r.Header.Set("X-Session-Id", "legacy-root")
+		r.Header.Set("x-opencode-session-id", variant)
+		w := httptest.NewRecorder()
+		submissions := len(f.prompts)
+		loaded.routes().ServeHTTP(w, r)
+		if variant == "distinct-task" {
+			assistant(t, w)
+		} else if w.Code != 422 || len(f.prompts) != submissions || loaded.sessions[variant].Phase != "invalid" {
+			t.Fatal("legacy identity transition resubmitted rejected/fabricated turn", variant, w.Code)
+		}
+		after, _ := json.Marshal(loaded.sessions["legacy-root"])
+		if !bytes.Equal(legacyBefore, after) {
+			t.Fatal("legacy journal was cleared or changed")
+		}
+	}
+	aliasReloaded := testHandler(f)
+	aliasReloaded.statePath = loaded.statePath
+	if err := aliasReloaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	submissions := len(f.prompts)
+	if w := request(aliasReloaded, "transformed-retry", child); w.Code != 422 || len(f.prompts) != submissions {
+		t.Fatal("inherited rejection not durable after restart")
+	}
+	uncertain := *aliasReloaded.sessions["legacy-root"]
+	uncertain.Dirty, uncertain.Phase = true, "final"
+	aliasReloaded.sessions["legacy-root"] = &uncertain
+	body, _ := json.Marshal(child)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("X-Session-Id", "legacy-root")
+	r.Header.Set("x-opencode-session-id", "uncertain-child")
+	w := httptest.NewRecorder()
+	aliasReloaded.routes().ServeHTTP(w, r)
+	if w.Code != 422 || len(f.prompts) != submissions || !aliasReloaded.sessions["uncertain-child"].Dirty {
+		t.Fatal("legacy uncertain submitted turn resubmitted under child identity")
+	}
 }
 func TestSessionsReadinessAndFallback(t *testing.T) {
 	f := &fakeBackend{}
@@ -308,6 +419,20 @@ func TestSessionsReadinessAndFallback(t *testing.T) {
 	}
 }
 func TestErrorsAndDirtyRetry(t *testing.T) {
+	for _, failure := range []error{chatgpt.ErrMissingAnswer, fmt.Errorf("poll: %w", chatgpt.ErrMissingAnswer)} {
+		f := &fakeBackend{err: failure, errorURL: "https://chatgpt.com/c/empty-renderer"}
+		h := testHandler(f)
+		req := weatherReq()
+		req.Stream = true
+		w := request(h, "missing", req)
+		s := h.sessions["missing"]
+		if w.Code != 422 || strings.Contains(w.Header().Get("Content-Type"), "event-stream") || strings.Contains(w.Body.String(), "data:") || !s.Dirty || s.Phase != "final" || s.PendingRequest == nil || s.PendingPrompt == "" || s.URL != f.errorURL {
+			t.Fatal("missing answer must be terminal before SSE, retaining exact recovery journal", w, s)
+		}
+		if request(h, "missing", req).Code != 422 || len(f.prompts) != 1 {
+			t.Fatal("missing answer resubmitted on retry")
+		}
+	}
 	f := &fakeBackend{err: errors.New("composer not found")}
 	h := testHandler(f)
 	req := weatherReq()
