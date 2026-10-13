@@ -10,7 +10,15 @@ import (
 )
 
 func tryTurnLock(f *os.File) error {
-	return unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	return tryProfileLock(f, false)
+}
+
+func tryProfileLock(f *os.File, shared bool) error {
+	mode := unix.LOCK_EX
+	if shared {
+		mode = unix.LOCK_SH
+	}
+	return unix.Flock(int(f.Fd()), mode|unix.LOCK_NB)
 }
 
 func turnLockContended(err error) bool {

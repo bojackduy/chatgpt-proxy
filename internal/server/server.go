@@ -135,7 +135,11 @@ func (h *Handler) askChatgpt(ctx context.Context, args json.RawMessage) mcp.Tool
 
 	// Cross-process turn lock: the :8788 adapter drives the same Chrome
 	// from another process. Read-only probes skip it; whole turns hold it.
-	unlock, err := chatgpt.LockTurn(ctx, h.profileDir)
+	lock := chatgpt.LockTurn
+	if owned, ok := h.cg.(interface{ UsesOwnedTabs() bool }); ok && owned.UsesOwnedTabs() {
+		lock = chatgpt.LockOwnedTurn
+	}
+	unlock, err := lock(ctx, h.profileDir)
 	if err != nil {
 		return mcp.ErrorResult("bridge busy: " + err.Error())
 	}
@@ -149,7 +153,11 @@ func (h *Handler) askChatgpt(ctx context.Context, args json.RawMessage) mcp.Tool
 }
 
 func (h *Handler) status(ctx context.Context) mcp.ToolResult {
-	unlock, err := chatgpt.LockTurn(ctx, h.profileDir)
+	lock := chatgpt.LockTurn
+	if owned, ok := h.cg.(interface{ UsesOwnedTabs() bool }); ok && owned.UsesOwnedTabs() {
+		lock = chatgpt.LockOwnedTurn
+	}
+	unlock, err := lock(ctx, h.profileDir)
 	if err != nil {
 		return mcp.ErrorResult("bridge busy: " + err.Error())
 	}

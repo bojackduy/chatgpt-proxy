@@ -50,6 +50,7 @@ func run() error {
 
 	cg := chatgpt.New(*chromePort, *profile, *chrome)
 	cg.Background = *background
+	cg.DedicatedTab, cg.SetupLocks = true, true
 	defer cg.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
