@@ -76,6 +76,7 @@ type Client struct {
 	ChromePath   string // optional override; auto-detected when empty
 	Background   bool   // run Chrome window in background (off-screen / minimized)
 	DedicatedTab bool   // do not reuse the MCP/user's existing ChatGPT tab
+	SetupLocks   bool   // coordinate only setup when using owned parallel targets
 
 	mu      sync.Mutex
 	life    context.Context // long-lived parent for browser/tab contexts
@@ -89,6 +90,8 @@ type Client struct {
 	launchAttempted bool
 	launchPort      int
 	actualPort      int
+	pool            *Pool
+	ownedTarget     target.ID
 }
 
 // New builds a client with defaults for anything zero-valued.
@@ -119,6 +122,15 @@ func (c *Client) Close() {
 // teardownLocked drops the tab and allocator contexts. Callers must hold c.mu.
 // Nil-safe: double teardown is a no-op.
 func (c *Client) teardownLocked() {
+	if c.ownedTarget != "" {
+		// Only explicit newly-created targets are ours to close. Context
+		// cancellation of an attached target merely detaches its CDP session.
+		client := http.Client{Timeout: 2 * time.Second}
+		if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/close/%s", c.actualPort, c.ownedTarget)); err == nil {
+			resp.Body.Close()
+		}
+		c.ownedTarget = ""
+	}
 	if c.tabDone != nil {
 		c.tabDone()
 		c.tabDone = nil
@@ -157,6 +169,9 @@ func (c *Client) tabAlive() bool {
 // one with the dedicated profile. Safe to call repeatedly — once launched,
 // the same port is reused and never relaunched while this process lives.
 func (c *Client) ensureBrowser(ctx context.Context) error {
+	if c.pool != nil {
+		return c.pool.connectClient(ctx, c)
+	}
 	if c.browser != nil {
 		if c.browserAlive() {
 			return nil
@@ -368,8 +383,22 @@ func (c *Client) tabCtx(ctx context.Context) (context.Context, error) {
 		log.Printf("[chatgpt] tab connection dead; re-attaching")
 		c.teardownLocked()
 	}
+	if c.SetupLocks && c.pool == nil {
+		unlock, err := LockSetup(ctx, c.ProfileDir)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+	}
 	if err := c.ensureBrowser(ctx); err != nil {
 		return nil, err
+	}
+	if c.SetupLocks && c.pool != nil {
+		unlock, err := LockSetup(ctx, c.ProfileDir)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 	}
 	// A freshly launched browser answers /json/version before its first
 	// window exists, and Target.createTarget fails until then ("no browser
@@ -393,7 +422,11 @@ func (c *Client) tabCtx(ctx context.Context) (context.Context, error) {
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("alloc: %w", lastErr)
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
@@ -440,7 +473,11 @@ func (c *Client) findOrCreateTab() (target.ID, error) {
 	if created.ID == "" {
 		return "", errors.New("empty target id from /json/new")
 	}
-	if c.DedicatedTab {
+	c.ownedTarget = target.ID(created.ID)
+	if c.DedicatedTab && c.pool == nil {
+		// Pool workers each own a short-lived target and must not clobber
+		// the shared file: it would point the next restart at an already-
+		// closed target. Owned clients never adopt by ID anyway.
 		if err := os.MkdirAll(c.ProfileDir, 0700); err != nil {
 			return "", err
 		}
@@ -684,11 +721,59 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	}
 
 	// 4. Submit.
+	var cprobe struct {
+		Found   bool   `json:"found"`
+		Exact   bool   `json:"exact"`
+		CompLen int    `json:"compLen"`
+		WantLen int    `json:"wantLen"`
+		Off     int    `json:"off"`
+		CompCtx string `json:"compCtx"`
+		WantCtx string `json:"wantCtx"`
+	}
+	if err := chromedp.Run(tab, chromedp.Evaluate(fmt.Sprintf(`(() => {
+	  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
+	  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+	  // The composer defuses markdown autolinks: "<https://…>" becomes
+	  // "< https://…>" (proven live: esp-idf URL, +1B at the break). Apply
+	  // the same rule to the wanted text — the model receives the composer
+	  // content either way; the check binds identity, not bytes.
+	  const want = norm(%s).replace(/<(https?:\/\/)/g, '< $1');
+	  if (!e) return {found:false, exact:false, compLen:0, wantLen:want.length, off:0, compCtx:'', wantCtx:''};
+	  const comp = norm(e.innerText || e.value);
+	  if (comp === want) return {found:true, exact:true, compLen:comp.length, wantLen:want.length, off:0, compCtx:'', wantCtx:''};
+	  let off = 0;
+	  const n = Math.min(comp.length, want.length);
+	  while (off < n && comp[off] === want[off]) off++;
+	  const win = s => s.slice(Math.max(0, off-40), off+40);
+	  return {found:true, exact:false, compLen:comp.length, wantLen:want.length, off, compCtx:win(comp), wantCtx:win(want)};
+	})()`, strconv.Quote(opt.Prompt)), &cprobe)); err != nil {
+		return out, err
+	}
+	if !cprobe.Exact {
+		// Evidence for the systematic chunk-2-style mismatch: log WHERE the
+		// composer diverges so the transform can be identified, not guessed.
+		// Still fails closed — nothing submits on mismatch. Best-effort wipe
+		// first: a partial insert must not persist as a draft that poisons
+		// retries or another session's pooled tab.
+		log.Printf("[chatgpt] composer mismatch found=%v compLen=%d wantLen=%d diffoff=%d compctx=%q wantctx=%q", cprobe.Found, cprobe.CompLen, cprobe.WantLen, cprobe.Off, cprobe.CompCtx, cprobe.WantCtx)
+		wipeCtx, wipeCancel := context.WithTimeout(tab, 5*time.Second)
+		_ = chromedp.Run(wipeCtx, chromedp.Evaluate(`(() => {
+		  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
+		  if (!e) return;
+		  try {
+		    if (e.tagName === 'TEXTAREA') { e.value = ''; }
+		    else { e.innerHTML = ''; }
+		    e.dispatchEvent(new Event('input', { bubbles: true }));
+		  } catch (_) {}
+		})()`, nil))
+		wipeCancel()
+		return out, errors.New("composer does not exactly match this turn; nothing submitted")
+	}
 	before, err := responseProbe(tab, nil)
 	if err != nil {
 		return out, err
 	}
-	log.Printf("[chatgpt] submitting prompt...")
+	log.Printf("[chatgpt] target=%s submitting prompt...", chromedp.FromContext(tab).Target.TargetID)
 	if err := c.submit(ctx, tab); err != nil {
 		return out, err
 	}
@@ -742,6 +827,15 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (TurnResult
 	page := opt.URL
 	projectURL := ""
 	if page == "" {
+		unlock := func() {}
+		if c.SetupLocks {
+			var err error
+			unlock, err = LockSetup(ctx, c.ProfileDir)
+			if err != nil {
+				return TurnResult{}, err
+			}
+			defer unlock()
+		}
 		switch {
 		case opt.ProjectURL != "":
 			if !projectPattern.MatchString(opt.ProjectURL) {
@@ -760,6 +854,7 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (TurnResult
 				return TurnResult{}, err
 			}
 		}
+		unlock() // shared project setup ends before any prompt is submitted
 	}
 	res, err := c.askLocked(ctx, opt, page, DefaultTimeout, 3*time.Second, nil)
 	if err != nil {
@@ -859,28 +954,39 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	insert := fmt.Sprintf(`(() => {
 	  const t = %s;
 	  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-	  if (!el) return false;
+	  if (!el) return 'missing';
 	  el.focus();
+	  // Wipe deterministically FIRST. A leftover draft — from a failed turn
+	  // on this thread, or another session's pooled tab — must never prepend
+	  // or append: the submit check would fail closed every retry, and worse,
+	  // a partial wipe could submit foreign text. Bail out if the wipe fails.
+	  try {
+	    if (el.tagName === 'TEXTAREA') { el.value = ''; }
+	    else { el.innerHTML = ''; }
+	    el.dispatchEvent(new Event('input', { bubbles: true }));
+	    el.focus();
+	  } catch (e) {}
+	  if ((el.innerText || el.value || '').length > 0) return 'dirty';
 	  try { document.execCommand('insertText', false, t); } catch (e) {}
-	  if ((el.innerText || el.value || '').length > 0) return true;
+	  if ((el.innerText || el.value || '').length > 0) return 'ok';
 	  try {
 	    const dt = new DataTransfer();
 	    dt.setData('text/plain', t);
 	    el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-	    return true;
+	    if ((el.innerText || el.value || '').length > 0) return 'ok';
 	  } catch (e) {}
-	  if (el.tagName === 'TEXTAREA') {
-	    el.value = t;
-	    el.dispatchEvent(new Event('input', { bubbles: true }));
-	    return true;
-	  }
-	  return false;
+	  return 'empty';
 	})()`, strconv.Quote(prompt))
-	var ok bool
-	if err := chromedp.Run(typeCtx, chromedp.Evaluate(insert, &ok)); err != nil {
+	var inserted string
+	if err := chromedp.Run(typeCtx, chromedp.Evaluate(insert, &inserted)); err != nil {
 		return fmt.Errorf("type prompt: %w", err)
 	}
-	if !ok {
+	switch inserted {
+	case "ok":
+		break
+	case "dirty":
+		return errors.New("type prompt: composer draft stuck, refusing to type over foreign text")
+	default:
 		return ErrNoComposer
 	}
 	// Confirm the composer actually holds the payload. If the renderer converted
@@ -1006,7 +1112,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 		if err != nil {
 			return "", "", fmt.Errorf("poll: %w", err)
 		}
-		log.Printf("[chatgpt] poll: stop=%v, cont=%v, err=%v, len=%d reasoning=%d", st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning))
+		log.Printf("[chatgpt] target=%s poll: stop=%v, cont=%v, err=%v, len=%d reasoning=%d", chromedp.FromContext(tab).Target.TargetID, st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning))
 
 		if st.ErrorText {
 			return "", "", errors.New("ChatGPT reported a page error; inspect the stored thread before recovery; no automatic resubmission")

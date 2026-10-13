@@ -157,7 +157,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.release()
-	unlock, err := chatgpt.LockTurn(r.Context(), h.profileDir)
+	unlock, err := h.lockTurn(r.Context())
 	if err != nil {
 		log.Printf("[openai] turn lock: %v", err)
 		apiError(w, http.StatusServiceUnavailable, err)

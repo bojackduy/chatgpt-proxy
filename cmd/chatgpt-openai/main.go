@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +32,14 @@ func main() {
 }
 
 func run() error {
+	parallelDefault := 1
+	if raw := os.Getenv("CHATGPT_BRIDGE_MAX_PARALLEL"); raw != "" {
+		var err error
+		parallelDefault, err = strconv.Atoi(raw)
+		if err != nil {
+			return errors.New("CHATGPT_BRIDGE_MAX_PARALLEL must be 1 or 2")
+		}
+	}
 	addr := flag.String("addr", "127.0.0.1:8788", "listen address")
 	port := flag.Int("chrome-port", 9222, "Chrome debugging port")
 	profile := flag.String("profile", defaultProfile(), "Chrome profile")
@@ -40,13 +49,34 @@ func run() error {
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per ChatGPT turn (chunk); long histories are replayed in chunks of this size, never one giant paste")
 	thinking := flag.Bool("thinking", false, "always select the ChatGPT Thinking model (reasoning)")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
+	maxParallel := flag.Int("max-parallel", parallelDefault, "maximum concurrent owned browser turns (1 serial compatibility, 2 parallel)")
 	flag.Parse()
+	if *maxParallel < 1 || *maxParallel > 2 {
+		return errors.New("max-parallel must be 1 or 2")
+	}
+	ownerCtx, ownerCancel := context.WithTimeout(context.Background(), time.Second)
+	ownerUnlock, err := chatgpt.LockState(ownerCtx, *state)
+	ownerCancel()
+	if err != nil {
+		return fmt.Errorf("session state already owned or unavailable: %w", err)
+	}
+	defer ownerUnlock()
 	cg := chatgpt.New(*port, *profile, *chrome)
 	cg.Background, cg.DedicatedTab = *background, true
 	defer cg.Close()
 	h := &handler{client: cg, model: *model, maxChars: *maxChars, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
 	if err := h.load(); err != nil {
 		return err
+	}
+	if *maxParallel > 1 {
+		pool := chatgpt.NewPool(*port, *profile, *chrome, *background, *maxParallel)
+		defer pool.Close()
+		h.browserPool, h.client = pool, pool.Root
+		clients := make([]backend, len(pool.Clients))
+		for i, client := range pool.Clients {
+			clients[i] = client
+		}
+		h.enableParallel(clients)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -57,9 +87,9 @@ func run() error {
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	}()
-	log.Printf("[openai] listening=%s model=%s dedicated_tab=true state=%s chrome_port=%d", *addr, *model, *state, *port)
+	log.Printf("[openai] listening=%s model=%s dedicated_tab=true state=%s chrome_port=%d max_parallel=%d", *addr, *model, *state, *port, *maxParallel)
 	log.Print("[openai] REPAIR: login in ~/.chatgpt-proxy Chrome; CDP: localhost:9222/json/version; DOM selectors: internal/chatgpt/chatgpt.go; restart: launchctl kickstart -k gui/$(id -u)/com.chatgpt-proxy.openai")
-	err := srv.ListenAndServe()
+	err = srv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -147,14 +177,18 @@ type session struct {
 	Project string `json:",omitempty"`
 }
 type handler struct {
-	client        backend
-	model         string
-	maxChars      int
-	statePath     string
-	profileDir    string // Chrome profile dir; scopes the cross-process turn lock
-	forceThinking bool
-	gate          chan struct{} // serializes browser transactions and all state access; cancellation-aware
-	sessions      map[string]*session
+	client           backend
+	model            string
+	maxChars         int
+	statePath        string
+	profileDir       string // Chrome profile dir; scopes the cross-process turn lock
+	forceThinking    bool
+	gate             chan struct{} // serializes browser transactions and all state access; cancellation-aware
+	sessions         map[string]*session
+	parallel         *parallelState
+	transactionOwner *handler
+	transactionID    string
+	browserPool      *chatgpt.Pool
 }
 
 func (h *handler) routes() http.Handler {
@@ -164,9 +198,9 @@ func (h *handler) routes() http.Handler {
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/readyz", h.readyz)
-	mux.HandleFunc("/v1/chat/completions", h.completions)
-	mux.HandleFunc("/v1/sessions/recover", h.recoverSession)
-	mux.HandleFunc("/v1/sessions/resync", h.resyncSession)
+	mux.HandleFunc("/v1/chat/completions", h.transactionRoute((*handler).completions))
+	mux.HandleFunc("/v1/sessions/recover", h.transactionRoute((*handler).recoverSession))
+	mux.HandleFunc("/v1/sessions/resync", h.transactionRoute((*handler).resyncSession))
 	return mux
 }
 func (h *handler) acquire(ctx context.Context) bool {
@@ -193,6 +227,9 @@ func (h *handler) load() error {
 	return json.Unmarshal(b, &h.sessions)
 }
 func (h *handler) save() error {
+	if h.transactionOwner != nil {
+		return h.commitSession()
+	}
 	if h.statePath == "" {
 		return nil
 	}
@@ -224,6 +261,29 @@ func apiError(w http.ResponseWriter, status int, err error) {
 func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	if h.parallel != nil {
+		// A busy pool is healthy, not unavailable. Probe only its separate
+		// owned root target; never borrow/navigate a live worker's thread.
+		var st *chatgpt.Status
+		var err error
+		if h.browserPool != nil {
+			st, err = h.browserPool.LoginState(ctx)
+		} else {
+			st, err = h.client.LoginState(ctx)
+		}
+		if err != nil {
+			apiError(w, 503, err)
+			return
+		}
+		ready := st.LoggedIn && st.Composer
+		code := 200
+		if !ready {
+			code = 503
+		}
+		capacity, available := cap(h.parallel.clients), len(h.parallel.clients)
+		writeJSON(w, code, map[string]any{"ready": ready, "status": st, "max_parallel": capacity, "active": capacity - available, "available": available})
+		return
+	}
 	if !h.acquire(ctx) {
 		apiError(w, 503, ctx.Err())
 		return
@@ -876,7 +936,9 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	defer h.release()
 	// Cross-process turn lock (after the in-process gate — always this
 	// order): the MCP server drives the same Chrome from another process.
-	unlock, err := chatgpt.LockTurn(r.Context(), h.profileDir)
+	// Parallel transactions already hold the shared owned-turn guard, so
+	// re-acquire it shared (see lockTurn); serial mode takes it exclusive.
+	unlock, err := h.lockTurn(r.Context())
 	if err != nil {
 		log.Printf("[openai] turn lock: %v", err)
 		apiError(w, http.StatusServiceUnavailable, err)
@@ -1032,7 +1094,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			start = len(s.Messages)
 		} else {
 			mismatch := firstMismatch(req.Messages, s.Messages)
-			log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s incoming_messages=%d saved_messages=%d incoming_encoding=%s saved_encoding=%s incoming_shape=%s saved_shape=%s", id, mismatch.Index, mismatch.Field, len(req.Messages), len(s.Messages), mismatch.IncomingEncoding, mismatch.SavedEncoding, mismatch.IncomingShape, mismatch.SavedShape)
+			log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s confoff=%d incoming_messages=%d saved_messages=%d incoming_encoding=%s saved_encoding=%s incoming_shape=%s saved_shape=%s", id, mismatch.Index, mismatch.Field, mismatch.ContentOff, len(req.Messages), len(s.Messages), mismatch.IncomingEncoding, mismatch.SavedEncoding, mismatch.IncomingShape, mismatch.SavedShape)
 			// The client history no longer matches the stored thread (client
 			// compaction or a reused session ID). Re-establish context by
 			// replaying the full client history into a new thread instead of

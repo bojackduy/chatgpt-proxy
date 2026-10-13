@@ -394,21 +394,25 @@ Unset (or any other value) keeps today's shared-project behavior byte-for-byte.
 - State gains one field per session (`Project`, the project URL) in
   `~/.chatgpt-proxy/openai-sessions.json`; old state files load unchanged.
 
-### Parallelism (one browser, strictly serial turns)
+### Parallelism (one browser, session-scoped turns)
 
-Two opencode sessions via the model never interleave: the adapter holds an
-in-process gate for the whole turn, so concurrent requests queue (a long
-turn head-of-line-blocks the rest — `/readyz` 503s while a turn owns the
-gate). The MCP server is a separate process on the same Chrome, so both
-binaries additionally hold a cross-process file lock
-(`<profile>/bridge.lock`, `internal/chatgpt/turnlock.go`) for whole turns —
-an MCP ask landing mid-turn waits instead of mixing navigate/type/poll
-across tabs. Pure read-only endpoints (`/healthz`, `/v1/models`) take
-neither lock; `/readyz` takes the gate only; every browser-driving path
-(turns, recover, resync, MCP ask/status) holds both. True parallel
-generations are intentionally serialized by the current implementation,
-not proven impossible for one account or browser. Server-side overlap limits
-remain unverified; see the gated multi-tab proposal in [BACKLOG.md](BACKLOG.md).
+Two opencode sessions via the model interleave only across sessions: with
+`-max-parallel=2` (or `CHATGPT_BRIDGE_MAX_PARALLEL=2`) each active session
+gets an owned dedicated tab from a bounded pool of 2, so distinct sessions
+generate simultaneously while requests for the SAME session (turns, recover,
+resync, duplicates) still serialize. A canceled session keeps its uncertain
+journal; its peer completes independently. Default `-max-parallel=1` preserves
+the legacy strictly-serial behavior (whole-turn in-process gate plus
+exclusive cross-process `bridge.lock`). In parallel mode the profile guard is
+held shared during generations (legacy exclusive holders still exclude all
+owned turns), setup/reconnect/project creation take only short locks, and
+`/readyz` reports `{ready, max_parallel, active, available}` — a busy pool
+stays 200, it does not 503. Limits: one adapter process per address/state
+file (a second writer is refused the state-owner lock); manual browser
+interaction mid-turn can still disturb a generation; account-side throttling
+was not hit during verification but remains possible — on refusal or
+collision, restart with `-max-parallel=1`. See the verified record in
+[BACKLOG.md](BACKLOG.md).
 
 ### Logs, readiness and repair
 ```sh

@@ -1,5 +1,41 @@
 # Backlog
 
+## User-facing recovery and safe model-switch fallback
+
+**Status:** deferred; recovery UX is unfinished. Existing read-only adoption,
+terminal errors and uncertainty guards are not a complete user-facing fallback.
+No implementation requested for this item yet.
+
+**Problem:** a prompt may reach ChatGPT before cancellation, connection failure
+or extraction failure prevents a verified response from reaching OpenCode.
+Switching to another model does not settle that pending browser turn. Users
+currently encounter internal recovery/resync instructions and blocked followups
+instead of a understandable continuation path. Proven pre-submit failures and
+verified completed-but-invalid output must not be mistaken for unknown outcomes.
+
+**Required behavior:**
+- Before submission: automatically retry/fall back only when no submission is
+  proved. After submission: first track/recover the exact original turn read-only;
+  return a validated cached response with stable call IDs if it can be bound.
+- Completed malformed output with no delivered calls: reject once and support
+  a safe new-user boundary. A still-generating turn remains tracked, not duplicated.
+- If the outcome is genuinely unverifiable: expose an explicit recovery action
+  in the OpenCode integration. Explain what is unknown and offer continuation
+  from reviewed recorded completed history in a fresh working chat. Resync is a
+  deliberate abandonment/continuation boundary, not proof the old turn succeeded.
+- Account for already-delivered/executed calls and results before abandonment;
+  never rerun historical tools, execute an abandoned late response or blindly
+  clear Dirty. Define late-completion, cancellation and parent/child behavior.
+- Keep manual exact-request recovery endpoints for diagnostics, not as the normal
+  user workflow. Avoid automatic retry loops and make v1/v2 errors actionable.
+
+**Acceptance:** actual installed v1/v2 flow covers completed and canceled
+ChatGPT→other-model→ChatGPT switches, delayed/hidden/malformed responses and
+already-executed tools; the user can explicitly recover or safely continue without
+crafting HTTP bodies, lost completed history or duplicate tool effects. Tests
+must distinguish recoverable, known-rejected and genuinely ambiguous outcomes.
+Do not claim seamless switching solely from synthetic-history adapter fixtures.
+
 ## 2026-10-12 missing answer: complete null-DIL tool-wrapper rendering
 
 **Fixed and deployed; pending answer recovered read-only.** The ordinary user
@@ -331,14 +367,64 @@ math delimiters or duplicates; image-only output is explicitly represented;
 bold/code/links/tables and tool-call JSON remain intact. Verify in both supported
 OpenCode hosts, not only by inspecting generated Markdown.
 
-## Genuine concurrent generations (proposal only)
+## Genuine concurrent generations
 
-**Status:** deferred; not implemented. Current adapter and cross-process
-profile locks intentionally serialize whole turns. One browser/account is
-not evidence that concurrent generation is impossible; account/server limits
-are unverified.
+**Status:** IMPLEMENTED flag-gated default-serial on 2026-10-13
+(`-max-parallel=2` / `CHATGPT_BRIDGE_MAX_PARALLEL=2`; default 1 = legacy
+serial behavior). Same-session requests (turns, recover, resync, duplicates)
+serialize; distinct sessions generate simultaneously on owned dedicated tabs
+(bounded pool of 2, cancellation-aware wait). No global lock is held for a
+full generation: per-session locks persist across the long turn, the journal
+merges immutable committed snapshots under a short mutex with atomic
+file replacement, and only browser init/reconnect/project setup take short
+shared locks. MCP uses dedicated owned tabs and never adopts adapter tabs.
+Serial mode (`-max-parallel=1`) remains the fallback.
 
-**Gate first:** run a live two-tab overlapping-generation probe on the same
+**Gate (passed, account permits overlap):** live two-owned-tab probe on the
+same logged-in profile, exact distinct prompts submitted ~0.1s apart —
+`gate-verdict.json` (goal artifacts): overlapping live answer-growth interval
+2026-10-12T17:52:52.603329Z–17:52:52.756373Z (ALPHA 99→258 chars,
+BETA 268→310 chars, both Stop controls present), exact own prompt/answer
+identity, two distinct persistent thread URLs. Production `Pool` re-proof
+(`pool-verdict.json`): two workers started ~10µs apart, overlap
+2026-10-13T01:06:41.031423Z–01:06:41.111107Z (ALPHA 190→543, BETA 350→505
+chars), both completed with correct markers. An earlier run showing both
+replies with the same marker was a probe artifact (inherited homepage draft
+concatenated pre-submit), not a server refusal — rejected as evidence.
+
+**Design as proposed, with two corrections found during implementation:**
+ownership probe showed the shared `openai-tab-id` file must not be written
+by pool workers (each owns a short-lived target), and transaction routes
+must re-acquire the profile guard shared (an exclusive re-acquire
+self-deadlocks behind the transaction's own shared hold).
+
+**Verified:** race suite covers backend-barrier overlap, same-session
+serial/cached IDs, cancel-A-keeps-B with uncertain journal preserved,
+saturated-queue cancel, simultaneous-save restart persistence, setup
+serialization, non-adoption/close-only-own, journal single-writer. Live
+installed-adapter overlap + cancellation + MCP verification and
+rollback notes follow in the rollout record below.
+
+**Rollout record (2026-10-13, service at `-max-parallel=2`):**
+- Installed overlap: sessions inst-c/inst-d — interleaved service-log
+growth polls on two owned tabs (D 410→2055B while C 110→1809B,
+08:13:39–08:13:59), done 08:13:57/08:14:08, distinct thread URLs, clean
+journals. Repeated inst-e/inst-f (joint streaming 08:16:10–08:16:19) and
+inst-i/inst-j runs.
+- Installed cancel: session inst-k aborted mid-generation via client
+socket shutdown; journal kept `Dirty`/`Phase=final` with thread URL;
+peer inst-l completed with correct marker and clean journal; distinct
+thread URLs. Server propagates disconnects; the abort does not disturb
+the peer or the shared browser.
+- MCP ownership: MCP-config client (dedicated owned tab, shared guard)
+does read-only status on its own new target and closes only it;
+pre-existing tabs verified intact.
+- Rollback: remove `-max-parallel 2` from the launchd plist (or set 1),
+unload/load the job; serial behavior is the default and needs no code
+change. Never auto-retry ambiguous turns; canceled sessions stay Dirty
+for explicit recovery.
+
+**Original proposal (kept for context):** run a live two-tab overlapping-generation probe on the same
 account. Record submission, generation-start and completion timestamps, prove
 overlap rather than two queued requests, and observe rate limits/interruption.
 Do not enable concurrency unless this probe succeeds.

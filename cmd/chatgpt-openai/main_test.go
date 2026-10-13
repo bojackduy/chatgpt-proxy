@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"chatgpt-proxy/internal/chatgpt"
@@ -27,9 +29,13 @@ type fakeBackend struct {
 	errorURL      string
 	failAt        int
 	probe         int
+	turn          func(context.Context, chatgpt.TurnOptions) (chatgpt.TurnResult, error)
 }
 
 func (f *fakeBackend) AskThreadTurn(ctx context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+	if f.turn != nil {
+		return f.turn(ctx, opt)
+	}
 	if ctx.Err() != nil {
 		return chatgpt.TurnResult{}, ctx.Err()
 	}
@@ -595,6 +601,209 @@ func TestSDKHistoryNormalization(t *testing.T) {
 	}
 }
 func TestConcurrentDuplicateAndCancellation(t *testing.T) {
+	t.Run("parallel transactions share the profile guard instead of self-deadlocking", func(t *testing.T) {
+		entered := make(chan string, 2)
+		finish := make(chan struct{})
+		hook := func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+			entered <- opt.Prompt
+			<-finish
+			return chatgpt.TurnResult{Answer: "done", URL: "https://chatgpt.com/c/shared-guard"}, nil
+		}
+		h := testHandler(&fakeBackend{})
+		h.profileDir = t.TempDir()
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		h.enableParallel([]backend{&fakeBackend{turn: hook}, &fakeBackend{turn: hook}})
+		done := make(chan *httptest.ResponseRecorder, 2)
+		go func() {
+			done <- request(h, "guard-a", completionsRequest{Messages: []message{{Role: "user", Content: "GUARD_A"}}, ToolChoice: "none"})
+		}()
+		go func() {
+			done <- request(h, "guard-b", completionsRequest{Messages: []message{{Role: "user", Content: "GUARD_B"}}, ToolChoice: "none"})
+		}()
+		for range 2 {
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				close(finish)
+				t.Fatal("parallel transaction wedged on the profile guard (SH->EX upgrade deadlock)")
+			}
+		}
+		close(finish)
+		for range 2 {
+			select {
+			case w := <-done:
+				if w.Code != 200 {
+					t.Fatalf("status %d: %s", w.Code, w.Body.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("transaction did not complete after guard sharing")
+			}
+		}
+	})
+	t.Run("cancel one active session without canceling peer or losing uncertainty", func(t *testing.T) {
+		entered := make(chan string, 2)
+		finishB := make(chan struct{})
+		hook := func(ctx context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+			label := "b"
+			if strings.Contains(opt.Prompt, "CANCEL_A") {
+				label = "a"
+			}
+			entered <- label
+			if label == "a" {
+				<-ctx.Done()
+				return chatgpt.TurnResult{URL: "https://chatgpt.com/c/cancel-a"}, ctx.Err()
+			}
+			select {
+			case <-finishB:
+				return chatgpt.TurnResult{Answer: "B_COMPLETED", URL: "https://chatgpt.com/c/cancel-b"}, nil
+			case <-ctx.Done():
+				return chatgpt.TurnResult{}, errors.New("peer was incorrectly canceled")
+			}
+		}
+		h := testHandler(&fakeBackend{})
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		h.enableParallel([]backend{&fakeBackend{turn: hook}, &fakeBackend{turn: hook}})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		reqA := completionsRequest{Messages: []message{{Role: "user", Content: "CANCEL_A"}}, ToolChoice: "none"}
+		body, _ := json.Marshal(reqA)
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)).WithContext(ctx)
+		r.Header.Set("X-Session-Id", "cancel-a")
+		aDone := make(chan struct{})
+		go func() { h.routes().ServeHTTP(httptest.NewRecorder(), r); close(aDone) }()
+		bDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			bDone <- request(h, "cancel-b", completionsRequest{Messages: []message{{Role: "user", Content: "KEEP_B"}}, ToolChoice: "none"})
+		}()
+		for range 2 {
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				cancel()
+				close(finishB)
+				t.Fatal("independent sessions failed to enter backend")
+			}
+		}
+		// Full capacity is not an unhealthy browser; readiness doesn't borrow
+		// either backend or navigate either active session.
+		ready := httptest.NewRecorder()
+		h.routes().ServeHTTP(ready, httptest.NewRequest("GET", "/readyz", nil))
+		if ready.Code != 200 || !strings.Contains(ready.Body.String(), `"active":2`) {
+			cancel()
+			close(finishB)
+			t.Fatalf("busy pool reported unhealthy: %s", ready.Body.String())
+		}
+		cancel()
+		select {
+		case <-aDone:
+		case <-time.After(3 * time.Second):
+			close(finishB)
+			t.Fatal("canceled session retained its tab")
+		}
+		select {
+		case <-bDone:
+			close(finishB)
+			t.Fatal("cancel A finished/canceled still-blocked B")
+		default:
+		}
+		close(finishB)
+		select {
+		case w := <-bDone:
+			if contentText(assistant(t, w)) != "B_COMPLETED" {
+				t.Fatal("wrong peer answer")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("peer did not complete independently")
+		}
+		restarted := testHandler(&fakeBackend{})
+		restarted.statePath = h.statePath
+		if err := restarted.load(); err != nil {
+			t.Fatal(err)
+		}
+		if a := restarted.sessions["cancel-a"]; a == nil || !a.Dirty || a.Phase != "final" || a.PendingRequest == nil || a.URL != "https://chatgpt.com/c/cancel-a" {
+			t.Fatalf("cancellation discarded uncertain original binding: %+v", a)
+		}
+		if b := restarted.sessions["cancel-b"]; b == nil || b.Dirty || b.Result.Text != "B_COMPLETED" {
+			t.Fatalf("peer committed journal lost: %+v", b)
+		}
+	})
+	t.Run("owned parallel transactions overlap and persist without lost updates", func(t *testing.T) {
+		entered := make(chan string, 2)
+		finish := make(chan struct{})
+		var calls atomic.Int32
+		clients := []backend{}
+		for _, label := range []string{"worker-a", "worker-b"} {
+			clients = append(clients, &fakeBackend{turn: func(ctx context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+				calls.Add(1)
+				entered <- label
+				select {
+				case <-finish:
+					return chatgpt.TurnResult{Answer: weatherAnswer, URL: "https://chatgpt.com/c/" + label}, nil
+				case <-ctx.Done():
+					return chatgpt.TurnResult{URL: "https://chatgpt.com/c/" + label}, ctx.Err()
+				}
+			}})
+		}
+		h := testHandler(&fakeBackend{})
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		h.enableParallel(clients)
+		responses := make(chan *httptest.ResponseRecorder, 3)
+		go func() { responses <- request(h, "parallel-a", weatherReq()) }()
+		go func() { responses <- request(h, "parallel-b", weatherReq()) }()
+		for range 2 {
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				close(finish)
+				t.Fatal("browser work failed to overlap before either backend finished")
+			}
+		}
+		// A duplicate queues on the session lock, not on a second browser tab.
+		go func() { responses <- request(h, "parallel-a", weatherReq()) }()
+		// Both tabs occupied: a third session must abandon its queue on cancel,
+		// without acquiring browser work or disturbing either active transaction.
+		ctx, cancel := context.WithCancel(context.Background())
+		body, _ := json.Marshal(weatherReq())
+		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)).WithContext(ctx)
+		r.Header.Set("X-Session-Id", "queued-canceled")
+		cancel()
+		h.routes().ServeHTTP(httptest.NewRecorder(), r)
+		if calls.Load() != 2 {
+			t.Fatal("same-session or canceled queued request acquired another backend")
+		}
+		close(finish)
+		var ids []string
+		for range 3 {
+			select {
+			case w := <-responses:
+				a := assistant(t, w)
+				ids = append(ids, a.ToolCalls[0].ID)
+			case <-time.After(3 * time.Second):
+				t.Fatal("transaction did not release its session/tab lease")
+			}
+		}
+		if calls.Load() != 2 {
+			t.Fatal("duplicate cache caused another browser generation")
+		}
+		restarted := testHandler(&fakeBackend{})
+		restarted.statePath = h.statePath
+		if err := restarted.load(); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []string{"parallel-a", "parallel-b"} {
+			s := restarted.sessions[id]
+			if s == nil || s.Dirty || s.Result.ID == "" || len(s.Result.Calls) != 1 {
+				t.Fatalf("lost or dirty concurrent committed session %s: %+v", id, s)
+			}
+		}
+		if len(restarted.sessions) != 2 || len(h.parallel.locks) != 0 || len(h.parallel.clients) != 2 {
+			t.Fatal("canceled queue leaked journal/session lock/tab lease")
+		}
+		if ids[0] != ids[1] && ids[0] != ids[2] && ids[1] != ids[2] {
+			t.Fatal("same-session duplicate did not retain stable tool call ID")
+		}
+	})
+
 	f := &fakeBackend{answers: []string{weatherAnswer}}
 	h := testHandler(f)
 	var wg sync.WaitGroup
