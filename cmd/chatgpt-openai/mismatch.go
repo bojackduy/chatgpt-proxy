@@ -18,6 +18,11 @@ type prefixMismatch struct {
 	// rewrites without revealing any text.
 	IncomingShape string
 	SavedShape    string
+	// ContentOff is the first differing byte offset for string-vs-string
+	// content (else -1). Offsets pinpoint append-vs-rewrite classes
+	// (trailing newline, truncation marker, re-encode tail) without
+	// revealing any text.
+	ContentOff int
 }
 
 func contentShape(v any) string {
@@ -52,10 +57,25 @@ func sameJSON(a, b any) bool {
 	return ex == nil && ey == nil && string(x) == string(y)
 }
 
+// firstDiffOff returns the first differing byte offset of two strings, or
+// min(len) when one is a prefix of the other. Structural evidence only.
+func firstDiffOff(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
 func firstMismatch(incoming, saved []message) *prefixMismatch {
 	a, b := canonicalMessages(incoming), canonicalMessages(saved)
 	for i := range b {
-		m := &prefixMismatch{Index: i}
+		m := &prefixMismatch{Index: i, ContentOff: -1}
 		if i >= len(a) {
 			m.Field = "history.truncated"
 			return m
@@ -71,6 +91,11 @@ func firstMismatch(incoming, saved []message) *prefixMismatch {
 			m.Field = "tool_call_id"
 		case !sameJSON(a[i].Content, b[i].Content):
 			m.Field = "content"
+			if ai, ok := a[i].Content.(string); ok {
+				if bi, ok := b[i].Content.(string); ok {
+					m.ContentOff = firstDiffOff(ai, bi)
+				}
+			}
 		case len(a[i].ToolCalls) != len(b[i].ToolCalls):
 			m.Field = "tool_calls.length"
 		default:

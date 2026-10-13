@@ -11,10 +11,15 @@ import (
 	"github.com/chromedp/chromedp"
 	"github.com/yuin/goldmark"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// autolinkSpaceRe matches the "<http" sequences ChatGPT's composer splits
+// with a space. Shared with the submit-path identity check.
+var autolinkSpaceRe = regexp.MustCompile(`<(https?://)`)
 
 // firstDiffByte returns the first byte offset at which a and b differ,
 // or min(len) when one is a prefix of the other. Evidence-only helper for
@@ -107,6 +112,10 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	}
 	normSpace := func(s string) string { return strings.Join(strings.Fields(s), " ") }
 	want := normSpace(prompt)
+	// Mirror the composer's autolink defusing ("<https://…>" renders as
+	// "< https://…>"): the submitted bubble carries the spaced form, so the
+	// wanted text must too. See the submit-path check in chatgpt.go.
+	want = autolinkSpaceRe.ReplaceAllString(want, "< $1")
 	userText := corr.User
 	if userText != want && corr.UserID != "" {
 		// The actual DOM-bound node, never a latest/branch mapping walk. The
