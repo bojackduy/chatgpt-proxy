@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,31 @@ import (
 )
 
 func TestSameURL(t *testing.T) {
+	t.Run("URL defusing preserves full prompt identity", func(t *testing.T) {
+		for _, tc := range []struct {
+			want, actual string
+			equal        bool
+		}{
+			{"see <https://example.com> and [link](http://example.com)", "see < https://example.com> and [link]( http://example.com)", true},
+			{"see <https://example.com>", "see <https://example.com>", true},
+			{"see ( https://example.com)", "see (https://example.com)", true},
+			{`{"$schema":"https://json-schema.org/draft/2020-12/schema"}`, `{"$schema":" https://json-schema.org/draft/2020-12/schema"}`, true},
+			{"see [https://example.com]", "see [ https://example.com]", false},
+			{"see <https://example.com> tail", "see < https://example.com>", false},
+			{"see <https://example.com>", "draft see < https://example.com>", false},
+			{"a b", "ab", false},
+			{"a b", "a  b", false},
+			{"a\nb", "a b", false},
+			{"a\tb", "a b", false},
+			{"x = 1", "x=1", false},
+		} {
+			want := autolinkSpaceRe.ReplaceAllString(tc.want, "$1$2")
+			actual := autolinkSpaceRe.ReplaceAllString(tc.actual, "$1$2")
+			if (want == actual) != tc.equal {
+				t.Fatalf("identity comparison: %q / %q", tc.want, tc.actual)
+			}
+		}
+	})
 	same := [][2]string{
 		{"https://chatgpt.com/c/abc", "https://chatgpt.com/c/abc"},
 		{"https://chatgpt.com/c/abc/", "https://chatgpt.com/c/abc"},
@@ -37,6 +63,15 @@ func TestSameURL(t *testing.T) {
 }
 
 func TestRequestContextCancellationDoesNotCancelTab(t *testing.T) {
+	t.Run("already canceled turn has explicit pre-submission evidence", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		c := New(0, t.TempDir(), "")
+		_, err := c.AskThreadTurn(ctx, TurnOptions{Prompt: "next", URL: "https://chatgpt.com/c/existing"})
+		if !errors.Is(err, ErrNotSubmitted) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled before browser access lost stage/cause: %v", err)
+		}
+	})
 	key := struct{}{}
 	tab := context.WithValue(context.Background(), key, "CDP executor")
 	request, cancel := context.WithCancel(context.Background())

@@ -156,6 +156,49 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 	}
 }
 func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound-completed-empty/automatic=%v", automatic), func(t *testing.T) {
+			req := weatherReq()
+			req.ToolChoice = "auto"
+			req.Messages = append(req.Messages, message{Role: "assistant", ToolCalls: []toolCall{{ID: "already-delivered", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`}}}}, message{Role: "tool", ToolCallID: "already-delivered", Content: "result already produced"})
+			f := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{"ACK", "continue safely"}}, expected: "full pending tool-result prompt", readErr: chatgpt.ErrCompletedEmpty}
+			h := testHandler(f.fakeBackend)
+			h.client = f
+			h.statePath = filepath.Join(t.TempDir(), "state.json")
+			s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", Messages: append([]message{}, req.Messages[:len(req.Messages)-1]...), PendingRequest: &req, PendingPrompt: f.expected}
+			h.sessions["recover"] = s
+			before, _ := json.Marshal(s.Messages)
+			var w *httptest.ResponseRecorder
+			if automatic {
+				w = request(h, "recover", req)
+			} else {
+				w = recoveryRequest(h, nil)
+			}
+			if w.Code != 422 || s.Dirty || s.Phase != "invalid" || s.PendingRequest != &req || len(s.Result.Calls) != 0 || len(f.prompts) != 0 || f.reads != 1 {
+				t.Fatal("completed empty not durably rejected", w.Code, w.Body.String())
+			}
+			after, _ := json.Marshal(s.Messages)
+			if !bytes.Equal(before, after) {
+				t.Fatal("prior delivered call history changed")
+			}
+			if retry := request(h, "recover", req); retry.Code != 422 || f.reads != 1 || len(f.prompts) != 0 {
+				t.Fatal("empty retry submitted/re-read")
+			}
+			loaded := testHandler(f.fakeBackend)
+			loaded.statePath = h.statePath
+			if err := loaded.load(); err != nil || loaded.sessions["recover"].Phase != "invalid" || loaded.sessions["recover"].Dirty {
+				t.Fatal("empty rejection not restart-safe", err)
+			}
+			current := req
+			current.Messages = append(append([]message{}, req.Messages...), message{Role: "user", Content: "summarize the already produced result"})
+			if next := request(h, "recover", current); next.Code != 200 || len(f.prompts) == 0 {
+				t.Fatal("new-user continuation blocked", next.Code, next.Body.String())
+			}
+			if !strings.Contains(strings.Join(f.prompts, "\n"), "already-delivered") || !strings.Contains(strings.Join(f.prompts, "\n"), "result already produced") {
+				t.Fatal("inert tool context lost")
+			}
+		})
+	}
 	// Automatic adoption must roll back its in-memory mutation too: losing the
 	// pending prompt on a failed state write makes the next read-only retry unsafe.
 	t.Run("auto-adoption-save-failure", func(t *testing.T) {
@@ -174,6 +217,10 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 		}
 		if f.reads != 2 {
 			t.Fatal("failed save prevented a subsequent read-only recovery")
+		}
+		f.readErr = chatgpt.ErrCompletedEmpty
+		if w := request(h, "auto-save-failure", req); w.Code != 422 || !s.Dirty || s.Phase != "final" || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Fingerprint != "previous-delivered" || len(f.prompts) != 0 {
+			t.Fatal("failed empty rejection discarded pending binding")
 		}
 	})
 	// A completed alternative-model transcript cannot prove the browser turn

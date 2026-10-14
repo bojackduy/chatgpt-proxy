@@ -1183,29 +1183,34 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// so the dirty journal records a usable repair target, not a page
 			// like the Project root. Uncertain sessions still return 409 and
 			// never retry.
-			if res.URL != "" && strings.Contains(res.URL, "/c/") {
-				s.URL = res.URL
-				if id != "" {
-					_ = h.save()
-				}
-			} else if res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err) {
-				// The page never loaded, so provably nothing was typed or
-				// submitted: clear the uncertainty flag so a retry can proceed
-				// instead of wedging the session forever on a transient error
-				// (e.g. the browser restarting). A retry starts over on a
-				// fresh thread; duplication is impossible because the first
-				// attempt never reached a conversation.
-				s.Dirty = false
-				s.Phase = ""
+			if errors.Is(err, chatgpt.ErrNotSubmitted) || (res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err)) {
+				// Stage evidence concerns this turn, not whether an older thread exists.
+				s.Dirty, s.Phase = false, ""
+				s.PendingRequest, s.PendingPrompt = nil, ""
 				if id != "" {
 					if serr := h.save(); serr != nil {
 						h.backendError(w, serr)
 						return
 					}
 				}
-				log.Printf("[openai] transient pre-submission failure session=%s, cleared for retry: %v", id, err)
+				log.Printf("[openai] pre-submission failure session=%s, retained completed transcript/thread: %v", id, err)
+			} else if res.URL != "" && strings.Contains(res.URL, "/c/") {
+				s.URL = res.URL
+				if id != "" {
+					_ = h.save()
+				}
 			}
-			log.Printf("[openai] uncertain session=%s turn=%d/%d thread=%s", id, i+1, len(turns), s.URL)
+			log.Printf("[openai] failed session=%s turn=%d/%d uncertain=%v thread=%s", id, i+1, len(turns), s.Dirty, s.URL)
+			// The normal poll already waited through its empty-answer grace. Settle
+			// only an exact read-only completed-empty proof, never resubmit a turn.
+			if !t.replay && id != "" && errors.Is(err, chatgpt.ErrMissingAnswer) && h.tryAdoptInterrupted(r, id, s) {
+				if s.Phase == "invalid" {
+					apiError(w, 422, errors.New("completed model output was empty or invalid; no new tool calls were delivered; send a distinct new ordinary user message to continue"))
+				} else {
+					h.respond(w, req, s.Result)
+				}
+				return
+			}
 			h.backendError(w, err)
 			return
 		}

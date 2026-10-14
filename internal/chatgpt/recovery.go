@@ -17,9 +17,14 @@ import (
 	"time"
 )
 
-// autolinkSpaceRe matches the "<http" sequences ChatGPT's composer splits
-// with a space. Shared with the submit-path identity check.
-var autolinkSpaceRe = regexp.MustCompile(`<(https?://)`)
+// autolinkSpaceRe canonicalizes only the observed optional URL-defusing space
+// after '<', '(' or a double quote. The quote case is observed in JSON schema
+// URLs. The submit-path identity check uses the same rule.
+var autolinkSpaceRe = regexp.MustCompile(`([<("]) ?(https?://)`)
+
+// ErrCompletedEmpty is authoritative rejection, not a missing DOM extraction.
+// It is returned only after full pending-prompt and final-source binding.
+var ErrCompletedEmpty = errors.New("ChatGPT stored a completed empty final response; no new tool calls were delivered; continue with a distinct new ordinary user message")
 
 // firstDiffByte returns the first byte offset at which a and b differ,
 // or min(len) when one is a prefix of the other. Evidence-only helper for
@@ -52,7 +57,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	defer c.mu.Unlock()
 	base, err := c.tabCtx(ctx)
 	if err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery base: %w", err)
 	}
 	// Recovery must never reload the active adapter tab. Own a background
 	// target for navigation/readback and close only that target afterwards.
@@ -64,7 +69,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		tid, err = target.CreateTarget("about:blank").WithBackground(true).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
 		return err
 	})); err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery create target: %w", err)
 	}
 	defer func() {
 		cleanup, done := context.WithTimeout(base, 3*time.Second)
@@ -73,31 +78,39 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 			return target.CloseTarget(tid).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
 		}))
 	}()
-	owned, closeOwned := chromedp.NewContext(c.browser, chromedp.WithTargetID(tid))
+	// Inherit the initialized browser executor, not the allocator. Initializing
+	// a second websocket through a short-lived request context can cancel it.
+	owned, closeOwned := chromedp.NewContext(base, chromedp.WithTargetID(tid))
 	defer closeOwned()
+	stopInit := context.AfterFunc(ctx, closeOwned)
+	initErr := chromedp.Run(owned)
+	stopInit()
+	if initErr != nil {
+		return TurnResult{}, fmt.Errorf("recovery attach target: %w", initErr)
+	}
 	tab, cancel := requestContext(ctx, owned)
 	defer cancel()
 	nav, done := context.WithTimeout(tab, 45*time.Second)
 	defer done()
 	if err := chromedp.Run(nav, chromedp.Navigate(url)); err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery navigate: %w", err)
 	}
 	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery ready: %w", err)
 	}
 	// Expand only the last user bubble's exact UI control; never a send,
 	// regenerate, edit, or global page button. React may update asynchronously.
 	var expanded bool
 	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryExpandJS, &expanded)); err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery expand: %w", err)
 	}
 	if expanded {
 		if err := pause(tab, 200*time.Millisecond); err != nil {
 			return TurnResult{}, err
 		}
 	}
-	// Correlate in the rendered DOM: the last "You said:" bubble must match
-	// the pending prompt (whitespace-normalized; rendered text reflows), and
+	// Correlate in the rendered DOM: the last "You said:" bubble's bound source
+	// must match the pending prompt without collapsing internal whitespace, and
 	// a "ChatGPT said:" section must follow it, so a stale earlier answer can
 	// never be adopted. The answer itself comes from responseProbe — the same
 	// rendered representation as the normal path.
@@ -108,22 +121,23 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		Answers    int    `json:"answers"`
 	}
 	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery user boundary: %w", err)
 	}
-	normSpace := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	normSpace := func(s string) string { return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) }
 	want := normSpace(prompt)
-	// Mirror the composer's autolink defusing ("<https://…>" renders as
-	// "< https://…>"): the submitted bubble carries the spaced form, so the
-	// wanted text must too. See the submit-path check in chatgpt.go.
-	want = autolinkSpaceRe.ReplaceAllString(want, "< $1")
-	userText := corr.User
-	if userText != want && corr.UserID != "" {
+	// Compare both spaced and unchanged URL forms symmetrically. All other
+	// content must still match the entire original prompt.
+	want = autolinkSpaceRe.ReplaceAllString(want, "$1$2")
+	userText := autolinkSpaceRe.ReplaceAllString(corr.User, "$1$2")
+	if corr.UserID != "" {
 		// The actual DOM-bound node, never a latest/branch mapping walk. The
 		// composer stores plain paragraphs as escaped CommonMark. Decode that
 		// declared format with a real parser, not guessed slash/prefix stripping.
-		if original, err := originalUserText(tab, corr.UserID); err == nil {
-			userText = normSpace(original)
+		original, err := originalUserText(tab, corr.UserID)
+		if err != nil {
+			return TurnResult{}, fmt.Errorf("recovery user source: %w", err)
 		}
+		userText = autolinkSpaceRe.ReplaceAllString(normSpace(original), "$1$2")
 	}
 	if userText == "" || userText != want {
 		off := firstDiffByte(userText, want)
@@ -138,13 +152,53 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	}
 	visible, err := responseProbe(tab, nil)
 	if err != nil {
-		return TurnResult{}, err
+		return TurnResult{}, fmt.Errorf("recovery response probe: %w", err)
+	}
+	if visible.Last == "" && visible.Complete && corr.UserID != "" {
+		var empty bool
+		js := fmt.Sprintf("(async () => {const uid = %s, id = %s; const recheck = () => %s([]); %s})()", strconv.Quote(corr.UserID), strconv.Quote(visible.LastID), responseProbeJS, completedEmptyJS)
+		if err := chromedp.Run(tab, chromedp.Evaluate(js, &empty, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
+			return TurnResult{}, fmt.Errorf("recovery empty source: %w", err)
+		}
+		if empty {
+			return TurnResult{}, ErrCompletedEmpty
+		}
 	}
 	if visible.Last == "" || visible.StopBtn || visible.ErrorText || visible.ContinueBtn || !visible.Complete {
 		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
 	}
 	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
 }
+
+// Only the observed empty DIL root's exact final source may establish rejection.
+// No latest-branch lookup, renderer execution, reasoning or prior call adoption.
+const completedEmptyJS = `
+ const valid = () => {
+   const st = recheck();
+   const h = [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:').at(-1);
+   const owner = h?.nextElementSibling?.closest('[data-chatgpt-search-message-ids], [data-message-id]') || h?.closest('[data-chatgpt-search-message-ids], [data-message-id]');
+   const userID = (owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-message-id') || '').trim().split(/\s+/).at(-1);
+   const root = [...document.querySelectorAll('[data-dil-message-id]')].find(e => e.getAttribute('data-dil-message-id') === id);
+   return userID === uid && st.lastID === id && st.fresh && st.complete && !st.lastAssistant && !st.stopBtn && !st.continueBtn && !st.errorText && root && root.childNodes.length === 0;
+ };
+ if (!/^[a-zA-Z0-9-]+$/.test(id) || !valid()) return false;
+ const thread = location.pathname.split('/c/')[1]; if (!thread) return false;
+ const auth = await (await fetch('/api/auth/session')).json(); if (!auth.accessToken) return false;
+ const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers:{Authorization:'Bearer ' + auth.accessToken}});
+ if (!r.ok) return false;
+ const mapping = (await r.json()).mapping, node = mapping?.[id], m = node?.message;
+ if (m?.id !== id || m.author?.role !== 'assistant' || m.channel !== 'final' || m.recipient !== 'all' ||
+     m.status !== 'finished_successfully' || m.end_turn !== true || m.metadata?.is_complete !== true ||
+     m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || m.content.parts[0] !== '') return false;
+ let parent = node.parent;
+ for (let i = 0; parent && i < 32; i++) {
+   const p = mapping[parent]; if (!p || p.message?.id !== parent) return false;
+   if (p.message.author?.role === 'user') return parent === uid && valid();
+   if (p.message.author?.role !== 'assistant' || p.message.content?.content_type !== 'reasoning_recap') return false;
+   parent = p.parent;
+ }
+ return false;
+`
 
 const recoveryExpandJS = `(() => {
 	const h = [...document.querySelectorAll('h4')].filter(e => (e.textContent || '').trim() === 'You said:').at(-1);
@@ -154,7 +208,7 @@ const recoveryExpandJS = `(() => {
 })()`
 
 const recoveryUserJS = `(() => {
-	  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+	  const norm = s => (s || '').replace(/\r\n?/g, '\n').trim();
 	  const h4s = [...document.querySelectorAll('h4')];
 	  let ui = -1;
 	  for (let i = 0; i < h4s.length; i++) {

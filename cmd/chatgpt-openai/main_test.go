@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -425,6 +426,29 @@ func TestSessionsReadinessAndFallback(t *testing.T) {
 	}
 }
 func TestErrorsAndDirtyRetry(t *testing.T) {
+	t.Run("valid tool then authoritative empty follow-up", func(t *testing.T) {
+		f := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{weatherAnswer}}}
+		h := testHandler(f.fakeBackend)
+		h.client = f
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		req := weatherReq()
+		a := assistant(t, request(h, "post-tool-empty", req))
+		if len(a.ToolCalls) != 1 {
+			t.Fatal("valid prior call not delivered")
+		}
+		req.ToolChoice, req.Stream = "auto", true
+		req.Messages = append(req.Messages, a, message{Role: "tool", ToolCallID: a.ToolCalls[0].ID, Content: "already completed result"})
+		f.expected = h.buildTurns(req, req.Messages[len(req.Messages)-1:], toolReminder(req))[0].prompt
+		f.err, f.errorURL, f.readErr = chatgpt.ErrMissingAnswer, h.sessions["post-tool-empty"].URL, chatgpt.ErrCompletedEmpty
+		w := request(h, "post-tool-empty", req)
+		s := h.sessions["post-tool-empty"]
+		if w.Code != 422 || strings.Contains(w.Header().Get("Content-Type"), "event-stream") || s.Dirty || s.Phase != "invalid" || f.reads != 1 || len(f.prompts) != 2 || len(s.Result.Calls) != 0 || s.PendingRequest.Messages[len(req.Messages)-1].ToolCallID != a.ToolCalls[0].ID {
+			t.Fatal("first empty follow-up not settled safely", w.Code, w.Body.String())
+		}
+		if retry := request(h, "post-tool-empty", req); retry.Code != 422 || f.reads != 1 || len(f.prompts) != 2 {
+			t.Fatal("empty follow-up repeated")
+		}
+	})
 	for _, failure := range []error{chatgpt.ErrMissingAnswer, fmt.Errorf("poll: %w", chatgpt.ErrMissingAnswer)} {
 		f := &fakeBackend{err: failure, errorURL: "https://chatgpt.com/c/empty-renderer"}
 		h := testHandler(f)
@@ -486,6 +510,66 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 }
 
 func TestNavigateFailureDoesNotWedgeFreshSession(t *testing.T) {
+	if fixture := os.Getenv("CHATGPT_BRIDGE_CONTINUATION_FIXTURE"); fixture != "" {
+		t.Run("recorded pending request route without browser submission", func(t *testing.T) {
+			t.Setenv("CHATGPT_BRIDGE_PROJECT_PER_SESSION", "0")
+			b, err := os.ReadFile(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var s session
+			if err := json.Unmarshal(b, &s); err != nil || s.PendingRequest == nil {
+				t.Fatal("missing recorded pending request", err)
+			}
+			req := *s.PendingRequest
+			before, _ := json.Marshal(s.Messages)
+			url := s.URL
+			s.Dirty, s.Phase, s.PendingRequest, s.PendingPrompt = false, "", nil, ""
+			f := &fakeBackend{err: errors.Join(chatgpt.ErrNotSubmitted, errors.New("fixture composer mismatch")), errorURL: url}
+			h := testHandler(f)
+			h.maxChars = 200000
+			h.sessions["recorded"] = &s
+			if w := request(h, "recorded", req); w.Code != 502 || s.Dirty || s.URL != url || len(f.prompts) != 1 {
+				t.Fatal("recorded unsent final route remained uncertain", w.Code)
+			}
+			after, _ := json.Marshal(s.Messages)
+			if !bytes.Equal(before, after) || strings.HasPrefix(f.prompts[0], historyIntro) {
+				t.Fatal("recorded completed replay progress was lost")
+			}
+			f.err = nil
+			f.answers = []string{"", "fixture continued"}
+			w := request(h, "recorded", req)
+			if w.Code != 200 || s.Dirty || s.URL != url || len(f.prompts) != 2 {
+				t.Fatal("exact recorded request could not continue", w.Code)
+			}
+			if cached := request(h, "recorded", req); cached.Code != 200 || cached.Body.String() != w.Body.String() || len(f.prompts) != 2 {
+				t.Fatal("recorded continuation did not cache stable result")
+			}
+		})
+	}
+	t.Run("pre-submit existing thread retains completed state", func(t *testing.T) {
+		for _, cause := range []error{errors.New("composer does not exactly match this turn; nothing submitted"), chatgpt.ErrNoComposer, context.Canceled} {
+			f := &fakeBackend{answers: []string{"first answer"}}
+			h := testHandler(f)
+			req := completionsRequest{Messages: []message{{Role: "user", Content: "first"}}}
+			assistant(t, request(h, "existing", req))
+			s := h.sessions["existing"]
+			url, completed := s.URL, len(s.Messages)
+			req.Messages = append(req.Messages, message{Role: "assistant", Content: "first answer"}, message{Role: "user", Content: "next"})
+			f.err, f.errorURL = errors.Join(chatgpt.ErrNotSubmitted, cause), url
+			if w := request(h, "existing", req); w.Code != 502 {
+				t.Fatal(w.Code, w.Body.String())
+			}
+			if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" || s.URL != url || len(s.Messages) != completed {
+				t.Fatalf("pre-send failure lost completed state: %+v", s)
+			}
+			f.err = nil
+			f.answers = []string{"first answer", "", "continued"}
+			if w := request(h, "existing", req); w.Code != 200 {
+				t.Fatal("continuation wedged", w.Code, w.Body.String())
+			}
+		}
+	})
 	for _, eager := range []string{"0", "1"} {
 		t.Setenv("CHATGPT_BRIDGE_PROJECT_PER_SESSION", eager)
 		for _, failure := range []error{errors.New("navigate: page load error net::ERR_FAILED"), errors.Join(chatgpt.ErrProjectSetup, errors.New(`Project URL not observed for "OpenCode Bridge — explain/sesed422"`))} {
@@ -1069,6 +1153,16 @@ func TestLargeCatchupAckAndDirtyResume(t *testing.T) {
 				}
 				if strings.Contains(w2.Body.String(), `"tool_calls"`) || h2.sessions["large"].Dirty {
 					t.Fatal("resumed replay leaked calls or stayed dirty")
+				}
+				for _, p := range f.prompts[n:] {
+					if p == f.prompts[1] {
+						t.Fatal("already acknowledged replay chunk was imported twice")
+					}
+				}
+				finished := len(f.prompts)
+				cached := request(h2, "large", req)
+				if cached.Code != 200 || cached.Body.String() != w2.Body.String() || len(f.prompts) != finished {
+					t.Fatal("resumed final completion was not cached exactly once")
 				}
 				return
 			}

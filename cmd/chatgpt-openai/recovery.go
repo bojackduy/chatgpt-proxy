@@ -52,6 +52,13 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 	for {
 		var err error
 		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt)
+		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
+			if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
+				return false
+			}
+			log.Printf("[openai] session=%s bound completed empty final rejected; no calls delivered", id)
+			return true
+		}
 		if err == nil {
 			break
 		}
@@ -204,6 +211,17 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := backend.ReadThreadTurn(r.Context(), s.URL, prompt)
+	if errors.Is(err, chatgpt.ErrCompletedEmpty) {
+		old := *s
+		s.PendingRequest, s.PendingPrompt = req, prompt
+		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
+			*s = old
+			apiError(w, 500, serr)
+			return
+		}
+		apiError(w, 422, err)
+		return
+	}
 	if err != nil {
 		apiError(w, 409, err)
 		return

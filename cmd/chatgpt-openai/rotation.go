@@ -260,7 +260,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		Attachments: atts, Thinking: thinking,
 	})
 	if err != nil {
-		if res.URL != "" || !chatgpt.IsNavigateError(err) {
+		if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
 			s.URL = res.URL
 			if serr := h.save(); serr != nil {
 				h.backendError(w, serr)

@@ -1,10 +1,91 @@
 # Backlog
 
+## 2026-10-14 post-tool genuinely empty final
+
+**Status:** strict completed-empty classification implemented, live verified and
+installed; the original session is durably rejected read-only. This does not
+complete the larger recovery UX below or guarantee ChatGPT never emits an empty
+answer.
+
+For `ses_f1c7ba8b8ffe4ZYAp4NhTjq49D`, the 10:33:36 response delivered one valid
+tool call. The next 3,364-byte submission was a tool-result-only delta, not the
+earlier composer failure or a child-header misattribution. Owned read-only
+inspection proves the latest DOM assistant `92bf6299…` is complete and its exact
+final/all backend text source is genuinely zero bytes, finished_successfully,
+end_turn/is_complete true. Its declared parent is a reasoning recap and then
+the latest DOM user `cbf59217…`; the entire normalized pending/source prompt
+matches at 3,363 bytes (only trailing whitespace differs). Null DIL is present,
+but there is no hidden nonempty wrapper or invalid-tag recovery diagnostic.
+The prior null-DIL fallback correctly refuses this case; there is no answer to
+extract and no evidence that the user's previously delivered tool failed.
+
+Recovery now distinguishes this exact authoritative completed-empty proof from
+missing extraction/unknown outcomes. After the existing normal polling grace,
+read-only settlement can durably reject it through the existing invalid-output
+gate: terminal422, zero new delivered calls, no original resubmission, retained
+completed history/pending tool result, and a distinct new ordinary user boundary.
+Exact retries cannot regenerate the empty turn. Wrong source identity, ancestry,
+status/channel/recipient, changed DOM/user, active generation or alerts remain
+protected. Save failure rolls back rejection. Recovery attaches its owned target
+to the initialized live executor with cancellation scoped to that target; the
+precise cause of the two original dead-tab reconnects is not established.
+
+Existing DOM/error/adoption tests were extended, without new bridge test files
+or top-level test functions. Full vet/test/build and both binaries pass. Actual
+original-thread readback returns completed-empty in 16.93 seconds, without a
+journal mutation. Isolated browser-backed two-slot tool-loop verification passed:
+two distinct owned targets/threads, one validated inert call each, externally
+fabricated results followed by correct finals on tool-result-only deltas, stable
+call/final duplicate caches, active=2 readiness true then idle capacity=2. No real
+or dummy function was executed. Live cancellation of a three-second read-only
+recovery did not kill a peer pool generation; the peer completed its harmless
+final and the root remained healthy (`peer.json`).
+
+Both binaries were atomically installed under an exclusive idle profile guard
+and journal-owner lock; no active generation was aborted. Final installed hashes
+match artifacts, readiness=true, active=0/available=2; deployment left the journal
+unchanged (`installation.json`). The first deployment's post-start health wait
+timed out and later readiness passed; two initial installed read-only recoveries
+returned context canceled around20 seconds, retaining all uncertainty. Their exact
+cause is not established. Stage-specific recovery errors were added rather than
+discarding the journal or repeating the original completion. Final installed
+POST /v1/sessions/recover with the exact saved request returned422 completed-empty
+in18.81 seconds. Only `ses_f1c7ba8…` changed: Dirty=false/Phase=invalid, zero cached
+calls, all106 completed messages and the exact pending request/prompt/thread
+retained, other journals unchanged (`recovery.json`). This is known rejection,
+not a recovered successful answer; no original task or tool was executed and
+client consumption is unknown. Send a distinct new ordinary user message in that
+same OpenCode session to cross the existing safe continuation boundary; retrying
+the original failed step remains terminal. Genuinely unverifiable sessions remain
+protected, and the larger recovery UX below is unfinished.
+
+Evidence: goal `3cb60bfe…` (`inspection.json`, `readback.json`,
+`stage-verification.log`, `live.json`, `live-adapter.log`, `peer.json`,
+`installation.json`, `recovery.json`).
+
 ## User-facing recovery and safe model-switch fallback
 
-**Status:** deferred; recovery UX is unfinished. Existing read-only adoption,
-terminal errors and uncertainty guards are not a complete user-facing fallback.
-No implementation requested for this item yet.
+**Status:** continuation repair in progress; recovery UX is still unfinished.
+Existing read-only adoption, terminal errors and uncertainty guards are not a
+complete user-facing fallback. The October 14 repair adds explicit pre-send
+failure evidence so an existing thread URL cannot falsely imply this turn was
+submitted, and compares the observed optional URL-defusing spaces symmetrically.
+The stage-aware repair was installed at an exclusive idle profile-lock boundary.
+The latest `ses_ecb2dd…` final was proved unsent by its composer-mismatch log and
+exact pending prompt; only its pending uncertainty was cleared, retaining all 15
+completed messages and its thread URL. Other sessions were unchanged. Full Go
+checks and the exact recorded request route (fake backend, no task execution)
+pass. The additional one-character composer difference was traced to rich-link
+widgets adding visual newlines to `innerText`, not changed logical input. The
+submit check now reads the current ProseMirror document and preserves internal
+spaces, tabs and newlines instead of collapsing them. Exact DOM-ID-bound recovery
+also preserves internal whitespace. Installed harmless URL-rich two-turn
+verification passed: same thread, remembered first-turn codeword, identical
+duplicate-cache response, no tools provided or executed, readiness true afterward.
+Both binaries were installed atomically with active=0 before/after; no active
+generation was restarted. Final audit confirmed all other preexisting sessions
+unchanged. Genuinely ambiguous final submissions remain protected; this is not a
+complete recovery UX.
 
 **Problem:** a prompt may reach ChatGPT before cancellation, connection failure
 or extraction failure prevents a verified response from reaching OpenCode.

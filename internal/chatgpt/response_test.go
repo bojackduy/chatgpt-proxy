@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"net/http"
 	"net/http/httptest"
@@ -166,7 +167,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		}
 	})
 	t.Run("exact collapsed user recovery and bound serialized source", func(t *testing.T) {
-		full := strings.Repeat("Long literal prompt_* with JSON \\\"quoted\\\".\n", 2200) + " … Show more"
+		full := strings.Repeat("Long literal prompt_* with  two spaces\tand JSON \\\"quoted\\\".\n", 2200) + " … Show more"
 		set(`<div data-turn-key="fixture-user"><h4>You said:</h4><div><span class="text">truncated prefix</span><button onclick="this.parentElement.querySelector('.text').textContent=window.__full;this.textContent='Show less'">Show more</button><button aria-label="Copy message">Copy</button></div></div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div>finished</div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__full = `+quoteJS(full), nil)); err != nil {
 			t.Fatal(err)
@@ -179,7 +180,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			User, UserID string
 			Answers      int
 		}
-		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != strings.Join(strings.Fields(full), " ") || corr.UserID != "fixture-user" || corr.Answers != 1 {
+		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != strings.TrimSpace(full) || corr.UserID != "fixture-user" || corr.Answers != 1 {
 			t.Fatal("full exact binding or literal UI suffix lost", err)
 		}
 		set(`<div><h4>You said:</h4><div>old matching prompt</div><h4>ChatGPT said:</h4><div>old answer</div><h4>You said:</h4><div>genuinely different prompt</div><h4>ChatGPT said:</h4><div>new answer</div></div>`)
@@ -274,6 +275,62 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		got, err = responseProbe(tab, before.IDs)
 		if err != nil || got.Last != "NEW COMPLETE ANSWER" || !got.Complete {
 			t.Fatal("actual rendered answer overridden", got, err)
+		}
+		// Actual October 14 post-tool follow-up: prior call is valid but the
+		// fresh final source is genuinely empty, with only a reasoning recap.
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{""}}
+		m["metadata"] = map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "return null;", "fallbackMarkdown": ""}}
+		mapping["recap"] = map[string]any{"parent": "fixture-user", "message": map[string]any{"id": "recap", "author": map[string]any{"role": "assistant"}, "content": map[string]any{"content_type": "reasoning_recap"}}}
+		node["parent"] = "recap"
+		mapping["prior-call"] = map[string]any{"message": map[string]any{"id": "prior-call", "content": map[string]any{"content_type": "text", "parts": []string{raw}}}}
+		publish()
+		set(dilHTML)
+		emptyProof := func() bool {
+			t.Helper()
+			var empty bool
+			js := "(async () => {const uid = 'fixture-user', id = 'dil-answer'; const recheck = () => " + responseProbeJS + "([]); " + completedEmptyJS + "})()"
+			if err := chromedp.Run(tab, chromedp.Evaluate(js, &empty, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
+				t.Fatal(err)
+			}
+			return empty
+		}
+		if !emptyProof() {
+			t.Fatal("exact finished empty follow-up not proved")
+		}
+		for field, wrong := range map[string]any{"id": "prior-call", "channel": "analysis", "recipient": "tool", "status": "in_progress", "end_turn": false} {
+			valid := m[field]
+			m[field] = wrong
+			publish()
+			if emptyProof() {
+				t.Fatalf("unsafe completed-empty %s accepted", field)
+			}
+			m[field] = valid
+		}
+		for field, wrong := range map[string]any{
+			"author":   map[string]any{"role": "user"},
+			"metadata": map[string]any{"is_complete": false},
+			"content":  map[string]any{"content_type": "text", "parts": []string{raw}},
+		} {
+			valid := m[field]
+			m[field] = wrong
+			publish()
+			if emptyProof() {
+				t.Fatalf("wrong completed-empty %s accepted", field)
+			}
+			m[field] = valid
+		}
+		node["parent"] = "different-user"
+		publish()
+		if emptyProof() {
+			t.Fatal("wrong empty ancestry accepted")
+		}
+		node["parent"] = "recap"
+		publish()
+		for _, html := range []string{dilHTML + `<button data-testid="stop-button">Stop</button>`, dilHTML + `<div role="alert">Something went wrong</div>`, strings.Replace(dilHTML, `fixture-user`, `different-user`, 1), old + `<h4>You said:</h4><div>new result</div>`} {
+			set(html)
+			if emptyProof() {
+				t.Fatal("changed/generating/stale boundary accepted")
+			}
 		}
 	})
 }

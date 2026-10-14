@@ -46,6 +46,7 @@ var (
 	ErrNoResponse     = errors.New("chatgpt did not produce a response in time")
 	ErrMissingAnswer  = errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread/rendering and recover the pending turn; no automatic resubmission")
 	ErrProjectSetup   = errors.New("project setup failed before turn submission")
+	ErrNotSubmitted   = errors.New("turn failed before any submission action")
 )
 
 // IsNavigateError reports a page-navigation or explicit project-setup failure. All
@@ -648,8 +649,13 @@ func sameURL(a, b string) bool {
 }
 
 // askLocked owns navigation through URL capture under one browser transaction.
-func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, timeout, pollInterval time.Duration, onProgress func(string)) (TurnResult, error) {
-	var out TurnResult
+func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, timeout, pollInterval time.Duration, onProgress func(string)) (out TurnResult, err error) {
+	submissionAttempted := false
+	defer func() {
+		if err != nil && !submissionAttempted {
+			err = errors.Join(ErrNotSubmitted, err)
+		}
+	}()
 	tab, err := c.tabCtx(ctx)
 	if err != nil {
 		return out, err
@@ -722,30 +728,32 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 
 	// 4. Submit.
 	var cprobe struct {
-		Found   bool   `json:"found"`
-		Exact   bool   `json:"exact"`
-		CompLen int    `json:"compLen"`
-		WantLen int    `json:"wantLen"`
-		Off     int    `json:"off"`
-		CompCtx string `json:"compCtx"`
-		WantCtx string `json:"wantCtx"`
+		Found   bool `json:"found"`
+		Exact   bool `json:"exact"`
+		CompLen int  `json:"compLen"`
+		WantLen int  `json:"wantLen"`
+		Off     int  `json:"off"`
 	}
 	if err := chromedp.Run(tab, chromedp.Evaluate(fmt.Sprintf(`(() => {
 	  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-	  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-	  // The composer defuses markdown autolinks: "<https://…>" becomes
-	  // "< https://…>" (proven live: esp-idf URL, +1B at the break). Apply
-	  // the same rule to the wanted text — the model receives the composer
-	  // content either way; the check binds identity, not bytes.
-	  const want = norm(%s).replace(/<(https?:\/\/)/g, '< $1');
-	  if (!e) return {found:false, exact:false, compLen:0, wantLen:want.length, off:0, compCtx:'', wantCtx:''};
-	  const comp = norm(e.innerText || e.value);
-	  if (comp === want) return {found:true, exact:true, compLen:comp.length, wantLen:want.length, off:0, compCtx:'', wantCtx:''};
+	  const norm = s => (s || '').replace(/\r\n?/g, '\n').trim();
+	  // Only the observed URL defusing space is equivalent, in either direction.
+	  const canonical = s => norm(s).replace(/([<(\"]) ?(https?:\/\/)/g, '$1$2');
+	  const want = canonical(%s);
+	  if (!e) return {found:false, exact:false, compLen:0, wantLen:want.length, off:0};
+	  // innerText includes visual line breaks around rendered link widgets,
+	  // not editor content. Read the current ProseMirror document instead.
+	  const node = e.pmViewDesc?.node;
+	  const text = node?.type?.name === 'doc' && typeof node.textBetween === 'function'
+	    ? node.textBetween(0, node.content.size, '\n', '\n')
+	    : e.tagName === 'TEXTAREA' ? e.value : null;
+	  if (text === null) return {found:true, exact:false, compLen:0, wantLen:want.length, off:0};
+	  const comp = canonical(text);
+	  if (comp === want) return {found:true, exact:true, compLen:comp.length, wantLen:want.length, off:0};
 	  let off = 0;
 	  const n = Math.min(comp.length, want.length);
 	  while (off < n && comp[off] === want[off]) off++;
-	  const win = s => s.slice(Math.max(0, off-40), off+40);
-	  return {found:true, exact:false, compLen:comp.length, wantLen:want.length, off, compCtx:win(comp), wantCtx:win(want)};
+	  return {found:true, exact:false, compLen:comp.length, wantLen:want.length, off};
 	})()`, strconv.Quote(opt.Prompt)), &cprobe)); err != nil {
 		return out, err
 	}
@@ -755,14 +763,14 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 		// Still fails closed — nothing submits on mismatch. Best-effort wipe
 		// first: a partial insert must not persist as a draft that poisons
 		// retries or another session's pooled tab.
-		log.Printf("[chatgpt] composer mismatch found=%v compLen=%d wantLen=%d diffoff=%d compctx=%q wantctx=%q", cprobe.Found, cprobe.CompLen, cprobe.WantLen, cprobe.Off, cprobe.CompCtx, cprobe.WantCtx)
+		log.Printf("[chatgpt] composer mismatch found=%v compLen=%d wantLen=%d diffoff=%d", cprobe.Found, cprobe.CompLen, cprobe.WantLen, cprobe.Off)
 		wipeCtx, wipeCancel := context.WithTimeout(tab, 5*time.Second)
 		_ = chromedp.Run(wipeCtx, chromedp.Evaluate(`(() => {
 		  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
 		  if (!e) return;
 		  try {
 		    if (e.tagName === 'TEXTAREA') { e.value = ''; }
-		    else { e.innerHTML = ''; }
+		    else { e.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
 		    e.dispatchEvent(new Event('input', { bubbles: true }));
 		  } catch (_) {}
 		})()`, nil))
@@ -774,6 +782,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 		return out, err
 	}
 	log.Printf("[chatgpt] target=%s submitting prompt...", chromedp.FromContext(tab).Target.TargetID)
+	submissionAttempted = true // Even a failed click can have an unknown outcome.
 	if err := c.submit(ctx, tab); err != nil {
 		return out, err
 	}
@@ -809,7 +818,13 @@ func (c *Client) AskThread(ctx context.Context, prompt, threadURL string) (strin
 }
 
 // AskThreadTurn is AskThread plus image/video attachments and Thinking reasoning.
-func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (TurnResult, error) {
+func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (out TurnResult, err error) {
+	enteredTurn := false
+	defer func() {
+		if err != nil && !enteredTurn {
+			err = errors.Join(ErrNotSubmitted, err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
@@ -856,6 +871,7 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (TurnResult
 		}
 		unlock() // shared project setup ends before any prompt is submitted
 	}
+	enteredTurn = true
 	res, err := c.askLocked(ctx, opt, page, DefaultTimeout, 3*time.Second, nil)
 	if err != nil {
 		return TurnResult{URL: res.URL}, err
@@ -962,18 +978,18 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	  // a partial wipe could submit foreign text. Bail out if the wipe fails.
 	  try {
 	    if (el.tagName === 'TEXTAREA') { el.value = ''; }
-	    else { el.innerHTML = ''; }
+	    else { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
 	    el.dispatchEvent(new Event('input', { bubbles: true }));
 	    el.focus();
 	  } catch (e) {}
-	  if ((el.innerText || el.value || '').length > 0) return 'dirty';
+	  if ((el.innerText || el.value || '').trim().length > 0) return 'dirty';
 	  try { document.execCommand('insertText', false, t); } catch (e) {}
-	  if ((el.innerText || el.value || '').length > 0) return 'ok';
+	  if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
 	  try {
 	    const dt = new DataTransfer();
 	    dt.setData('text/plain', t);
 	    el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-	    if ((el.innerText || el.value || '').length > 0) return 'ok';
+	    if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
 	  } catch (e) {}
 	  return 'empty';
 	})()`, strconv.Quote(prompt))
