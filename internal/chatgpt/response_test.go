@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -276,6 +277,34 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err != nil || got.Last != "NEW COMPLETE ANSWER" || !got.Complete {
 			t.Fatal("actual rendered answer overridden", got, err)
 		}
+		// Real mixed-commentary DIL shape: rendered JSON has escaped Markdown
+		// and collapsed whitespace; only the final source preserves arguments.
+		mixed := "I will call the declared function.\n\n" + raw + "\n\nNo tools have run yet."
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{mixed}}
+		m["metadata"] = map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "not executed", "fallbackMarkdown": mixed}}
+		publish()
+		visibleHTML := strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div>`, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"><p>I will call the declared function.</p><p>`+html.EscapeString(raw)+`</p><p>No tools have run yet.</p></div>`, 1)
+		set(visibleHTML)
+		got, err = responseProbe(tab, before.IDs)
+		if err != nil || !got.SourceRequired || got.Last != mixed || got.LastID != "dil-answer" {
+			t.Fatal("mixed DIL protocol source was transformed", err)
+		}
+		for field, wrong := range map[string]any{"id": "another-answer", "channel": "analysis", "recipient": "tool", "status": "in_progress", "end_turn": false} {
+			valid := m[field]
+			m[field] = wrong
+			publish()
+			if _, err := responseProbe(tab, before.IDs); err == nil {
+				t.Fatalf("visible unsafe source %s fell back to rendered arguments", field)
+			}
+			m[field] = valid
+		}
+		node["parent"] = "different-user"
+		publish()
+		if _, err := responseProbe(tab, before.IDs); err == nil {
+			t.Fatal("visible unbound source accepted")
+		}
+		node["parent"] = "fixture-user"
+		publish()
 		// Actual October 14 post-tool follow-up: prior call is valid but the
 		// fresh final source is genuinely empty, with only a reasoning recap.
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{""}}

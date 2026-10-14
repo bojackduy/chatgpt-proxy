@@ -52,6 +52,46 @@ func TestAuxiliaryLanesCannotContaminateMain(t *testing.T) {
 	}
 }
 
+func TestUntaggedTitleRequestCannotRotateMain(t *testing.T) {
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := completionsRequest{Messages: []message{{Role: "user", Content: "main first"}}}
+	a := assistant(t, request(h, "session", req))
+	url := h.sessions["session"].URL
+	before, _ := json.Marshal(h.sessions["session"])
+	// Exact installed-host title shape: same session ID, no lane header, no
+	// tools, title prefix as the first user message.
+	title := completionsRequest{Messages: []message{{Role: "user", Content: "Generate a title for this conversation:\nmain first"}}}
+	assistant(t, request(h, "session", title))
+	after, _ := json.Marshal(h.sessions["session"])
+	if !bytes.Equal(before, after) {
+		t.Fatal("untagged title request changed main journal")
+	}
+	if len(h.sessions) != 2 {
+		t.Fatal("untagged title had no isolated journal", len(h.sessions))
+	}
+	req.Messages = append(req.Messages, a, message{Role: "user", Content: "main followup"})
+	assistant(t, request(h, "session", req))
+	if h.sessions["session"].URL != url || f.urls[len(f.urls)-1] != url {
+		t.Fatal("main thread lost across untagged title")
+	}
+	// Near-miss shapes stay on main: no exact prefix, multipart content, or
+	// tool-carrying requests must not be diverted.
+	for _, near := range []completionsRequest{
+		{Messages: []message{{Role: "user", Content: "Generate a title for a story"}}},
+		{Messages: []message{{Role: "user", Content: []any{map[string]any{"type": "text", "text": "Generate a title for this conversation:\nmain first"}}}}},
+		{Messages: []message{{Role: "user", Content: "Generate a title for this conversation:\nmain first"}}, Tools: weatherReq().Tools},
+	} {
+		if aux, ok := isolateUntaggedTitle("session", near, h.sessions["session"]); ok {
+			t.Fatalf("near-miss title diverted to %s", aux)
+		}
+	}
+	if aux, ok := isolateUntaggedTitle("session", title, nil); ok {
+		t.Fatalf("title without established thread diverted to %s", aux)
+	}
+}
+
 func TestLaneValidationAndLegacyIdentity(t *testing.T) {
 	h := testHandler(&fakeBackend{})
 	req := completionsRequest{Messages: []message{{Role: "user", Content: "hello"}}}

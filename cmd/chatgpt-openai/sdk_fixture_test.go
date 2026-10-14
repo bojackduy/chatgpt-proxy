@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +16,44 @@ const capturedSDKRequests = `[
 ]`
 
 func TestCapturedSDKTitleAndToolRepresentations(t *testing.T) {
+	t.Run("installed v2 compact DCP ordinary followup and restart", func(t *testing.T) {
+		// Exact 637-byte metadata suffix from the affected v2 wire transcript.
+		const suffix = "\n\n<dcp-system-reminder>\nEvaluate the conversation for compressible ranges.\n\nIf any messages are cleanly closed and unlikely to be needed again, use the compress tool on them.\nIf direction has shifted, compress earlier ranges that are now less relevant.\n\nThe goal is to filter noise and distill key information so context accumulation stays under control.\nKeep active context uncompressed.\n\nCompressed block context:\n- Active compressed blocks in this session: 0 (none)\n- If your selected compression range includes any listed block, include each required placeholder exactly once in the summary using `@b1@`.\n</dcp-system-reminder>\n\n@33@"
+		if len(suffix) != 637 {
+			t.Fatal("captured suffix shape changed")
+		}
+		f := &fakeBackend{answers: []string{"first answer", "second answer", "third answer"}}
+		h := testHandler(f)
+		h.statePath = t.TempDir() + "/state.json"
+		req := completionsRequest{Messages: []message{{Role: "user", Content: "first question"}}, Tools: weatherReq().Tools, ToolChoice: "auto"}
+		a := assistant(t, request(h, "compact-v2", req))
+		url := h.sessions["compact-v2"].URL
+		a.Content = contentText(a) + suffix
+		req.Messages = append(req.Messages, a, message{Role: "user", Content: "second question"})
+		b := assistant(t, request(h, "compact-v2", req))
+		reloaded := testHandler(f)
+		reloaded.statePath = h.statePath
+		if err := reloaded.load(); err != nil {
+			t.Fatal(err)
+		}
+		b.Content = contentText(b) + suffix
+		req.Messages = append(req.Messages, b, message{Role: "user", Content: "third question"})
+		assistant(t, request(reloaded, "compact-v2", req))
+		if reloaded.sessions["compact-v2"].URL != url || len(f.prompts) != 3 || f.urls[1] != url || f.urls[2] != url || strings.Contains(f.prompts[1], "first question") || strings.Contains(f.prompts[2], "second question") || strings.Contains(f.prompts[1], toolPreamble) || strings.Contains(f.prompts[2], toolPreamble) {
+			t.Fatal("ordinary compact-metadata followup/reopen rotated or replayed")
+		}
+		for _, changed := range []message{
+			{Role: "assistant", Content: "first answer edited" + suffix},
+			{Role: "assistant", Content: "first answer\n\n@33@"},
+			{Role: "assistant", Content: "first answer" + strings.Replace(suffix, "\n\n@33@", "\n\n@b1@", 1)},
+			{Role: "assistant", Content: "first answer" + suffix + " intentional tail"},
+			{Role: "user", Content: "first answer" + suffix},
+		} {
+			if prefix([]message{changed}, []message{{Role: "assistant", Content: "first answer"}}) {
+				t.Fatal("genuine edit or unrecognized metadata normalized")
+			}
+		}
+	})
 	var captured []struct {
 		Lane     string    `json:"lane"`
 		Messages []message `json:"messages"`

@@ -482,7 +482,10 @@ var (
 	// first assistant message. Proven shape (3 live samples): answer, then
 	// the reminder block, then exactly one trailing message-id tag at end
 	// of string. Anything else stays exact.
-	dcpReminderRe = regexp.MustCompile(`(?s)\n*<dcp-system-reminder>.*?</dcp-system-reminder>\n*<dcp-message-id>[^<]*</dcp-message-id>\s*$`)
+	// Installed v2 DCP also emits compact raw-message references (@33@).
+	// Only the complete assistant reminder envelope is equivalent; standalone
+	// @tokens, compressed-block references (@b1@), and surrounding text stay exact.
+	dcpReminderRe = regexp.MustCompile(`(?s)\n*<dcp-system-reminder>.*?</dcp-system-reminder>\n*(?:<dcp-message-id>[^<]*</dcp-message-id>|@[1-9][0-9]*@)\s*$`)
 )
 
 func normalizeSystem(s string) string {
@@ -836,8 +839,11 @@ func parseAnswer(answer string, req completionsRequest) (result, error) {
 		return result{}, errors.New("incomplete opencode_bridge_call wrapper")
 	}
 	out.Text = strings.TrimSpace(out.Text)
-	if len(out.Calls) > 0 && out.Text != "" {
-		return result{}, errors.New("bridge calls must not contain prose or Markdown fences")
+	// All wrappers have passed full schema and tool_choice validation before
+	// returning anything. Preserve accompanying commentary as non-executable
+	// assistant text; never discard it or promote fenced/inline code examples.
+	if len(out.Calls) > 0 && (strings.Contains(out.Text, "`") || regexp.MustCompile(`(?m)^\s*~~~`).MatchString(out.Text)) {
+		return result{}, errors.New("bridge calls must not appear in Markdown code examples")
 	}
 	if (choice == "required" || named != "") && len(out.Calls) == 0 {
 		return result{}, errors.New("backend did not honor required tool_choice")
@@ -949,6 +955,16 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		h.sessions = map[string]*session{}
 	}
 	s := h.sessions[id]
+	// The installed host sends title generation on the main session ID with
+	// no lane header. Isolate that exact shape to the title journal before it
+	// can prefix-mismatch and rotate the established working thread.
+	if lane == "main" {
+		if aux, ok := isolateUntaggedTitle(id, req, s); ok {
+			log.Printf("[openai] session=%s lane=main untagged title isolated; main thread untouched", id)
+			id, lane = aux, "title"
+			s = h.sessions[id]
+		}
+	}
 	// Preserve pre-upgrade rejection/uncertainty when a v2 child was journaled
 	// under its root affinity ID. Bind only an exact authoritative transcript
 	// prefix (including delivered call IDs/results), never user-text similarity.

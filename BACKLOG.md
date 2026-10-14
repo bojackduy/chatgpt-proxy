@@ -586,3 +586,14 @@ only or drop entirely; rollout behind a flag vs default.
 **Related constraints:** new projects need default (not project-only) memory
 for cross-chat references — verify the creation default; creation adds ~15-30s
 first-turn latency; unknown creation rate limits.
+
+**Status 2026-10-14 (stable-thread goal, uncommitted, undeployed):** live
+correlation on `ses_ec74b8ec4ffekz0UslWJu0xkCT` proved the first rotation was
+an untagged title request (same session ID, tools=0, short system) hitting
+`prefix_mismatch index=0`, and every later rotation was a 637-byte compact-DCP
+reminder suffix the canonicalizer did not recognize. Narrow fixes: untagged
+title shapes go to the title-lane journal (`isolateUntaggedTitle`, exact host
+prefix only); compact `@N@` reminder envelopes compare equivalent; completed
+DIL protocol falls back to DOM-ID-bound source bytes; fully validated outer
+commentary is kept as non-executable text. Live same-thread continuity and
+deployment still pending; item stays open until proven.

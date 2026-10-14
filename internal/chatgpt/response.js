@@ -23,7 +23,7 @@
   const candidates = ordered([...heads, ...roles.filter(e => !heads.some(h => h.parentElement.contains(e)))]);
   const fresh = candidates.filter(e => !baseline.includes(key(e)) && user && (user.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING));
   const last = fresh.at(-1);
-  let text = '', reasoning = '';
+  let text = '', reasoning = '', sourceRequired = false;
   if (last) {
     const body = last.tagName === 'H4' ? last.nextElementSibling : last;
     const thoughts = body?.querySelector('[data-testid="thought-block"], [data-thinking]');
@@ -189,6 +189,11 @@
       // Tool-only answers are a literal wire protocol, not Markdown prose.
       // Preserve their JSON (including backslashes) and historical exact ACK.
       const raw = clone.textContent.trim();
+      // DIL can render literal JSON as styled Markdown, changing backslashes
+      // and indentation. Executable protocol must use the completed source
+      // bound to this DOM identity; never infer arguments from that rendering.
+      sourceRequired = /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/.test(raw) &&
+        !!(source.matches?.('[data-dil-message-id]') || source.querySelector('[data-dil-message-id]'));
       // Incomplete protocol must reach the adapter unchanged too, so it can
       // reject it rather than accidentally return escaped successful prose.
       // Code examples remain Markdown and are never promoted to calls.
@@ -204,7 +209,7 @@
   const buttons = [...document.querySelectorAll('button')];
   const alerts = [...document.querySelectorAll('[role="alert"], [data-testid="error-notification"], .text-token-text-error')];
   const turn = last?.closest('[data-talvt-turn-state]');
-  return {ids:candidates.map(key), lastID:last ? key(last) : '', lastAssistant:text, reasoning,
+  return {ids:candidates.map(key), lastID:last ? key(last) : '', lastAssistant:text, reasoning, sourceRequired,
     fresh:!!last, complete:turn?.getAttribute('data-talvt-turn-state') === 'complete',
     stopBtn:!!q('[data-testid="stop-button"]') || buttons.some(b => /stop/i.test(b.getAttribute('aria-label') || '')),
     continueBtn:!!q('[data-testid="continue-generate-button"]') || buttons.some(b => /continue generating/i.test((b.textContent || '').trim())),

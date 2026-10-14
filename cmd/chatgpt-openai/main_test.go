@@ -188,7 +188,7 @@ func TestSSEContract(t *testing.T) {
 	}
 }
 func TestMalformedCalls(t *testing.T) {
-	for _, answer := range []string{"<opencode_bridge_call>{bad}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":\"bad\"}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":null}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"unknown\",\"arguments\":{}}</opencode_bridge_call>", "<opencode_bridge_call>{}", "plain answer", "```tool_call\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hanoi\"}}\n```", "```\n" + weatherAnswer + "\n```", "prose\n" + weatherAnswer} {
+	for _, answer := range []string{"<opencode_bridge_call>{bad}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":\"bad\"}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":null}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"unknown\",\"arguments\":{}}</opencode_bridge_call>", "<opencode_bridge_call>{}", "plain answer", "```tool_call\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hanoi\"}}\n```", "```\n" + weatherAnswer + "\n```", "~~~\n" + weatherAnswer + "\n~~~", "Example `" + weatherAnswer + "`"} {
 		t.Run(answer, func(t *testing.T) {
 			req := weatherReq()
 			if answer == "<opencode_bridge_call>{}" {
@@ -214,6 +214,22 @@ func TestMalformedCalls(t *testing.T) {
 	if _, err := parseAnswer(weatherAnswer, weatherReq()); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("commentary is preserved only after every call validates", func(t *testing.T) {
+		out, err := parseAnswer("I will check.\n"+weatherAnswer+"\nWaiting for results.", weatherReq())
+		if err != nil || len(out.Calls) != 1 || out.Text != "I will check.\n\nWaiting for results." {
+			t.Fatal("valid calls or non-executable commentary lost", err)
+		}
+		for _, unsafe := range []string{
+			"I will check.\n" + weatherAnswer + "\n<opencode_bridge_call>{",
+			"I will check.\n" + weatherAnswer + "\n<opencode_bridge_call>{\"name\":\"unknown\",\"arguments\":{}}</opencode_bridge_call>",
+			"I will check.\n" + weatherAnswer + "\n<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":12}}</opencode_bridge_call>",
+		} {
+			out, err := parseAnswer(unsafe, weatherReq())
+			if err == nil || len(out.Calls) != 0 {
+				t.Fatal("partially validated mixed output delivered")
+			}
+		}
+	})
 	// A completely received invalid response delivers no partial calls, is
 	// durable across restart, and exact retries do not submit or execute again.
 	f := &fakeBackend{answers: []string{weatherAnswer + "\n<opencode_bridge_call>{", "ACK", "continued"}}
@@ -313,10 +329,9 @@ func TestMalformedCalls(t *testing.T) {
 			child.Messages = append(child.Messages, message{Role: "tool", ToolCallID: call.ID, Content: "prior delivered result"})
 		}
 	}
-	// Exact-source diagnostics found an authorized, schema-valid call mixed
-	// with commentary. Redact the real shell arguments and use the same shape;
-	// escaped delimiters are the observed rendered form, not an invalid schema.
-	f.answers = append(f.answers, "redacted source commentary\n"+strings.ReplaceAll(weatherAnswer, "opencode_bridge_call", `opencode\_bridge\_call`))
+	// Mixed commentary alone is valid now. Retain the rejected child boundary
+	// using the actual serializer failure class: illegal Markdown JSON escapes.
+	f.answers = append(f.answers, "redacted source commentary\n"+strings.ReplaceAll(weatherAnswer, "Hanoi", `\*Hanoi\*`))
 	for attempt := 0; attempt < 2; attempt++ {
 		body, _ := json.Marshal(child)
 		r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
@@ -426,6 +441,44 @@ func TestSessionsReadinessAndFallback(t *testing.T) {
 	}
 }
 func TestErrorsAndDirtyRetry(t *testing.T) {
+	if fixture := os.Getenv("CHATGPT_BRIDGE_REJECTED_FIXTURE"); fixture != "" {
+		t.Run("exact recorded rejected answer offline", func(t *testing.T) {
+			b, err := os.ReadFile(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var captured struct {
+				Request        completionsRequest
+				Answer, Source string
+			}
+			if err := json.Unmarshal(b, &captured); err != nil {
+				t.Fatal(err)
+			}
+			for label, answer := range map[string]string{"rendered": captured.Answer, "source": captured.Source} {
+				_, err := parseAnswer(answer, captured.Request)
+				if label == "rendered" {
+					if err == nil || !strings.Contains(err.Error(), "invalid escape sequence") {
+						t.Fatalf("rendered failure classification: %v", err)
+					}
+					t.Log("rendered: Markdown serialization introduced an invalid JSON escape")
+					continue
+				}
+				out, err := parseAnswer(answer, captured.Request)
+				if err != nil || len(out.Calls) != 1 || out.Text == "" {
+					t.Fatalf("%s source call/commentary: %v", label, err)
+				}
+				blocks := toolBlock.FindAllString(answer, -1)
+				if len(blocks) != 1 {
+					t.Fatal("expected exact single recorded wrapper")
+				}
+				wrapper, err := parseAnswer(blocks[0], captured.Request)
+				if err != nil || len(wrapper.Calls) != 1 || wrapper.Calls[0].Function.Name != "patch" || wrapper.Calls[0].Function.Arguments != out.Calls[0].Function.Arguments {
+					t.Fatalf("%s wrapper schema/tool_choice: %v", label, err)
+				}
+				t.Logf("%s: complete patch wrapper validates against exact catalog; outer text retained separately and exact arguments preserved", label)
+			}
+		})
+	}
 	t.Run("valid tool then authoritative empty follow-up", func(t *testing.T) {
 		f := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{weatherAnswer}}}
 		h := testHandler(f.fakeBackend)
