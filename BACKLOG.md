@@ -63,6 +63,42 @@ Evidence: goal `3cb60bfe…` (`inspection.json`, `readback.json`,
 `stage-verification.log`, `live.json`, `live-adapter.log`, `peer.json`,
 `installation.json`, `recovery.json`).
 
+## Incomplete uncertainty journals (2026-10-15)
+
+**Implemented; actual session resync armed, isolated live verification passed.** The
+adapter previously saved `Dirty=true` before phase/request/prompt, leaving a
+reproducible crash or save-failure window. This is a possible mechanism, not a
+proved attribution of older records. The first write now includes the complete
+final binding or explicit inert-replay phase. Load/save classify incomplete
+records without rewriting their evidence or treating them as clean.
+
+Completions and `/recover` return terminal422 `error.code=incomplete_journal`
+when the original binding is absent or repair binding is inconsistent. Supplying
+a guessed request is not recovery evidence. Explicit `/resync` accepts reviewed
+completed authoritative history and recorded tool results, retaining Dirty until
+a distinct new user boundary; historical calls remain inert imports. It can
+reconcile completed later history after the journal's outstanding call results.
+Old user requests and system-update-only changes cannot consume resync permission
+through the loose compaction/re-anchoring path.
+For the reviewed current session, endpoint arming preserved 386 original journal
+messages and reconciled 2978 completed-history messages, including 1126 recorded
+tool results. Only that journal changed; no original task was generated or
+historical tool executed. The armed snapshot survived an idle service restart
+with unchanged SHA256. This is **armed, not a recovered/settled actual turn**:
+the next distinct ordinary user message must trigger inert import and continuation.
+An isolated synthetic journal passed live resync of 35 messages/12,340 bytes in
+two inert ACK chunks, harmless final response, a separate-thread switch, and
+reopening the same resynced thread. Zero tools were offered/executed; the actual
+session hash stayed unchanged. The first synthetic attempt hit a proved
+pre-submission composer mismatch (clean saved import progress), then safely
+resumed; this is not an incomplete/unknown submitted journal.
+
+Separately, the newly reported `ses_ed3b3e58…` typing deadline at 09:41:53 was
+reported before submission (`uncertain=false`, retained completed state). It is
+not this session's missing-pending journal. Large-input typing/timeout handling
+remains a separate follow-up; this change does not claim to fix it.
+The larger integrated user-facing recovery UX below is still unfinished.
+
 ## User-facing recovery and safe model-switch fallback
 
 **Status:** continuation repair in progress; recovery UX is still unfinished.

@@ -720,10 +720,14 @@ is a reproduced failure mechanism rather than a claimed historical observation.
 An uncertain session remains blocked from automatic resubmission. To recover a
 finished stored response **without executing any tools**, send
 `POST /v1/sessions/recover` with the original `X-Session-Id` header. New journals
-retain the pending request and prompt, so an empty body is sufficient. For older
-journals, supply the exact original `/v1/chat/completions` request body, including
-messages, tools and tool choice. Recovery requires the original history/tool-set
-match, exact equality with the full stored user prompt (visible user text can be
+retain the pending request, prompt and final phase, so an empty body is sufficient.
+A supplied request must match that durable original binding; it cannot fill in
+missing evidence. Dirty journals missing phase, request or prompt return terminal
+HTTP422 with `error.code=incomplete_journal` from completions and recovery. Their
+submission outcome is unknown, not proved unsubmitted. Use explicit completed-
+history resync below, never manual file edits or a guessed original request.
+Explicit replay-phase journals remain resumable and are not incomplete finals.
+Recovery requires exact equality with the full stored user prompt (visible user text can be
 truncated), an unambiguous finished assistant response, and normal tool-schema
 validation. Any mismatch leaves the dirty journal untouched.
 
@@ -744,15 +748,18 @@ client's text encodings and metadata; never substitute guessed or regenerated
 results. The endpoint keeps `Dirty=true`, retains the old thread URL, and only
 arms permission for a **new user message** following that transcript. It does
 not submit anything or return the uncertain response's calls.
+The final message must contain distinct ordinary user text: an old request,
+tool result, or `<system-update>` metadata alone cannot consume this permission,
+even when compaction requires re-anchoring the reviewed transcript.
 
 The next new user request uses a fresh Project thread. The entire completed
 transcript is imported with the inert-history instruction and ACK-only replies
 before the new request is submitted. Arming is consumed before the first browser
 submission; a failed import stays dirty and cannot automatically resubmit.
 
-Journals that do NOT end in outstanding assistant tool calls (for example a
-journal reduced to its system message by an earlier bad recovery) can instead be
-armed with a fully completed authoritative transcript: every assistant tool
+Resync may also reconcile later completed authoritative history, including when
+the recorded journal ends with outstanding calls: supply those recorded results
+first, then later completed exchanges. Every assistant tool
 call matched by exactly one non-empty tool result, no dangling calls, and the
 recorded prefix included. The same new-user-message flow then applies.
 

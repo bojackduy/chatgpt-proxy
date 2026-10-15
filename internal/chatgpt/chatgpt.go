@@ -13,8 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +26,7 @@ import (
 
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
+	"github.com/gorilla/websocket"
 )
 
 // Defaults.
@@ -40,6 +41,7 @@ const (
 var (
 	ErrChromeNotFound = errors.New("chrome binary not found")
 	ErrChromeLaunch   = errors.New("failed to launch chrome")
+	ErrChromeProfile  = errors.New("debugging endpoint cannot prove the configured Chrome profile; start the dedicated Chrome with --enable-automation on the configured port")
 	ErrNotLoggedIn    = errors.New("not logged in to chatgpt.com")
 	ErrNoComposer     = errors.New("chatgpt composer not found (no #prompt-textarea or ProseMirror contenteditable)")
 	ErrNoNewChat      = errors.New("could not find the New chat button")
@@ -186,15 +188,16 @@ func (c *Client) ensureBrowser(ctx context.Context) error {
 	}
 	// 1. Attach to an already-running DevTools server (e.g. from a previous
 	//    run of this proxy) before launching anything.
-	for port := c.scanStart(); port < c.scanStart()+10; port++ {
-		wsURL, err := c.attach(ctx, port)
-		if err == nil {
-			c.actualPort = port
-			return c.connect(wsURL)
-		}
-	}
-	// 2. None found — launch once on a free port and poll until it comes up.
 	port := c.resolvePort()
+	wsURL, err := c.attach(ctx, port)
+	if err == nil {
+		c.actualPort = port
+		return c.connect(wsURL)
+	}
+	if errors.Is(err, ErrChromeProfile) || ctx.Err() != nil {
+		return err
+	}
+	// 2. Configured endpoint absent — launch only on that exact port.
 	if !c.launchAttempted {
 		if err := c.launch(ctx, port); err != nil {
 			return err
@@ -208,6 +211,9 @@ func (c *Client) ensureBrowser(ctx context.Context) error {
 		if err == nil {
 			c.actualPort = c.launchPort
 			return c.connect(wsURL)
+		}
+		if errors.Is(err, ErrChromeProfile) || ctx.Err() != nil {
+			return err
 		}
 		if time.Now().After(deadline) {
 			c.launchAttempted = false // allow a fresh launch on the next call
@@ -267,19 +273,11 @@ func (c *Client) browserAlive() bool {
 	return v.WebSocketDebuggerURL != "" && v.WebSocketDebuggerURL == c.wsURL
 }
 
-// resolvePort picks the debug port to use. An explicit (non-default) port is
-// respected; the default scans for the first free port so a stray listener on
-// 9222 (e.g. another tool) can't wedge the proxy.
+// resolvePort keeps browser identity on the configured endpoint. Adjacent
+// listeners may belong to another provider/profile and must never be adopted.
 func (c *Client) resolvePort() int {
-	if c.ChromePort != 0 && c.ChromePort != DefaultChromePort {
+	if c.ChromePort != 0 {
 		return c.ChromePort
-	}
-	for p := DefaultChromePort; p < DefaultChromePort+10; p++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err == nil {
-			ln.Close()
-			return p
-		}
 	}
 	return DefaultChromePort
 }
@@ -287,10 +285,10 @@ func (c *Client) resolvePort() int {
 // attach returns the WebSocket debugger URL of an already-running Chrome.
 // Bounded by a short timeout so a dead or foreign listener can't hang us.
 func (c *Client) attach(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/json/version", port)
+	versionURL := fmt.Sprintf("http://127.0.0.1:%d/json/version", port)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, versionURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -303,10 +301,99 @@ func (c *Client) attach(ctx context.Context, port int) (string, error) {
 		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: invalid version response", ErrChromeProfile)
 	}
 	if v.WebSocketDebuggerURL == "" {
-		return "", errors.New("no webSocketDebuggerUrl in /json/version")
+		return "", fmt.Errorf("%w: missing browser endpoint", ErrChromeProfile)
+	}
+	endpoint, err := url.Parse(v.WebSocketDebuggerURL)
+	if err != nil || endpoint.Scheme != "ws" || (endpoint.Hostname() != "127.0.0.1" && endpoint.Hostname() != "localhost") || endpoint.Port() != strconv.Itoa(port) || !strings.HasPrefix(endpoint.Path, "/devtools/browser/") {
+		return "", fmt.Errorf("%w: unexpected browser endpoint", ErrChromeProfile)
+	}
+	// This browser-level query is read-only: never create/adopt a target until
+	// Chrome proves both its profile and port. Without --enable-automation the
+	// command is unavailable; fail closed rather than trusting a static label.
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, v.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("%w: browser verification unavailable", ErrChromeProfile)
+	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetWriteDeadline(deadline)
+	if err := conn.WriteJSON(map[string]any{"id": 1, "method": "Browser.getBrowserCommandLine"}); err != nil {
+		return "", fmt.Errorf("%w: browser verification unavailable", ErrChromeProfile)
+	}
+	var command struct {
+		ID    int `json:"id"`
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Result struct {
+			Arguments []string `json:"arguments"`
+		} `json:"result"`
+	}
+	for command.ID != 1 {
+		if err := conn.ReadJSON(&command); err != nil {
+			return "", fmt.Errorf("%w: browser verification unavailable", ErrChromeProfile)
+		}
+	}
+	profileOK, portOK := false, false
+	wantProfile, err := filepath.Abs(c.ProfileDir)
+	if err != nil {
+		return "", ErrChromeProfile
+	}
+	// Older dedicated Chrome may not expose command-line CDP without
+	// --enable-automation. In that ONE case require independent OS proof:
+	// exact TCP listener PID, exact executable/profile/port args, and the same
+	// PID as this profile's singleton owner. No missing evidence is trusted.
+	if command.Error.Code == -32000 && command.Error.Message == "Command line not returned because --enable-automation not set." {
+		listeners, err := exec.CommandContext(ctx, "lsof", "-nP", "-a", "-iTCP:"+strconv.Itoa(port), "-sTCP:LISTEN", "-Fp").Output()
+		if err != nil {
+			return "", fmt.Errorf("%w: listener owner unavailable", ErrChromeProfile)
+		}
+		var pids []string
+		for _, field := range strings.Fields(string(listeners)) {
+			if strings.HasPrefix(field, "p") {
+				pids = append(pids, field)
+			}
+		}
+		if len(pids) != 1 || !regexp.MustCompile(`^p[1-9][0-9]*$`).MatchString(pids[0]) {
+			return "", fmt.Errorf("%w: listener owner ambiguous", ErrChromeProfile)
+		}
+		pid := pids[0][1:]
+		lock, err := os.Readlink(filepath.Join(wantProfile, "SingletonLock"))
+		if err != nil || !strings.HasSuffix(lock, "-"+pid) {
+			return "", fmt.Errorf("%w: listener is not the profile singleton owner", ErrChromeProfile)
+		}
+		argv, err := exec.CommandContext(ctx, "ps", "-ww", "-p", pid, "-o", "command=").Output()
+		bin := c.ChromePath
+		if bin == "" {
+			bin = findChrome()
+		}
+		line := strings.TrimSpace(string(argv))
+		profileFlag := "--user-data-dir=" + wantProfile
+		portFlag := "--remote-debugging-port=" + strconv.Itoa(port)
+		if err != nil || bin == "" || !strings.HasPrefix(line, bin+" ") ||
+			strings.Count(line, "--user-data-dir=") != 1 || strings.Count(line, "--remote-debugging-port=") != 1 ||
+			!regexp.MustCompile(`(?:^|\s)`+regexp.QuoteMeta(profileFlag)+`(?:\s|$)`).MatchString(line) ||
+			!regexp.MustCompile(`(?:^|\s)`+regexp.QuoteMeta(portFlag)+`(?:\s|$)`).MatchString(line) {
+			return "", fmt.Errorf("%w: listener executable/profile/port mismatch", ErrChromeProfile)
+		}
+		command.Result.Arguments = []string{profileFlag, portFlag}
+	}
+	for _, arg := range command.Result.Arguments {
+		if strings.HasPrefix(arg, "--user-data-dir=") {
+			actual, err := filepath.Abs(strings.TrimPrefix(arg, "--user-data-dir="))
+			profileOK = err == nil && actual == wantProfile
+		}
+		if strings.HasPrefix(arg, "--remote-debugging-port=") {
+			portOK = arg == "--remote-debugging-port="+strconv.Itoa(port)
+		}
+	}
+	if !profileOK || !portOK {
+		return "", fmt.Errorf("%w: browser profile or port mismatch", ErrChromeProfile)
 	}
 	return v.WebSocketDebuggerURL, nil
 }
@@ -324,7 +411,17 @@ func (c *Client) launch(ctx context.Context, port int) error {
 	if err := os.MkdirAll(c.ProfileDir, 0o755); err != nil {
 		return err
 	}
+	// Never forward launch arguments into an existing non-debuggable Chrome
+	// using this profile, or remove a potentially live singleton lock.
+	for _, name := range []string{"SingletonLock", "SingletonSocket"} {
+		if _, err := os.Lstat(filepath.Join(c.ProfileDir, name)); err == nil {
+			return fmt.Errorf("%w: dedicated profile is already locked; inspect its owning Chrome and start its exact configured debugging port; no lock was removed", ErrChromeLaunch)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	args := []string{
+		"--enable-automation",
 		"--remote-debugging-port=" + strconv.Itoa(port),
 		"--user-data-dir=" + c.ProfileDir,
 		"--no-first-run",

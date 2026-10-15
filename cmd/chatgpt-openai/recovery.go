@@ -17,6 +17,22 @@ type recoveryBackend interface {
 	ReadThreadTurn(context.Context, string, string) (chatgpt.TurnResult, error)
 }
 
+// An absent binding is not evidence that a turn was never submitted. Replay is
+// different: its explicit phase proves only inert imports were in flight.
+// Classification is derived so loading an old record preserves its raw fields.
+func (s *session) incompleteJournal() bool {
+	return s != nil && s.Dirty && s.Phase != "replay" &&
+		(s.Phase != "final" || s.PendingRequest == nil || len(s.PendingRequest.Messages) == 0 || s.PendingPrompt == "" ||
+			(s.RepairPendingPrompt != "" && (s.RepairPendingPrompt != s.PendingPrompt || s.RepairFingerprint != requestFingerprint(*s.PendingRequest))))
+}
+
+func incompleteJournalError(w http.ResponseWriter) {
+	writeJSON(w, 422, map[string]any{"error": map[string]any{
+		"type": "incomplete_journal", "code": "incomplete_journal",
+		"message": "session uncertainty journal lacks a complete original request/prompt binding; submission outcome is unknown. Read-only /v1/sessions/recover cannot reconstruct it safely. Explicitly POST /v1/sessions/resync with the authoritative completed transcript and recorded tool results, then send a NEW ordinary user message; historical tools will be imported inertly, never rerun",
+	}})
+}
+
 // tryAdoptInterrupted attempts bounded read-only recovery of an interrupted
 // final turn: it waits for the stored thread's answer to complete, validates
 // it against the pending prompt, and caches it exactly like a normal
@@ -26,6 +42,9 @@ type recoveryBackend interface {
 // hit the duplicate cache. On any failure it returns false and the caller
 // keeps terminal uncertainty. It never submits, never executes tools, and never clears an
 // ambiguous journal.
+// Adoption intentionally remains read-only: it never initiates a format repair.
+// A stored repair prompt is adopted against the original client request and
+// the durable RepairFingerprint budget is retained, so restart cannot re-ask.
 func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bool {
 	pending := s.PendingRequest
 	if pending == nil || s.PendingPrompt == "" || s.URL == "" {
@@ -107,6 +126,7 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 	s.Fingerprint, s.Result, s.Dirty, s.Phase = fp, out, false, ""
 	s.ToolsFP = toolsFingerprint(pending.Tools)
 	s.PendingRequest, s.PendingPrompt = nil, ""
+	s.RepairPendingPrompt = ""
 	if err := h.save(); err != nil {
 		*s = old // retain the original pending binding if adoption was not durable
 		return false
@@ -172,6 +192,10 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 	s := h.sessions[id]
+	if s.incompleteJournal() {
+		incompleteJournalError(w)
+		return
+	}
 	if s != nil && s.Phase == "invalid" {
 		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with a distinct new ordinary user message at the end of the authoritative transcript"))
 		return
@@ -180,31 +204,16 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 409, errors.New("no uncertain stored thread for this session"))
 		return
 	}
-	req := s.PendingRequest
-	if req == nil {
-		req = supplied
-	}
-	if req == nil || len(req.Messages) == 0 {
-		apiError(w, 409, errors.New("legacy journal requires exact original completion request including tools"))
+	if s.Phase == "replay" {
+		apiError(w, 409, errors.New("only inert history import was interrupted; resume the completion request to continue replay; there is no submitted final response to recover"))
 		return
 	}
+	req := s.PendingRequest
 	if supplied != nil && requestFingerprint(*supplied) != requestFingerprint(*req) {
 		apiError(w, 409, errors.New("supplied request does not match the exact original pending request"))
 		return
 	}
 	prompt := s.PendingPrompt
-	if s.PendingRequest == nil {
-		if !prefix(req.Messages, s.Messages) || len(req.Messages) <= len(s.Messages) || toolsFingerprint(req.Tools) != s.ToolsFP {
-			apiError(w, 409, errors.New("original history/tool set does not match the journal"))
-			return
-		}
-		turns := h.buildTurns(*req, req.Messages[len(s.Messages):], toolReminder(*req))
-		if len(turns) != 1 || turns[0].replay {
-			apiError(w, 409, errors.New("legacy recovery requires one exactly correlated answer turn"))
-			return
-		}
-		prompt = turns[0].prompt
-	}
 	backend, ok := h.client.(recoveryBackend)
 	if !ok {
 		apiError(w, 503, errors.New("backend cannot inspect stored responses"))

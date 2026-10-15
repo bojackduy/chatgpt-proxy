@@ -64,6 +64,15 @@
         if (/^[\w#+.-]{1,20}$/.test(first)) blockLang.set(w, first.toLowerCase());
       }
       for (const e of clone.querySelectorAll('button, [role="toolbar"], [hidden], [aria-hidden="true"], script, style, [data-markdown-copy="exclude"], [data-testid="thought-block"], [data-thinking], [data-d-component="badge"]')) e.remove();
+      // Empty paired escape text has been observed in journals, but its channel
+      // provenance is unproved. Remove only standalone empty blocks, never
+      // route their content into reasoning or strip tags from prose/code/JSON.
+      const emptyEscape = /^\s*(?:<escape>\s*<\/escape>\s*)+$/;
+      for (const e of [clone, ...clone.querySelectorAll('p, div, section, article')]) {
+        if (!e.closest('pre, code, [data-markdown-copy="code-block"], [data-d-component="code-block"]') &&
+            !e.querySelector('pre, code, [data-markdown-copy="code-block"], [data-d-component="code-block"]') &&
+            emptyEscape.test(e.textContent)) e.replaceChildren();
+      }
       // Serialize only this answer, never page HTML. textContent decodes escaped
       // literal protocol tags without ever interpreting them as HTML elements.
       const ticks = raw => '`'.repeat(Math.max(0, ...(raw.match(/`+/g) || []).map(s => s.length)) + 1);
@@ -85,7 +94,9 @@
       const block = s => '\n\n' + s + '\n\n';
       const codeBlocks = [];
       const render = (e, cell = false) => {
-        if (e.nodeType === Node.TEXT_NODE) return escape(e.textContent.replace(/\s+/g, ' '));
+        if (e.nodeType === Node.TEXT_NODE) {
+          return escape(e.textContent.replace(/\s+/g, ' '));
+        }
         if (e.nodeType !== Node.ELEMENT_NODE) return '';
         const math = mathSource.get(e);
         if (math) return math.display ? block(plainMath(math.tex)) : plainMath(math.tex);

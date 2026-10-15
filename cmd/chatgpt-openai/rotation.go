@@ -249,6 +249,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	s.Dirty = true
 	s.Phase = "final"
 	s.PendingRequest, s.PendingPrompt = &req, prompt
+	s.RepairPendingPrompt = ""
 	if err := h.save(); err != nil {
 		h.backendError(w, err)
 		return true
@@ -290,6 +291,17 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256(b))
 	out, err := parseAnswer(res.Answer, req)
 	if err != nil {
+		repaired, state := h.requestFormatRepair(r, id, lane, res.URL, req, res.Answer, thinking)
+		if state == repairUncertain || state == repairStoreFailed {
+			apiError(w, 422, errors.New("format repair outcome is uncertain or not durably stored; pending binding retained; recover read-only, do not resubmit"))
+			return true
+		}
+		if state == repairCompleted {
+			res.Answer, res.Reasoning, res.URL = repaired.Answer, repaired.Reasoning, s.URL
+			out, err = parseAnswer(res.Answer, req)
+		}
+	}
+	if err != nil {
 		// Model-protocol failure, not infra: behave exactly like the legacy
 		// parse-error path (persist the thread, terminal 422) rather than resubmitting.
 		s.URL = res.URL
@@ -312,6 +324,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", id, fingerprint, i)))
 		out.Calls[i].ID = fmt.Sprintf("call_%x", sum[:12])
 	}
+	beforeCommit := *s
 	s.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	s.URL = res.URL
 	if res.ProjectURL != "" {
@@ -322,8 +335,9 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	s.Fingerprint, s.Result, s.Dirty = fingerprint, out, false
 	s.ToolsFP = toolsFP
 	s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
+	s.RepairPendingPrompt = ""
 	if err := h.save(); err != nil {
-		s.Dirty = true
+		*s = beforeCommit
 		h.backendError(w, err)
 		return true
 	}

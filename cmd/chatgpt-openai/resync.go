@@ -5,7 +5,33 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 )
+
+// Explicit resync authorizes a NEW ordinary user boundary, not a retry of an
+// old task whose output was never verified. Check before any loose re-arming
+// for compaction: a changed prefix or system-update alone is not new input.
+func freshResyncUser(s *session, req completionsRequest) bool {
+	if len(req.Messages) == 0 {
+		return false
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if last.Role != "user" || last.ToolCallID != "" || len(last.ToolCalls) != 0 {
+		return false
+	}
+	updates := regexp.MustCompile(`(?s)<system-update>.*?</system-update>`)
+	text := strings.TrimSpace(updates.ReplaceAllString(contentText(last), ""))
+	if text == "" {
+		return false
+	}
+	for _, old := range s.ResyncMessages {
+		if old.Role == "user" && strings.TrimSpace(updates.ReplaceAllString(contentText(old), "")) == text {
+			return false
+		}
+	}
+	return true
+}
 
 // An explicit resync keeps uncertainty until a NEW user request arrives.
 // All completed exchanges are imported as inert history, never as new calls.
@@ -53,7 +79,7 @@ func (h *handler) resyncSession(w http.ResponseWriter, r *http.Request) {
 	last := s.Messages[len(s.Messages)-1]
 	delta := input.Messages[len(s.Messages):]
 	if last.Role == "assistant" && len(last.ToolCalls) > 0 {
-		if len(delta) != len(last.ToolCalls) {
+		if len(delta) < len(last.ToolCalls) {
 			apiError(w, 409, errors.New("supply exactly the recorded completed results for outstanding calls"))
 			return
 		}
@@ -61,22 +87,29 @@ func (h *handler) resyncSession(w http.ResponseWriter, r *http.Request) {
 		for _, call := range last.ToolCalls {
 			outstanding[call.ID] = true
 		}
-		for _, m := range delta {
+		for _, m := range delta[:len(last.ToolCalls)] {
 			if m.Role != "tool" || !outstanding[m.ToolCallID] || contentText(m) == "" {
 				apiError(w, 409, errors.New("completed tool result IDs/content must account for every outstanding call exactly once"))
 				return
 			}
 			delete(outstanding, m.ToolCallID)
 		}
-	} else {
+	}
+	{
 		if len(input.Messages) < len(s.Messages) {
 			apiError(w, 409, errors.New("authoritative transcript must include recorded prefix"))
 			return
 		}
 		pendingCalls := map[string]bool{}
+		seenCalls := map[string]bool{}
 		for _, m := range input.Messages {
 			if m.Role == "assistant" {
 				for _, call := range m.ToolCalls {
+					if call.ID == "" || seenCalls[call.ID] {
+						apiError(w, 409, errors.New("authoritative transcript tool call IDs must be nonempty and unique"))
+						return
+					}
+					seenCalls[call.ID] = true
 					pendingCalls[call.ID] = true
 				}
 			} else if m.Role == "tool" {

@@ -116,7 +116,11 @@ const nullDILWireJS = `
      if (p.message.author?.role === 'user') { bound = parent === uid; break; }
      parent = p.parent;
    }
-   const text = m.content.parts[0].trim();
+    const text = m.content.parts[0].trim();
+    // Do not reintroduce standalone empty escape artifacts via source fallback.
+    // Refuse rather than rewriting source: JSON strings inside exact wrappers
+    // (e.g. {"value":"<escape>"}) remain byte-for-byte unchanged.
+    if (/(?:^|\n)[ \t]*(?:<escape>\s*<\/escape>[ \t]*)+(?=\n|$)/.test(text)) return '';
     if (!bound || !(st.sourceRequired ? /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/ : /^<opencode(?:\\)?_bridge(?:\\)?_call\b/).test(text)) return '';
    // The read may have awaited network while React changed the page.
    const after = recheck();

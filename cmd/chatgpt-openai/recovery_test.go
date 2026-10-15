@@ -46,7 +46,39 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 	h := testHandler(f.fakeBackend)
 	h.client = f
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
-	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
+	// A supplied request is not proof of an absent durable source binding.
+	for _, broken := range []*session{
+		{Dirty: true},
+		{Dirty: true, Phase: "final", PendingPrompt: "orphan"},
+		{Dirty: true, Phase: "final", PendingRequest: &req},
+		{Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "repair", RepairPendingPrompt: "repair", RepairFingerprint: "wrong"},
+	} {
+		broken.URL = "https://chatgpt.com/c/stored"
+		broken.Messages = req.Messages[:1]
+		h.sessions["recover"] = broken
+		before, _ := json.Marshal(broken)
+		if err := h.save(); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.load(); err != nil {
+			t.Fatal(err)
+		}
+		for _, supplied := range []*completionsRequest{nil, &req} {
+			w := recoveryRequest(h, supplied)
+			if w.Code != 422 || !strings.Contains(w.Body.String(), `"code":"incomplete_journal"`) || !strings.Contains(w.Body.String(), "/v1/sessions/resync") {
+				t.Fatal(w.Code, w.Body.String())
+			}
+		}
+		if w := request(h, "recover", req); w.Code != 422 || !strings.Contains(w.Body.String(), `"code":"incomplete_journal"`) {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		after, _ := json.Marshal(h.sessions["recover"])
+		if !bytes.Equal(before, after) || f.reads != 0 || len(f.prompts) != 0 {
+			t.Fatal("incomplete record changed or browser accessed")
+		}
+	}
+	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
 	h.sessions["recover"] = s
 	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
 	if w := recoveryRequest(h, &req); w.Code != 200 {
@@ -250,6 +282,8 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 			s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
 			h.sessions["recover"] = s
 			f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+			pending := req
+			s.Phase, s.PendingRequest, s.PendingPrompt = "final", &pending, f.expected
 			switch mode {
 			case "mismatch":
 				f.expected = "different"

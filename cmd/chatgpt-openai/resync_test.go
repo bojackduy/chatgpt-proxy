@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -17,18 +19,78 @@ func resyncRequest(h *handler, history []message) *httptest.ResponseRecorder {
 	return w
 }
 func TestResyncSameSessionImportsExecutedCallsInertly(t *testing.T) {
+	if fixture := os.Getenv("CHATGPT_BRIDGE_RESYNC_FIXTURE"); fixture != "" {
+		t.Run("authoritative private completed snapshot", func(t *testing.T) {
+			b, err := os.ReadFile(filepath.Join(fixture, "journal-before.private.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sessions map[string]*session
+			if err := json.Unmarshal(b, &sessions); err != nil {
+				t.Fatal(err)
+			}
+			b, err = os.ReadFile(filepath.Join(fixture, "resync.private.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var snapshot struct {
+				Messages []message `json:"messages"`
+			}
+			if err := json.Unmarshal(b, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			f := &fakeBackend{}
+			h := testHandler(f)
+			h.statePath = filepath.Join(t.TempDir(), "state.json")
+			h.sessions["resync"] = sessions["ses_ee37195f1ffevx8whYJhUD1hoW"]
+			if w := resyncRequest(h, snapshot.Messages); w.Code != 200 || len(f.prompts) != 0 {
+				t.Fatal("snapshot did not arm inertly", w.Code)
+			}
+			if err := h.load(); err != nil || !h.sessions["resync"].Dirty || len(h.sessions["resync"].ResyncMessages) != len(snapshot.Messages) {
+				t.Fatal("restart lost snapshot", err)
+			}
+			req := completionsRequest{Messages: snapshot.Messages, ToolChoice: "none"}
+			if w := request(h, "resync", req); w.Code != 409 || len(f.prompts) != 0 {
+				t.Fatal("snapshot alone submitted", w.Code)
+			}
+			req.Messages = append(append([]message{}, snapshot.Messages...), message{Role: "user", Content: "Recovery verification only: reply OK without any tools."})
+			if w := request(h, "resync", req); w.Code != 200 {
+				t.Fatal("reviewed new-user boundary failed", w.Code, w.Body.String())
+			}
+			for _, prompt := range f.prompts[:len(f.prompts)-1] {
+				if !strings.HasPrefix(prompt, historyIntro) {
+					t.Fatal("historical calls were not inert imports")
+				}
+			}
+			if strings.Contains(f.prompts[len(f.prompts)-1], "call_ab4a0273125d41ce8027eac75b32c0ed") {
+				t.Fatal("historical goal invocation in final request")
+			}
+		})
+	}
 	f := &fakeBackend{}
 	h := testHandler(f)
 	req := weatherReq()
 	calls := []toolCall{{ID: "completed", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Hanoi"}`}}}
 	recorded := append(append([]message{}, req.Messages...), message{Role: "assistant", ToolCalls: calls})
 	history := append(append([]message{}, recorded...), message{Role: "tool", ToolCallID: "completed", Content: "already executed: 25 C"})
+	history = append(history, message{Role: "assistant", Content: "Previously summarized"})
 	h.sessions["resync"] = &session{URL: "https://chatgpt.com/c/uncertain", Messages: recorded, Dirty: true}
 	if w := resyncRequest(h, history); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	if !h.sessions["resync"].Dirty || len(f.prompts) != 0 {
 		t.Fatal("arming cleared dirty/submitted")
+	}
+	for _, text := range []string{contentText(req.Messages[0]), "<system-update>metadata only</system-update>"} {
+		retry := completionsRequest{Messages: []message{{Role: "system", Content: "compacted"}, {Role: "assistant", Content: "prior context"}, {Role: "user", Content: text}}}
+		before, _ := json.Marshal(h.sessions["resync"])
+		if w := request(h, "resync", retry); w.Code != 409 || len(f.prompts) != 0 {
+			t.Fatal("old request crossed loose resync boundary", w.Code)
+		}
+		after, _ := json.Marshal(h.sessions["resync"])
+		if !bytes.Equal(before, after) {
+			t.Fatal("old request consumed reviewed resync")
+		}
 	}
 	req.Messages = history
 	if w := request(h, "resync", req); w.Code != 409 || len(f.prompts) != 0 {

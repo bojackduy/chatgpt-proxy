@@ -88,6 +88,40 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if math != "Potentially O(n^2). Linear O(n).\n\nx^2 + y^2\n\nRepeat O(n) O(n) intentionally." {
 			t.Fatalf("math duplicated or source/prose lost: %q", math)
 		}
+		// Custom HTML elements are implicitly unwrapped. These are NOT tests of
+		// escaped literal text, and neither fixture proves a reasoning channel.
+		if got := probe(`<p>Answer text.</p><escape></escape>`); got != "Answer text." {
+			t.Fatalf("empty escape pair leaked: %q", got)
+		}
+		if got := probe(`<escape>` + "\n\n" + `</escape><p>Answer text.</p><escape>` + "\n\n" + `</escape>`); got != "Answer text." {
+			t.Fatalf("escape markers leaked: %q", got)
+		}
+		// Real escaped literal TEXT, combined and split across text/span nodes.
+		for _, body := range []string{
+			`<p>&lt;escape&gt;&lt;/escape&gt;</p><p>Answer text.</p>`,
+			`<p>&lt;escape&gt;<span>&lt;/escape&gt;</span></p><p>Answer text.</p>`,
+			`<p><span>&lt;escape&gt;</span> <span>&lt;/escape&gt;</span></p><p>Answer text.</p>`,
+		} {
+			if got := probe(body); got != "Answer text." {
+				t.Fatalf("literal empty artifact leaked: %q", got)
+			}
+		}
+		if got := probe(`&lt;escape&gt;&lt;/escape&gt;`); got != "" {
+			t.Fatalf("artifact-only answer fabricated: %q", got)
+		}
+		if got := probe(`<p>Example &lt;escape&gt;&lt;/escape&gt; stays literal.</p>`); got != "Example <escape></escape> stays literal." {
+			t.Fatalf("prose altered: %q", got)
+		}
+		if got := probe(`<p><code>&lt;escape&gt;&lt;/escape&gt;</code></p><pre><code>&lt;escape&gt;&lt;/escape&gt;</code></pre>`); !strings.Contains(got, "`<escape></escape>`") || !strings.Contains(got, "```\n<escape></escape>\n```") {
+			t.Fatalf("code altered: %q", got)
+		}
+		wire := `<opencode_bridge_call>{"name":"x","arguments":{"literal":"<escape></escape>"}}</opencode_bridge_call>`
+		if got := probe(strings.ReplaceAll(strings.ReplaceAll(wire, "&", "&amp;"), "<", "&lt;")); got != wire {
+			t.Fatalf("tool string altered: %q", got)
+		}
+		if got := probe(`<p>Use &lt;escape&gt; tags in config.</p>`); got != "Use <escape> tags in config." {
+			t.Fatalf("escape text in prose altered: %q", got)
+		}
 		for _, tc := range []struct{ tex, want string }{
 			{`R(i+t)<R(j+t)\qquad 0\le t\le k`, "R(i+t)<R(j+t)  0≤ t≤ k"},
 			{`j,\ j+1,\ \ldots,\ j+k`, "j, j+1, …, j+k"},
@@ -289,6 +323,20 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err != nil || !got.SourceRequired || got.Last != mixed || got.LastID != "dil-answer" {
 			t.Fatal("mixed DIL protocol source was transformed", err)
 		}
+		artifactSource := "<escape></escape>\n" + raw
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{artifactSource}}
+		publish()
+		if _, err := responseProbe(tab, before.IDs); err == nil {
+			t.Fatal("source fallback reintroduced escape artifact")
+		}
+		literalSource := `<opencode_bridge_call>{"name":"literal","arguments":{"value":"<escape>"}}</opencode_bridge_call>`
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{literalSource}}
+		publish()
+		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != literalSource {
+			t.Fatal("source tool string altered", err)
+		}
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{mixed}}
+		publish()
 		for field, wrong := range map[string]any{"id": "another-answer", "channel": "analysis", "recipient": "tool", "status": "in_progress", "end_turn": false} {
 			valid := m[field]
 			m[field] = wrong
