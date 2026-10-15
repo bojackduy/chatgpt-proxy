@@ -323,6 +323,73 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err != nil || !got.SourceRequired || got.Last != mixed || got.LastID != "dil-answer" {
 			t.Fatal("mixed DIL protocol source was transformed", err)
 		}
+		// Actual ec597 renderer: final assistant owner has a stable message ID
+		// but no data-dil-message-id anywhere. Bind its full source, not the
+		// Markdown-escaped visual JSON; ancestry/status validation still applies.
+		plainHTML := strings.Replace(visibleHTML, ` data-dil-message-id="dil-answer"`, "", 1)
+		m["metadata"] = map[string]any{"is_complete": true}
+		publish()
+		set(plainHTML)
+		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != mixed || !got.SourceRequired {
+			t.Fatal("non-DIL DOM-bound protocol source lost", err)
+		}
+		emptyPlain := strings.Replace(dilHTML, ` data-dil-message-id="dil-answer"`, "", 1)
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{"<escape>" + raw + "</escape>"}}
+		publish()
+		set(emptyPlain)
+		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "<escape>"+raw+"</escape>" {
+			t.Fatal("completed non-DIL empty rendering lost exact protocol source", err)
+		}
+		// Real audit: hydration completed during the fourteen-second source
+		// fetch. IDs/status/user ancestry stayed fixed but visual text changed.
+		for _, change := range []struct {
+			name, js string
+			safe     bool
+		}{
+			{"hydrate same final", `document.querySelector('.DilResponseRoot-HfQrEh').textContent=` + quoteJS(raw), true},
+			{"replace user identity", `document.querySelector('[data-chatgpt-search-message-ids="fixture-user"]').setAttribute('data-chatgpt-search-message-ids','different-user')`, false},
+			{"replace assistant identity", `document.querySelector('[data-chatgpt-search-message-ids="dil-answer dil-answer"]').setAttribute('data-chatgpt-search-message-ids','different-answer')`, false},
+		} {
+			set(emptyPlain)
+			js := `window.__auditFetch=window.fetch;window.fetch=async(...args)=>{const r=await window.__auditFetch(...args);if(String(args[0]).includes('/backend-api/conversation/')){` + change.js + `}return r;};`
+			if err := chromedp.Run(tab, chromedp.Evaluate(js, nil)); err != nil {
+				t.Fatal(err)
+			}
+			got, err := responseProbe(tab, before.IDs)
+			if restoreErr := chromedp.Run(tab, chromedp.Evaluate(`window.fetch=window.__auditFetch;delete window.__auditFetch`, nil)); restoreErr != nil {
+				t.Fatal(restoreErr)
+			}
+			if change.safe && (err != nil || got.Last != "<escape>"+raw+"</escape>") {
+				t.Fatal("same final hydration rejected", err)
+			}
+			if !change.safe && got.Last != "" {
+				t.Fatal("changed identity adopted during source read", change.name, err)
+			}
+		}
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{"ordinary prose"}}
+		publish()
+		set(emptyPlain)
+		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "" {
+			t.Fatal("non-DIL empty rendering adopted unverified prose", err)
+		}
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{mixed}}
+		publish()
+		set(plainHTML)
+		node["parent"] = "different-user"
+		publish()
+		if _, err := responseProbe(tab, before.IDs); err == nil {
+			t.Fatal("non-DIL wrong user ancestry accepted")
+		}
+		node["parent"] = "fixture-user"
+		m["status"] = "in_progress"
+		publish()
+		if _, err := responseProbe(tab, before.IDs); err == nil {
+			t.Fatal("non-DIL unfinished source accepted")
+		}
+		m["status"] = "finished_successfully"
+		m["metadata"] = map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "not executed", "fallbackMarkdown": mixed}}
+		publish()
+		set(visibleHTML)
 		artifactSource := "<escape></escape>\n" + raw
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{artifactSource}}
 		publish()

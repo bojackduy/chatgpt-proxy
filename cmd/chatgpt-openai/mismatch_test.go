@@ -47,4 +47,34 @@ func TestMismatchEquivalentEncodingsAndJSON(t *testing.T) {
 	if got := firstMismatch(a, b); got != nil {
 		t.Fatalf("equivalent: %+v", got)
 	}
+	// Multi-text-part split around an injected advisory equals the plain
+	// string in both directions: SDKs split around advisories, and the same
+	// logical message must not rotate the thread for it.
+	split := []message{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "commit and release then\n\n"},
+		map[string]any{"type": "text", "text": "<system-reminder>\nMode changed.\n</system-reminder>\n\n"},
+	}}}
+	plain := []message{{Role: "user", Content: "commit and release then\n\n"}}
+	if got := firstMismatch(split, plain); got != nil {
+		t.Fatalf("split advisory must match: %+v", got)
+	}
+	if got := firstMismatch(plain, split); got != nil {
+		t.Fatalf("split advisory must match reversed: %+v", got)
+	}
+	// Genuine text change inside the split still mismatches.
+	edited := []message{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "commit and release LATER\n\n"},
+		map[string]any{"type": "text", "text": "<system-reminder>\nMode changed.\n</system-reminder>\n\n"},
+	}}}
+	if got := firstMismatch(edited, plain); got == nil {
+		t.Fatal("edited split text must still mismatch")
+	}
+	// Media parts never merge into text.
+	withMedia := []message{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "commit and release then\n\n"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "x"}},
+	}}}
+	if got := firstMismatch(withMedia, plain); got == nil {
+		t.Fatal("media split must stay exact")
+	}
 }

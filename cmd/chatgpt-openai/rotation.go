@@ -127,8 +127,28 @@ func truncateRunes(s string, n int) string {
 }
 
 // rotationRecentN is how many trailing transcript messages go into the new
-// working chat verbatim alongside the context card.
+// working chat verbatim alongside the context card (bottom ladder rung).
 const rotationRecentN = 6
+
+// rotationLevel is one rung of the rotation-payload ladder, richest first.
+// The bottom rung reproduces the legacy card byte-for-byte (recent 6,
+// 200-char results, 3000B digest). Richer rungs carry full tool results and
+// wider verbatim windows so the new thread inherits evidence, not just
+// summaries — directly reducing post-rotation hallucination.
+type rotationLevel struct {
+	recentN   int // verbatim trailing turns
+	resultCap int // per-tool-result chars
+	digestMax int // total digest bytes
+	notesN    int // assistant conclusions kept
+	noteCap   int // chars per conclusion
+}
+
+var rotationLadder = []rotationLevel{
+	{16, 8000, 12000, 8, 400},
+	{12, 8000, 12000, 8, 400},
+	{8, 2000, 6000, 5, 300},
+	{rotationRecentN, 200, 3000, 5, 300},
+}
 
 const rotationIntro = "BRIDGE SESSION ROTATION\nThis turn starts a fresh working chat inside this session's dedicated project. What follows is a compact context card written locally from stored adapter state (no model was consulted) plus the most recent turns verbatim. Older history remains in this project's retired chats and may be referenced from there. Reply to the current request below; do not replay history.\n"
 
@@ -136,8 +156,17 @@ const rotationIntro = "BRIDGE SESSION ROTATION\nThis turn starts a fresh working
 // working chat deterministically from the adapter's own Messages state: the
 // session goal (first stored user message), recent assistant conclusions,
 // digested tool results, and the last ~6 incoming turns verbatim. No model
-// calls are involved.
+// calls are involved. This is the bottom ladder rung (legacy shape); the
+// ranged builder below carries richer payloads when budget allows.
 func buildRotationPrompt(req completionsRequest, s *session, head string) string {
+	p, _ := buildRotationPromptLevel(req, s, head, rotationLadder[len(rotationLadder)-1])
+	return p
+}
+
+// buildRotationPromptLevel is the parametrized rotation builder. It also
+// returns the verbatim window used, so callers attach files from exactly the
+// turns the model sees.
+func buildRotationPromptLevel(req completionsRequest, s *session, head string, lv rotationLevel) (string, []message) {
 	goal := ""
 	for _, m := range s.Messages {
 		if m.Role == "user" {
@@ -154,10 +183,10 @@ func buildRotationPrompt(req completionsRequest, s *session, head string) string
 		}
 	}
 	var notes []string
-	for i := len(s.Messages) - 1; i >= 0 && len(notes) < 5; i-- {
+	for i := len(s.Messages) - 1; i >= 0 && len(notes) < lv.notesN; i-- {
 		m := s.Messages[i]
 		if m.Role == "assistant" && len(m.ToolCalls) == 0 && strings.TrimSpace(contentText(m)) != "" {
-			notes = append([]string{"- " + truncateRunes(strings.TrimSpace(contentText(m)), 300)}, notes...)
+			notes = append([]string{"- " + truncateRunes(strings.TrimSpace(contentText(m)), lv.noteCap)}, notes...)
 		}
 	}
 	var digest []string
@@ -177,17 +206,17 @@ func buildRotationPrompt(req completionsRequest, s *session, head string) string
 			}
 			line := fmt.Sprintf("- call %s (args %d bytes)", call.Function.Name, len(call.Function.Arguments))
 			if res, ok := results[call.ID]; ok {
-				line += fmt.Sprintf(" -> result %d bytes: %s", len(res), truncateRunes(res, 200))
+				line += fmt.Sprintf(" -> result %d bytes: %s", len(res), truncateRunes(res, lv.resultCap))
 			}
-			if len(strings.Join(digest, "\n"))+len(line) > 3000 {
+			if len(strings.Join(digest, "\n"))+len(line) > lv.digestMax {
 				break
 			}
 			digest = append(digest, line)
 		}
 	}
 	recent := req.Messages
-	if len(recent) > rotationRecentN {
-		recent = recent[len(recent)-rotationRecentN:]
+	if len(recent) > lv.recentN {
+		recent = recent[len(recent)-lv.recentN:]
 	}
 	var b strings.Builder
 	b.WriteString(head)
@@ -211,7 +240,7 @@ func buildRotationPrompt(req completionsRequest, s *session, head string) string
 	}
 	b.WriteString("END RECENT TURNS\n")
 	b.WriteString(answerInstruction(req))
-	return b.String()
+	return b.String(), recent
 }
 
 // serveRotation attempts a project-per-session rotation for a prefix-mismatched
@@ -227,14 +256,25 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	name := sessionProjectName(id, req)
 	projectURL := s.Project
 	toolsFP := toolsFingerprint(req.Tools)
-	prompt := buildRotationPrompt(req, s, toolPrompt(req))
-	if h.maxChars > 0 && len(prompt) > h.maxChars {
-		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=card_over_budget bytes=%d budget=%d", id, lane, len(prompt), h.maxChars)
-		return false
+	head := toolPrompt(req)
+	// Richest-fitting rung wins: full tool results and wide verbatim
+	// windows when budget allows, degrading rung by rung to the legacy
+	// card. Nothing fits at all → existing card_over_budget fallback.
+	var prompt string
+	var recent []message
+	leveled := false
+	lastLen := 0
+	for _, lv := range rotationLadder {
+		p, r := buildRotationPromptLevel(req, s, head, lv)
+		lastLen = len(p)
+		if h.maxChars <= 0 || len(p) <= h.maxChars {
+			prompt, recent, leveled = p, r, true
+			break
+		}
 	}
-	recent := req.Messages
-	if len(recent) > rotationRecentN {
-		recent = recent[len(recent)-rotationRecentN:]
+	if !leveled {
+		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=card_over_budget bytes=%d budget=%d", id, lane, lastLen, h.maxChars)
+		return false
 	}
 	var atts []chatgpt.Attachment
 	for _, m := range recent {

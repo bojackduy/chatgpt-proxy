@@ -375,9 +375,11 @@ Unset (or any other value) keeps today's shared-project behavior byte-for-byte.
   that today cause reset-replay (compaction, edits, truncation), the adapter
   opens a fresh working chat in the session's project whose single first turn
   is a compact context card (session goal from early messages, recent
-  assistant conclusions, digested tool results — composed deterministically
-  from adapter state, no model calls) plus the last ~6 turns verbatim. No
-  replay pastes, ever. Old chats stay in the project for project-level
+  assistant conclusions, full tool results — composed deterministically
+  from adapter state, no model calls) plus recent turns verbatim (up to 16
+  within budget, degrading rung by rung to the legacy card shape when over
+  budget, falling back to reset-replay only if nothing fits). No replay
+  pastes, ever. Old chats stay in the project for project-level
   retrieval (Phase-0 probe: fresh-chat cross-chat retrieval works with and
   without a card — see `phase0-report.md`).
 - **Steady state unchanged:** delta continuation, per-thread tool teaching,

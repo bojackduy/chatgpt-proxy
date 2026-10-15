@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 	"github.com/gorilla/websocket"
@@ -1064,43 +1065,96 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// text. The paste path stays as a fallback for renderers that ignore it.
 	typeCtx, cancel := context.WithTimeout(tab, 30*time.Second)
 	defer cancel()
-	insert := fmt.Sprintf(`(() => {
-	  const t = %s;
-	  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-	  if (!el) return 'missing';
+	compSel := `document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]')`
+	// 1. Wipe through the editor pipeline so no stale model state survives
+	//    to resurrect foreign text. No manual input-event dispatch: the
+	//    execCommand calls already fire real input events, and an extra
+	//    synthetic one can queue a stale flush that later replays over our
+	//    insert.
+	wipeJS := `(() => {
+	  const el = ` + compSel + `;
+	  if (!el) return -1;
 	  el.focus();
-	  // Wipe deterministically FIRST. A leftover draft — from a failed turn
-	  // on this thread, or another session's pooled tab — must never prepend
-	  // or append: the submit check would fail closed every retry, and worse,
-	  // a partial wipe could submit foreign text. Bail out if the wipe fails.
-	  try {
-	    if (el.tagName === 'TEXTAREA') { el.value = ''; }
-	    else { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
-	    el.dispatchEvent(new Event('input', { bubbles: true }));
-	    el.focus();
-	  } catch (e) {}
-	  if ((el.innerText || el.value || '').trim().length > 0) return 'dirty';
-	  try { document.execCommand('insertText', false, t); } catch (e) {}
-	  if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
-	  try {
-	    const dt = new DataTransfer();
-	    dt.setData('text/plain', t);
-	    el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-	    if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
-	  } catch (e) {}
-	  return 'empty';
-	})()`, strconv.Quote(prompt))
-	var inserted string
-	if err := chromedp.Run(typeCtx, chromedp.Evaluate(insert, &inserted)); err != nil {
+	  try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
+	  catch (e) { if (el.tagName === 'TEXTAREA') { el.value = ''; } else { el.innerHTML = ''; } }
+	  return (el.innerText || el.value || '').trim().length;
+	})()`
+	var wipedLen int
+	if err := chromedp.Run(typeCtx, chromedp.Evaluate(wipeJS, &wipedLen)); err != nil {
 		return fmt.Errorf("type prompt: %w", err)
 	}
-	switch inserted {
-	case "ok":
-		break
-	case "dirty":
+	if wipedLen != 0 {
+		// Stale foreign draft the pipeline wipe could not clear: refuse to
+		// type over it rather than risk submitting mixed text.
 		return errors.New("type prompt: composer draft stuck, refusing to type over foreign text")
-	default:
+	}
+	if wipedLen < 0 {
 		return ErrNoComposer
+	}
+	// 2. Primary insertion: trusted CDP input travels the editor's
+	//    beforeinput pipeline, so the editor absorbs it into model state
+	//    instead of async-flushing an execCommand/paste around it.
+	focusJS := `(() => { const el = ` + compSel + `; if (!el) return false; el.focus(); try { document.getSelection().collapseToEnd(); } catch (e) {} return true; })()`
+	var focused bool
+	_ = chromedp.Run(typeCtx, chromedp.Evaluate(focusJS, &focused))
+	insCtx, insCancel := context.WithTimeout(tab, 20*time.Second)
+	insErr := input.InsertText(prompt).Do(insCtx)
+	insCancel()
+	// 3. Settle: the editor may process input asynchronously; only stable
+	//    content may proceed. Trajectory is lengths-only by design.
+	var lens []int
+	settleUntil := time.Now().Add(8 * time.Second)
+	stable, lastLen, settledLen := 0, -1, 0
+	for {
+		var l int
+		sctx, scancel := context.WithTimeout(tab, 3*time.Second)
+		serr := chromedp.Run(sctx, chromedp.Evaluate(`(() => { const el = `+compSel+`; return el ? (el.innerText || el.value || '').trim().length : -1; })()`, &l))
+		scancel()
+		if serr != nil {
+			break
+		}
+		lens = append(lens, l)
+		if l == lastLen {
+			stable++
+		} else {
+			stable, lastLen = 0, l
+		}
+		if stable >= 2 || time.Now().After(settleUntil) {
+			settledLen = l
+			break
+		}
+		if err := pause(tab, 300*time.Millisecond); err != nil {
+			break
+		}
+	}
+	log.Printf("[chatgpt] type settle prompt=%d trajectory=%v inserr=%v", len(prompt), lens, insErr)
+	if settledLen <= 0 {
+		// 4. Fallback: legacy execCommand/paste for renderers where trusted
+		//    input cannot land. Composer is verified empty above, so nothing
+		//    can mix. Partial content skips this and fails loud below.
+		fbCtx, fbCancel := context.WithTimeout(tab, 10*time.Second)
+		defer fbCancel()
+		legacyJS := fmt.Sprintf(`(() => {
+		  const t = %s;
+		  const el = %s;
+		  if (!el) return 'missing';
+		  try { document.execCommand('insertText', false, t); } catch (e) {}
+		  if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
+		  try {
+		    const dt = new DataTransfer();
+		    dt.setData('text/plain', t);
+		    el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+		    if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
+		  } catch (e) {}
+		  return 'empty';
+		})()`, strconv.Quote(prompt), compSel)
+		var legacy string
+		if err := chromedp.Run(fbCtx, chromedp.Evaluate(legacyJS, &legacy)); err != nil {
+			return fmt.Errorf("type prompt: %w", err)
+		}
+		if legacy != "ok" {
+			return ErrNoComposer
+		}
 	}
 	// Confirm the composer actually holds the payload. If the renderer converted
 	// it into an attachment, click "Show in text field" until it expands inline.

@@ -40,6 +40,18 @@ func TestSameURL(t *testing.T) {
 			}
 		}
 	})
+	t.Run("Lone carriage returns match renderer newlines", func(t *testing.T) {
+		norm := normalizeRecoveryPrompt
+		if norm("progress\n\r\x1b[Kdone") != "progress\n\n\x1b[Kdone" {
+			t.Fatalf("lone CR not normalized: %q", norm("progress\n\r\x1b[Kdone"))
+		}
+		if norm("a\r\nb") != norm("a\nb") || norm("a\rb") != norm("a\nb") {
+			t.Fatal("CR/CRLF/LF forms diverge")
+		}
+		if norm("a\rb") == "ab" || norm("a\n\rb") == norm("a\nb") || norm(`a\*b`) == norm(`a*b`) {
+			t.Fatal("meaningful newline or literal backslash lost")
+		}
+	})
 	same := [][2]string{
 		{"https://chatgpt.com/c/abc", "https://chatgpt.com/c/abc"},
 		{"https://chatgpt.com/c/abc/", "https://chatgpt.com/c/abc"},

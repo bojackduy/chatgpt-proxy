@@ -1,5 +1,51 @@
 # Backlog
 
+## 2026-10-15 ec597: source-bound recovery, not guessed text matching
+
+Direct investigation of `ses_ec5972388ffeVexnQwYcnwkZ1K` traced the current
+blocker to the 12:58 rotation followed by protocol-source verification failure
+at 13:01. An earlier interrupted history import had already resumed and completed;
+it is not the submission currently pending. Small history mismatches separately
+triggered rotations and remain a distinct continuity concern.
+
+Read-only inspection bound user `953c1b2c…` and completed final assistant
+`f4f0f262…` through their actual DOM IDs and source ancestry. Decoding the user
+source's declared Markdown and converting CR/CRLF to LF matched the ENTIRE
+97,805-byte pending prompt (identical SHA-256). Both decoded and pending text
+contain 1,901 literal backslashes: blanket punctuation unescaping was unnecessary
+and unsafe, and the speculative implementation was removed. Lone CR must become
+LF, not disappear; meaningful code whitespace and backslashes stay significant.
+
+The actual answer renderer has no DIL root and can be temporarily empty while
+hydrating. Source readback now supports its exact assistant-owner ID, retaining
+finished-final/channel/recipient/ancestry checks and rejecting ordinary prose
+fallback. A traced fetch took about fourteen seconds; the former eight-second
+read bound was insufficient. Rechecking visual text equality also falsely
+rejected hydration even when user/assistant IDs and final status stayed fixed.
+The read now has a bounded twenty-second allowance within its caller deadline,
+and rechecks immutable IDs, current user binding, completion and alert state.
+Wrong identities, unfinished sources, stale answers and invalid tool arguments
+remain rejected. An empty display-only escape envelope is removed only AFTER
+its contained calls pass full validation; JSON argument bytes are not rewritten.
+
+Verification extends existing test functions/files: newline/literal-backslash
+distinctions, non-DIL empty/visible source, hydration during fetch, changed-user
+and changed-assistant rejection, and exact tool arguments. Full vet, tests, race
+checks and both executable builds passed. Private source/deployment/recovery
+evidence is under `~/.chatgpt-proxy/diagnostics/`; no original task or tool was
+executed by these diagnostics. This does not complete the broader recovery UI
+or establish that every history-mismatch/rotation cause has been fixed.
+
+Installed read-only recovery subsequently returned HTTP200 in36.377s:
+`cached_tool_calls=1`, `response_bytes=11316`, Dirty=false, no pending phase,
+380 messages (378 previously completed + pending input + validated answer),
+same original thread URL. Every other session is semantically unchanged. No
+model submission, historical replay, fresh thread or tool execution occurred.
+The client still needs to consume the recovered cached response; consumption
+was not inferred from successful recovery. Idle deployment used both the
+exclusive profile guard and journal owner lock, preserved the journal hash
+across restart and retained private backups. Changes remain uncommitted.
+
 ## 2026-10-14 post-tool genuinely empty final
 
 **Status:** strict completed-empty classification implemented, live verified and

@@ -188,6 +188,13 @@ func TestSSEContract(t *testing.T) {
 	}
 }
 func TestMalformedCalls(t *testing.T) {
+	// Captured ec597 source encloses a complete valid protocol in escape tags.
+	// Remove the empty display envelope only after all call validation succeeds.
+	plain, plainErr := parseAnswer(weatherAnswer, weatherReq())
+	wrapped, wrappedErr := parseAnswer("<escape>"+weatherAnswer+"</escape>", weatherReq())
+	if plainErr != nil || wrappedErr != nil || len(wrapped.Calls) != 1 || wrapped.Text != "" || wrapped.Calls[0].Function.Arguments != plain.Calls[0].Function.Arguments {
+		t.Fatal("bound escape envelope changed executable arguments or leaked as text", plainErr, wrappedErr)
+	}
 	for _, answer := range []string{"<opencode_bridge_call>{bad}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":\"bad\"}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"get_weather\",\"arguments\":null}</opencode_bridge_call>", "<opencode_bridge_call>{\"name\":\"unknown\",\"arguments\":{}}</opencode_bridge_call>", "<opencode_bridge_call>{}", "plain answer", "```tool_call\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hanoi\"}}\n```", "```\n" + weatherAnswer + "\n```", "~~~\n" + weatherAnswer + "\n~~~", "Example `" + weatherAnswer + "`"} {
 		t.Run(answer, func(t *testing.T) {
 			req := weatherReq()
@@ -1614,6 +1621,62 @@ func TestCompactionCreatesNewThreadAndVideoGap(t *testing.T) {
 	assistant(t, request(h, "video", req))
 	if f.urls[2] != "" || h.sessions["video"].URL == url {
 		t.Fatal("compaction reused thread")
+	}
+
+	// Rich rotation payload (stage 2): full tool results and a wide verbatim
+	// window within budget, degrading rung by rung to the legacy card shape.
+	t.Setenv("CHATGPT_BRIDGE_PROJECT_PER_SESSION", "1")
+	f2 := &fakeBackend{}
+	h2 := testHandler(f2)
+	big := strings.Repeat("R", 1500)
+	req2 := completionsRequest{Messages: []message{
+		{Role: "user", Content: "do the thing"},
+		{Role: "assistant", Content: "working", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: callFunction{Name: "f", Arguments: "{}"}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: big},
+		{Role: "assistant", Content: "done"},
+		{Role: "user", Content: "next"},
+	}, ToolChoice: "none"}
+	assistant(t, request(h2, "rich", req2))
+	req2.Messages = []message{{Role: "system", Content: "Compacted summary"}, {Role: "user", Content: "next after compact"}}
+	assistant(t, request(h2, "rich", req2))
+	if len(f2.prompts) != 2 {
+		t.Fatalf("rich rotation submitted %d prompts, want 2", len(f2.prompts))
+	}
+	for _, want := range []string{big, "do the thing", "next", "CONTEXT CARD"} {
+		if !strings.Contains(f2.prompts[1], want) {
+			t.Fatalf("rotation prompt missing %q", want[:20])
+		}
+	}
+	// Ladder degrades monotonically and bottoms out at the legacy shape,
+	// judged on the pre-rotation history the card was built from (the live
+	// session now holds the rotated transcript).
+	head := toolPrompt(req2)
+	pre := &session{Messages: []message{
+		{Role: "user", Content: "do the thing"},
+		{Role: "assistant", Content: "working", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: callFunction{Name: "f", Arguments: "{}"}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: big},
+		{Role: "assistant", Content: "done"},
+		{Role: "user", Content: "next"},
+	}}
+	s := pre
+	var prevLen = -1
+	for i, lv := range rotationLadder {
+		p, _ := buildRotationPromptLevel(req2, s, head, lv)
+		if prevLen >= 0 && len(p) > prevLen {
+			t.Fatalf("ladder rung %d larger than previous: %d > %d", i, len(p), prevLen)
+		}
+		prevLen = len(p)
+		if i == 0 && !strings.Contains(p, big) {
+			t.Fatal("top rung dropped full tool result")
+		}
+		if i == len(rotationLadder)-1 {
+			if strings.Contains(p, big[500:1000]) {
+				t.Fatal("bottom rung kept full tool result")
+			}
+			if p != buildRotationPrompt(req2, s, head) {
+				t.Fatal("bottom rung diverged from legacy card shape")
+			}
+		}
 	}
 }
 

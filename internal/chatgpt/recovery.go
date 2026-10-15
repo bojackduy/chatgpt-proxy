@@ -22,6 +22,13 @@ import (
 // URLs. The submit-path identity check uses the same rule.
 var autolinkSpaceRe = regexp.MustCompile(`([<("]) ?(https?://)`)
 
+// Match the declared CommonMark/HTML newline serialization, not visual layout.
+// Interior spaces, tabs and literal plain-text backslashes remain significant.
+func normalizeRecoveryPrompt(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"))
+	return autolinkSpaceRe.ReplaceAllString(s, "$1$2")
+}
+
 // ErrCompletedEmpty is authoritative rejection, not a missing DOM extraction.
 // It is returned only after full pending-prompt and final-source binding.
 var ErrCompletedEmpty = errors.New("ChatGPT stored a completed empty final response; no new tool calls were delivered; continue with a distinct new ordinary user message")
@@ -123,12 +130,12 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil {
 		return TurnResult{}, fmt.Errorf("recovery user boundary: %w", err)
 	}
-	normSpace := func(s string) string { return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) }
-	want := normSpace(prompt)
+	// The full DOM-bound source audit matched all 97,805 bytes after decoding
+	// its declared Markdown and normalizing newlines. No extra slash decoding.
+	want := normalizeRecoveryPrompt(prompt)
 	// Compare both spaced and unchanged URL forms symmetrically. All other
 	// content must still match the entire original prompt.
-	want = autolinkSpaceRe.ReplaceAllString(want, "$1$2")
-	userText := autolinkSpaceRe.ReplaceAllString(corr.User, "$1$2")
+	userText := normalizeRecoveryPrompt(corr.User)
 	if corr.UserID != "" {
 		// The actual DOM-bound node, never a latest/branch mapping walk. The
 		// composer stores plain paragraphs as escaped CommonMark. Decode that
@@ -137,7 +144,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("recovery user source: %w", err)
 		}
-		userText = autolinkSpaceRe.ReplaceAllString(normSpace(original), "$1$2")
+		userText = normalizeRecoveryPrompt(original)
 	}
 	if userText == "" || userText != want {
 		off := firstDiffByte(userText, want)

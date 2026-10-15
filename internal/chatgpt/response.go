@@ -65,7 +65,9 @@ func responseProbe(tab context.Context, baseline []string) (responseState, error
 		probe := responseProbeJS + "(" + string(b) + ")"
 		var recovered string
 		expected, _ := json.Marshal(st.LastID)
-		read, cancel := context.WithTimeout(tab, 8*time.Second)
+		// Observed source fetches take about fourteen seconds even for a
+		// finished answer. Still bounded by the caller/recovery deadline.
+		read, cancel := context.WithTimeout(tab, 20*time.Second)
 		defer cancel()
 		js := "(async () => {const recheck = () => " + probe + "; const st = recheck(); if (st.lastID !== " + string(expected) + ") return '';" + nullDILWireJS + "})()"
 		if rerr := chromedp.Run(read, chromedp.Evaluate(js, &recovered, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); rerr == nil && recovered != "" {
@@ -77,20 +79,27 @@ func responseProbe(tab context.Context, baseline []string) (responseState, error
 	return st, err
 }
 
-// Only completed DIL protocol responses use source readback: the captured null
-// renderer failure, or visible protocol whose rendering can transform JSON.
+// Completed protocol responses use their exact DOM-bound source: either the
+// captured null-DIL failure or visible protocol in DIL and non-DIL renderers.
 // Ordinary Markdown remains DOM-only; all schema validation stays in the adapter.
 // Neither the model's renderer code nor its textual tool call is run.
 const nullDILWireJS = `
  if (!st.fresh || !st.complete || (st.lastAssistant && !st.sourceRequired) || st.stopBtn || st.continueBtn || st.errorText) return '';
  const id = st.lastID;
  if (!/^[a-zA-Z0-9-]+$/.test(id)) return '';
- const root = [...document.querySelectorAll('[data-dil-message-id]')].find(e => e.getAttribute('data-dil-message-id') === id);
- if (!root || (!st.sourceRequired && root.childNodes.length !== 0)) return '';
- const users = [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:');
- const user = users.at(-1);
- const owner = user?.nextElementSibling?.closest('[data-chatgpt-search-message-ids], [data-message-id]') || user?.closest('[data-chatgpt-search-message-ids], [data-message-id]');
- const uid = (owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-message-id') || '').trim().split(/\s+/).at(-1);
+  const dilRoot = [...document.querySelectorAll('[data-dil-message-id]')].find(e => e.getAttribute('data-dil-message-id') === id);
+  // The current alternate renderer has no DIL root. Its assistant heading
+  // lives inside an owner carrying the exact same ID responseProbe selected.
+  // Its rendered body can also be empty despite a completed protocol source.
+  // Read only this selected identity; ordinary prose is never substituted.
+  const ownerID = e => (e?.getAttribute('data-chatgpt-search-message-ids') || e?.getAttribute('data-message-id') || '').trim().split(/\s+/).at(-1);
+  const heading = [...document.querySelectorAll('h4')].filter(e => e.getAttribute('data-conversation-role') === 'assistant' || e.textContent.trim() === 'ChatGPT said:').find(e => ownerID(e.closest('[data-chatgpt-search-message-ids], [data-message-id]')) === id);
+  const root = dilRoot || (heading && heading.closest('[data-chatgpt-search-message-ids], [data-message-id]'));
+  if (!root || (!st.sourceRequired && dilRoot && dilRoot.childNodes.length !== 0)) return '';
+  const users = [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:');
+  const user = users.at(-1);
+  const userID = h => ownerID(h?.nextElementSibling?.closest('[data-chatgpt-search-message-ids], [data-message-id]') || h?.closest('[data-chatgpt-search-message-ids], [data-message-id]'));
+  const uid = userID(user);
  if (!uid || !(user.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
  const thread = location.pathname.split('/c/')[1];
  if (!thread) return '';
@@ -103,9 +112,8 @@ const nullDILWireJS = `
    const node = mapping?.[id], m = node?.message, dil = m?.metadata?.model_dil_v2;
    if (m?.id !== id || m.author?.role !== 'assistant' || m.channel !== 'final' || m.recipient !== 'all' ||
        m.status !== 'finished_successfully' || m.end_turn !== true || m.metadata?.is_complete !== true ||
-       m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string' ||
-        !dil) return '';
-    if (!st.sourceRequired && (dil.fallbackMarkdown !== '' || !/return null;/.test(dil.code || '') ||
+        m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return '';
+     if (!st.sourceRequired && dilRoot && (!dil || dil.fallbackMarkdown !== '' || !/return null;/.test(dil.code || '') ||
         !dil.recoveryDiagnostics?.some(d => d.code === 'invalid_tag_syntax' && d.action === 'recovered_parse'))) return '';
    // Follow only the selected DOM node's declared ancestry to the latest DOM
    // user; no sibling, current_node or latest-message selection is allowed.
@@ -121,10 +129,14 @@ const nullDILWireJS = `
     // Refuse rather than rewriting source: JSON strings inside exact wrappers
     // (e.g. {"value":"<escape>"}) remain byte-for-byte unchanged.
     if (/(?:^|\n)[ \t]*(?:<escape>\s*<\/escape>[ \t]*)+(?=\n|$)/.test(text)) return '';
-    if (!bound || !(st.sourceRequired ? /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/ : /^<opencode(?:\\)?_bridge(?:\\)?_call\b/).test(text)) return '';
-   // The read may have awaited network while React changed the page.
-   const after = recheck();
-    if (!root.isConnected || after.lastID !== id || !after.complete || after.lastAssistant !== st.lastAssistant || after.sourceRequired !== st.sourceRequired || after.stopBtn || after.continueBtn || after.errorText || users.at(-1) !== [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:').at(-1)) return '';
+     if (!bound || !((st.sourceRequired || !dilRoot) ? /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/ : /^<opencode(?:\\)?_bridge(?:\\)?_call\b/).test(text)) return '';
+    // React can finish hydrating this SAME final answer while source fetches
+    // await network. Visual text/sourceRequired can change without identity
+    // changing. Fence on immutable source IDs, completion and user ancestry,
+    // not equality of the renderer's temporary text representation.
+    const after = recheck();
+    const afterUser = [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:').at(-1);
+     if (!root.isConnected || after.lastID !== id || !after.fresh || !after.complete || after.stopBtn || after.continueBtn || after.errorText || userID(afterUser) !== uid || !afterUser || !(afterUser.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
    return text;
  } catch (_) { return ''; }
 `

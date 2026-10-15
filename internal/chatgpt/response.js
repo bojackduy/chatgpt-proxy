@@ -203,8 +203,9 @@
       // DIL can render literal JSON as styled Markdown, changing backslashes
       // and indentation. Executable protocol must use the completed source
       // bound to this DOM identity; never infer arguments from that rendering.
-      sourceRequired = /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/.test(raw) &&
-        !!(source.matches?.('[data-dil-message-id]') || source.querySelector('[data-dil-message-id]'));
+      // Protocol JSON can be restyled in both DIL and ordinary renderers.
+      // Always verify its completed source against the selected DOM identity.
+      sourceRequired = /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/.test(raw);
       // Incomplete protocol must reach the adapter unchanged too, so it can
       // reject it rather than accidentally return escaped successful prose.
       // Code examples remain Markdown and are never promoted to calls.
