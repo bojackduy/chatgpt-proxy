@@ -1366,6 +1366,54 @@ func TestPackPiecesSplitAtRuneBoundary(t *testing.T) {
 	}
 }
 
+func TestPackPiecesRespectsBridgeWrapperBoundaries(t *testing.T) {
+	// Splits must land before an opening tag or after a closing tag: a
+	// wrapper split across chunks is a guaranteed tool-parse failure.
+	wrap := func(name, args string) string {
+		return "<opencode_bridge_call>\n{\"name\":\"" + name + "\",\"arguments\":" + args + "}\n</opencode_bridge_call>"
+	}
+	text := "filler intro " + strings.Repeat("a", 40) + "\n" + wrap("fn_one", `{"x":"1"}`) + "\nbetween " + strings.Repeat("b", 40) + "\n" + wrap("fn_two", `{"y":"2"}`) + "\n" + strings.Repeat("c", 60)
+	groups := packPieces([]piece{{text: text}}, 100)
+	var b strings.Builder
+	for _, g := range groups {
+		for _, p := range g {
+			b.WriteString(p.text)
+		}
+	}
+	if b.String() != text {
+		t.Fatal("chunking lost or reordered bytes")
+	}
+	if len(groups) < 2 {
+		t.Fatalf("expected splits, got %d chunk(s)", len(groups))
+	}
+	for i, g := range groups {
+		for _, p := range g {
+			if strings.Count(p.text, "<opencode_bridge_call>") != strings.Count(p.text, "</opencode_bridge_call>") {
+				t.Fatalf("chunk %d splits inside a bridge wrapper", i)
+			}
+		}
+	}
+}
+
+func TestPackPiecesOversizedSingleWrapperStillSends(t *testing.T) {
+	// One wrapper larger than the whole budget cannot sit whole in any
+	// chunk: it warns but still sends (split), never drops the turn.
+	big := "<opencode_bridge_call>\n{\"name\":\"big\",\"arguments\":{\"blob\":\"" + strings.Repeat("z", 500) + "\"}}\n</opencode_bridge_call>"
+	groups := packPieces([]piece{{text: big}}, 100)
+	var b strings.Builder
+	for _, g := range groups {
+		for _, p := range g {
+			b.WriteString(p.text)
+		}
+	}
+	if b.String() != big {
+		t.Fatal("oversized wrapper lost bytes")
+	}
+	if len(groups) < 2 {
+		t.Fatal("oversized wrapper was not split")
+	}
+}
+
 func TestProviderSwitchImportsOnlyCompletedGap(t *testing.T) {
 	f := &fakeBackend{answers: []string{"own-last-reply", "gap recalled"}}
 	h := testHandler(f)
@@ -1744,5 +1792,94 @@ func TestToolSchemasTaughtOncePerThread(t *testing.T) {
 	}
 	if !strings.Contains(last, "External client functions:") || !strings.Contains(last, "brand_new") {
 		t.Fatal("changed toolset not re-taught")
+	}
+}
+
+func TestRewriteReseedCarriesExecutedResults(t *testing.T) {
+	// Two committed turns: a weather tool call with its recorded result,
+	// then a text follow-up. The client then forks history, dropping the
+	// executed exchange but staying internally coherent. The bridge must
+	// reseed a fresh thread with the rewritten timeline plus the carried
+	// executed results as inert history — never re-submitting them.
+	f := &fakeBackend{answers: []string{weatherAnswer, "noted", "ACK", "fresh summary"}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	a := assistant(t, request(h, "reseed", req))
+	callID := a.ToolCalls[0].ID
+	req.Messages = append(req.Messages, a, message{Role: "tool", ToolCallID: callID, Content: "25 C"}, message{Role: "user", Content: "and tomorrow?"})
+	req.ToolChoice = "none"
+	if got := assistant(t, request(h, "reseed", req)); contentText(got) != "noted" {
+		t.Fatal("follow-up did not commit", got)
+	}
+	oldURL := h.sessions["reseed"].URL
+	if oldURL == "" || h.sessions["reseed"].Dirty {
+		t.Fatal("turns did not commit cleanly")
+	}
+	rewritten := completionsRequest{Messages: []message{
+		{Role: "user", Content: "Call weather for Hanoi"},
+		{Role: "user", Content: "and tomorrow?"},
+	}, ToolChoice: "none"}
+	got := assistant(t, request(h, "reseed", rewritten))
+	if contentText(got) != "fresh summary" {
+		t.Fatalf("reseed did not answer fresh: %+v", got)
+	}
+	s := h.sessions["reseed"]
+	if s.Dirty || s.URL == "" || s.URL == oldURL {
+		t.Fatalf("reseed reused or abandoned the thread: old=%s new=%s dirty=%v", oldURL, s.URL, s.Dirty)
+	}
+	// Four submissions: turn1, turn2, record import, rewritten final.
+	if len(f.prompts) != 4 || f.urls[2] != "" || f.urls[3] != s.URL {
+		t.Fatalf("reseed did not seed a fresh thread record-first: urls=%v", f.urls)
+	}
+	record, final := f.prompts[2], f.prompts[3]
+	for _, want := range []string{historyIntro, "PRIOR EXECUTION RECORD", callID, "get_weather", "25 C", "END PRIOR EXECUTION RECORD"} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("record import lacks %q", want)
+		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(record), "ACK. No tool calls.") && !strings.Contains(record, "ACK. No tool calls.") {
+		t.Fatal("record import is not an inert ACK turn")
+	}
+	// The already-executed call is never re-submitted as pending: its ID
+	// and no wrapper tag appear anywhere in the answer-seeking final
+	// prompt. (The head instructions name the wrapper format in prose;
+	// only a literal tag would be an executable re-submission.)
+	if strings.Contains(final, callID) || strings.Contains(final, "<opencode_bridge_call>") || strings.Contains(final, `<opencode\_bridge\_call>`) {
+		t.Fatal("carried call re-submitted in final prompt")
+	}
+	if !strings.Contains(final, "and tomorrow?") {
+		t.Fatal("rewritten timeline missing from final prompt")
+	}
+	// Journal evidence: classification, linkage, carried items.
+	for _, want := range []string{"rewrite-divergence", "old=" + oldURL, "new=" + s.URL, callID + "(get_weather)"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
+	}
+	if s.ReseedFrom != oldURL {
+		t.Fatalf("linkage lost: %q", s.ReseedFrom)
+	}
+	// Stable duplicate cache: exact retry submits nothing further.
+	body := request(h, "reseed", rewritten).Body.String()
+	if retry := request(h, "reseed", rewritten); retry.Body.String() != body || len(f.prompts) != 4 {
+		t.Fatal("retry after reseed resubmitted")
+	}
+	// Restart survival: journal linkage plus the sent-log reseed entry.
+	loaded := testHandler(&fakeBackend{})
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	ls := loaded.sessions["reseed"]
+	if ls.ReseedEvidence != s.ReseedEvidence || ls.ReseedFrom != oldURL || ls.Dirty {
+		t.Fatal("reseed evidence lost across restart")
+	}
+	if retry := request(loaded, "reseed", rewritten); retry.Body.String() != body {
+		t.Fatal("restarted duplicate cache missed")
+	}
+	last := loaded.lastSentFor("reseed")
+	if last == nil || last.Event != "reseed" || last.URL != s.URL || !strings.Contains(last.Note, "old="+oldURL) || !strings.Contains(last.Note, "rewrite-divergence") || !strings.Contains(last.Note, callID) {
+		t.Fatalf("sent-log reseed linkage missing: %+v", last)
 	}
 }

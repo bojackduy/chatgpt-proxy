@@ -78,3 +78,60 @@ func TestMismatchEquivalentEncodingsAndJSON(t *testing.T) {
 		t.Fatal("media split must stay exact")
 	}
 }
+
+func rewriteBase() []message {
+	return []message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "", ToolCalls: []toolCall{{ID: "call_1", Type: "function", Function: callFunction{Name: "read", Arguments: `{"f":"a"}`}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "file content"},
+		{Role: "assistant", Content: "done"},
+	}
+}
+
+func TestClassifyHistoryRewrite(t *testing.T) {
+	saved := rewriteBase()
+	// Coherent append-only continuation is not a rewrite: no behavior change.
+	appended := append(append([]message{}, saved...), message{Role: "user", Content: "more"})
+	if kind, mm := classifyHistoryRewrite(appended, saved); kind != "" || mm != nil {
+		t.Fatalf("append classified as %q (%+v)", kind, mm)
+	}
+	// Empty journal is not a rewrite either: nothing executed to carry.
+	if kind, _ := classifyHistoryRewrite(appended, nil); kind != "" {
+		t.Fatalf("empty journal classified as %q", kind)
+	}
+	// Revert/truncation: shorter and prefix-equal.
+	truncated := append([]message{}, saved[:2]...)
+	if kind, mm := classifyHistoryRewrite(truncated, saved); kind != rewriteTruncation || mm == nil || mm.Field != "history.truncated" {
+		t.Fatalf("truncation classified as %q (%+v)", kind, mm)
+	}
+	// Fork/regeneration: same-length-but-diverged content.
+	diverged := append([]message{}, saved...)
+	diverged[3] = message{Role: "tool", ToolCallID: "call_1", Content: "regenerated content"}
+	if kind, mm := classifyHistoryRewrite(diverged, saved); kind != rewriteDivergence || mm == nil || mm.Index != 3 {
+		t.Fatalf("divergence classified as %q (%+v)", kind, mm)
+	}
+	// Fork that drops the executed exchange but stays coherent.
+	forked := []message{{Role: "system", Content: "sys"}, {Role: "user", Content: "hello"}, {Role: "user", Content: "never mind"}}
+	if kind, mm := classifyHistoryRewrite(forked, saved); kind != rewriteDivergence || mm == nil {
+		t.Fatalf("fork classified as %q (%+v)", kind, mm)
+	}
+	// Compaction: summarized system prefix.
+	compacted := []message{{Role: "system", Content: "Compacted summary of prior work"}, {Role: "user", Content: "continue"}}
+	if kind, mm := classifyHistoryRewrite(compacted, saved); kind != rewriteCompaction || mm == nil {
+		t.Fatalf("compaction classified as %q (%+v)", kind, mm)
+	}
+	// Incoherent histories are ambiguous, never a rewrite: dangling call,
+	// duplicate IDs, unmatched result, empty result.
+	for name, bad := range map[string][]message{
+		"dangling":   {{Role: "user", Content: "hi"}, {Role: "assistant", ToolCalls: []toolCall{{ID: "ghost", Type: "function", Function: callFunction{Name: "read", Arguments: `{}`}}}}},
+		"duplicate":  {{Role: "assistant", ToolCalls: []toolCall{{ID: "dup", Type: "function", Function: callFunction{Name: "read", Arguments: `{}`}}}}, {Role: "tool", ToolCallID: "dup", Content: "x"}, {Role: "assistant", ToolCalls: []toolCall{{ID: "dup", Type: "function", Function: callFunction{Name: "read", Arguments: `{}`}}}}, {Role: "tool", ToolCallID: "dup", Content: "y"}},
+		"unmatched":  {{Role: "user", Content: "hi"}, {Role: "tool", ToolCallID: "nobody", Content: "x"}},
+		"empty":      {{Role: "assistant", ToolCalls: []toolCall{{ID: "e", Type: "function", Function: callFunction{Name: "read", Arguments: `{}`}}}}, {Role: "tool", ToolCallID: "e", Content: ""}},
+		"unfinished": {{Role: "user", Content: "hi"}, {Role: "assistant", ToolCalls: []toolCall{{ID: "open", Type: "function", Function: callFunction{Name: "read", Arguments: `{}`}}}}},
+	} {
+		if kind, mm := classifyHistoryRewrite(bad, saved); kind != rewriteAmbiguous || mm == nil {
+			t.Fatalf("%s classified as %q (%+v)", name, kind, mm)
+		}
+	}
+}

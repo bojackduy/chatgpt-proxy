@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"github.com/chromedp/cdproto/cdp"
@@ -49,14 +50,210 @@ func firstDiffByte(a, b string) int {
 	return n
 }
 
+// diffSpans maps ALL divergent regions between rendered and wanted text as
+// "aOff+aLen/bOff+bLen,..." (offsets and lengths only, never content), so one
+// log line distinguishes a single bounded renderer transform (one span, then
+// re-convergence) from structural desync such as compaction or a rebuilt
+// request (scattered spans or no re-convergence). Bounded: at most 6 spans,
+// anchor search capped, so a 170KB pair stays cheap.
+func diffSpans(a, b string) string {
+	const anchorLen = 32
+	const maxSpans = 6
+	const scanWindow = 8192
+	var spans []string
+	i, j := 0, 0
+	for len(spans) < maxSpans {
+		// Skip equal prefix.
+		for i < len(a) && j < len(b) && a[i] == b[j] {
+			i++
+			j++
+		}
+		if i >= len(a) && j >= len(b) {
+			break
+		}
+		// Divergent region: re-sync on the next shared 32-byte anchor.
+		ai, bj := i, j
+		found := false
+		aiEnd := ai + scanWindow
+		if aiEnd > len(a) {
+			aiEnd = len(a)
+		}
+	outer:
+		for p := ai; p+anchorLen <= aiEnd; p++ {
+			needle := a[p : p+anchorLen]
+			q := j
+			for q+anchorLen <= len(b) && q < j+scanWindow {
+				if b[q:q+anchorLen] == needle {
+					ai, bj = p, q
+					found = true
+					break outer
+				}
+				q++
+			}
+		}
+		if !found {
+			spans = append(spans, itoa2(ai)+"+rest/"+itoa2(bj)+"+rest")
+			break
+		}
+		spans = append(spans, itoa2(i)+"-"+itoa2(ai)+"/"+itoa2(j)+"-"+itoa2(bj))
+		i, j = ai, bj
+	}
+	return strings.Join(spans, ",")
+}
+
+func itoa2(n int) string {
+	if n < 0 {
+		return "0"
+	}
+	return strconv.Itoa(n)
+}
+
+// UserBubbleMismatchError is the structural adoption failure: the thread's
+// stored user turn provably is not the pending prompt. Spans carries the
+// size-only divergence map (see diffSpans), so the recovery layer can tell a
+// bounded renderer transform (one small span, then re-convergence) from
+// multi-KB interior desync such as compaction or a rebuilt request. The
+// Error text preserves the historic message so string-matching callers keep
+// working; use errors.As for the structured evidence.
+type UserBubbleMismatchError struct {
+	Path     string // "bubble" or "mapping": which DOM-bound source diverged
+	Rendered int
+	Want     int
+	DiffOff  int
+	Spans    string
+}
+
+func (e *UserBubbleMismatchError) Error() string {
+	return fmt.Sprintf("stored user prompt does not exactly match original request (rendered %dB want %dB)", e.Rendered, e.Want)
+}
+
+// PromptHash identifies a submitted prompt exactly the way adoption compares
+// it: normalized, then SHA256 hex. The sent-log and the hash-lineage gate
+// both use it, so a thread reading that went through the same normalization
+// compares equal to the logged submission.
+func PromptHash(prompt string) string {
+	sum := sha256.Sum256([]byte(normalizeRecoveryPrompt(prompt)))
+	return fmt.Sprintf("%x", sum)
+}
+
+// threadSnapshot is one read-only look at a stored thread's latest turn: the
+// last rendered user bubble's normalized text plus everything needed to gate
+// its following assistant answer — without comparing to any pending prompt.
+// ReadThreadTurn (exact adoption) and ReadLatestThreadTurn (hash-lineage
+// auto-resync) share it, so their finishedness proofs cannot drift apart.
+type threadSnapshot struct {
+	userText    string
+	userID      string
+	srcPath     string
+	answerNext  bool
+	answers     int
+	visible     responseState
+	probeErr    error
+	emptyProved bool
+	emptyErr    error
+}
+
 // ReadThreadTurn only reads an existing finished turn in an owned target. The
 // last rendered user bubble (or its exact ID-bound original text node) must
 // equal the full normalized pending prompt. Never walk the backend mapping to
 // guess the latest branch; only decode declared serialization for that DOM ID.
 // A completed assistant body must follow it. Anything else fails closed.
 func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnResult, error) {
-	if !threadPattern.MatchString(url) || prompt == "" {
+	if prompt == "" {
 		return TurnResult{}, errors.New("recovery requires a stored thread and exact original prompt")
+	}
+	snap, err := c.snapshotThread(ctx, url)
+	if err != nil {
+		return TurnResult{}, err
+	}
+	// The full DOM-bound source audit matched all 97,805 bytes after decoding
+	// its declared Markdown and normalizing newlines. No extra slash decoding.
+	want := normalizeRecoveryPrompt(prompt)
+	// Compare both spaced and unchanged URL forms symmetrically. All other
+	// content must still match the entire original prompt.
+	if snap.userText == "" || snap.userText != want {
+		off := firstDiffByte(snap.userText, want)
+		spans := diffSpans(snap.userText, want)
+		log.Printf("[chatgpt] adoption user-bubble mismatch path=%s rendered=%dB want=%dB diffoff=%d spans=%s", snap.srcPath, len(snap.userText), len(want), off, spans)
+		return TurnResult{}, &UserBubbleMismatchError{Path: snap.srcPath, Rendered: len(snap.userText), Want: len(want), DiffOff: off, Spans: spans}
+	}
+	if snap.probeErr != nil {
+		return TurnResult{}, snap.probeErr
+	}
+	if snap.emptyErr != nil {
+		return TurnResult{}, snap.emptyErr
+	}
+	if snap.emptyProved {
+		return TurnResult{}, ErrCompletedEmpty
+	}
+	return gateThreadAnswer(url, snap)
+}
+
+// ReadLatestThreadTurn returns the stored thread's latest user turn text
+// (normalized exactly as adoption normalizes it) plus its following
+// assistant answer, under the same finishedness proof as adoption but with NO
+// prompt comparison. It exists for the hash-lineage auto-resync: the caller
+// proves ownership with PromptHash(userText) against the sent-log instead of
+// an exact pending prompt. The proof is: one "ChatGPT said:" section follows
+// the user bubble (author-ended), exactly one answer (unambiguous), and the
+// probe reports a complete non-empty rendering with no stop/error/continue
+// chrome. Reasoning recaps are split out of Last by the probe, so a
+// reasoning-only render fails the non-empty gate (non-thinking). Every
+// failure is a plain error that fails closed — never a mismatch or
+// completed-empty adoption signal.
+func (c *Client) ReadLatestThreadTurn(ctx context.Context, url string) (string, TurnResult, error) {
+	snap, err := c.snapshotThread(ctx, url)
+	if err != nil {
+		return "", TurnResult{}, err
+	}
+	if snap.probeErr != nil {
+		return "", TurnResult{}, snap.probeErr
+	}
+	if snap.emptyErr != nil {
+		return "", TurnResult{}, snap.emptyErr
+	}
+	if snap.emptyProved || snap.visible.Last == "" {
+		return "", TurnResult{}, errors.New("stored thread holds no complete assistant answer to transplant")
+	}
+	if !snap.answerNext {
+		return "", TurnResult{}, errors.New("stored latest turn has no finished assistant answer following it")
+	}
+	if snap.answers != 1 {
+		return "", TurnResult{}, errors.New("stored thread latest turn has no single following answer")
+	}
+	if snap.visible.StopBtn || snap.visible.ErrorText || snap.visible.ContinueBtn || !snap.visible.Complete {
+		return "", TurnResult{}, errors.New("stored latest answer is not a finished rendering; inspect before recovery")
+	}
+	return snap.userText, TurnResult{Answer: snap.visible.Last, Reasoning: snap.visible.Reasoning, URL: url}, nil
+}
+
+// gateThreadAnswer applies the exact-adoption finishedness proof to an
+// already prompt-matched snapshot.
+func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
+	if !snap.answerNext {
+		return TurnResult{}, errors.New("current response is not finished and nonempty")
+	}
+	if snap.answers != 1 {
+		return TurnResult{}, errors.New("ambiguous multiple assistant responses after stored user prompt")
+	}
+	visible := snap.visible
+	if visible.Last == "" || visible.StopBtn || visible.ErrorText || visible.ContinueBtn || !visible.Complete {
+		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
+	}
+	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
+}
+
+// snapshotThread navigates a throwaway background target to url and captures
+// the latest turn: normalized user-bubble text plus the answer probe state.
+// Read-only: it clicks only "Show more" expanders inside the last user bubble
+// and closes only its own target afterwards. Recovery must never reload the
+// active adapter tab. Probe-phase failures are captured in the snapshot (not
+// returned) so ReadThreadTurn still reports a prompt mismatch first,
+// preserving adoption error order.
+func (c *Client) snapshotThread(ctx context.Context, url string) (threadSnapshot, error) {
+	var snap threadSnapshot
+	if !threadPattern.MatchString(url) {
+		return snap, errors.New("recovery requires a stored thread and exact original prompt")
 	}
 	ctx, cancelRead := context.WithTimeout(ctx, 90*time.Second)
 	defer cancelRead()
@@ -64,7 +261,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	defer c.mu.Unlock()
 	base, err := c.tabCtx(ctx)
 	if err != nil {
-		return TurnResult{}, fmt.Errorf("recovery base: %w", err)
+		return snap, fmt.Errorf("recovery base: %w", err)
 	}
 	// Recovery must never reload the active adapter tab. Own a background
 	// target for navigation/readback and close only that target afterwards.
@@ -76,7 +273,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		tid, err = target.CreateTarget("about:blank").WithBackground(true).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
 		return err
 	})); err != nil {
-		return TurnResult{}, fmt.Errorf("recovery create target: %w", err)
+		return snap, fmt.Errorf("recovery create target: %w", err)
 	}
 	defer func() {
 		cleanup, done := context.WithTimeout(base, 3*time.Second)
@@ -93,34 +290,46 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	initErr := chromedp.Run(owned)
 	stopInit()
 	if initErr != nil {
-		return TurnResult{}, fmt.Errorf("recovery attach target: %w", initErr)
+		return snap, fmt.Errorf("recovery attach target: %w", initErr)
 	}
 	tab, cancel := requestContext(ctx, owned)
 	defer cancel()
 	nav, done := context.WithTimeout(tab, 45*time.Second)
 	defer done()
 	if err := chromedp.Run(nav, chromedp.Navigate(url)); err != nil {
-		return TurnResult{}, fmt.Errorf("recovery navigate: %w", err)
+		return snap, fmt.Errorf("recovery navigate: %w", err)
 	}
 	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
-		return TurnResult{}, fmt.Errorf("recovery ready: %w", err)
+		return snap, fmt.Errorf("recovery ready: %w", err)
 	}
-	// Expand only the last user bubble's exact UI control; never a send,
-	// regenerate, edit, or global page button. React may update asynchronously.
+	// Expand every collapsed region of the last user bubble (a long prompt
+	// renders several "Show more" sections, not one), then wait until its
+	// rendered length stops growing. Lengths only, never content.
 	var expanded bool
 	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryExpandJS, &expanded)); err != nil {
-		return TurnResult{}, fmt.Errorf("recovery expand: %w", err)
+		return snap, fmt.Errorf("recovery expand: %w", err)
 	}
 	if expanded {
-		if err := pause(tab, 200*time.Millisecond); err != nil {
-			return TurnResult{}, err
+		deadline := time.Now().Add(10 * time.Second)
+		lastLen := -1
+		for {
+			var l int
+			lctx, lcancel := context.WithTimeout(tab, 5*time.Second)
+			_ = chromedp.Run(lctx, chromedp.Evaluate(recoveryUserLenJS, &l))
+			lcancel()
+			if l == lastLen || time.Now().After(deadline) {
+				break
+			}
+			lastLen = l
+			if err := pause(tab, 500*time.Millisecond); err != nil {
+				return snap, err
+			}
 		}
 	}
 	// Correlate in the rendered DOM: the last "You said:" bubble's bound source
-	// must match the pending prompt without collapsing internal whitespace, and
-	// a "ChatGPT said:" section must follow it, so a stale earlier answer can
-	// never be adopted. The answer itself comes from responseProbe — the same
-	// rendered representation as the normal path.
+	// and whether a "ChatGPT said:" section follows it, so a stale earlier
+	// answer can never be adopted. The answer itself comes from responseProbe
+	// — the same rendered representation as the normal path.
 	var corr struct {
 		User       string `json:"user"`
 		UserID     string `json:"userID"`
@@ -128,53 +337,40 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		Answers    int    `json:"answers"`
 	}
 	if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil {
-		return TurnResult{}, fmt.Errorf("recovery user boundary: %w", err)
+		return snap, fmt.Errorf("recovery user boundary: %w", err)
 	}
-	// The full DOM-bound source audit matched all 97,805 bytes after decoding
-	// its declared Markdown and normalizing newlines. No extra slash decoding.
-	want := normalizeRecoveryPrompt(prompt)
-	// Compare both spaced and unchanged URL forms symmetrically. All other
-	// content must still match the entire original prompt.
+	snap.answerNext, snap.answers = corr.AnswerNext, corr.Answers
+	snap.userID = corr.UserID
+	// The actual DOM-bound node, never a latest/branch mapping walk. The
+	// composer stores plain paragraphs as escaped CommonMark. Decode that
+	// declared format with a real parser, not guessed slash/prefix stripping.
 	userText := normalizeRecoveryPrompt(corr.User)
+	snap.srcPath = "bubble"
 	if corr.UserID != "" {
-		// The actual DOM-bound node, never a latest/branch mapping walk. The
-		// composer stores plain paragraphs as escaped CommonMark. Decode that
-		// declared format with a real parser, not guessed slash/prefix stripping.
 		original, err := originalUserText(tab, corr.UserID)
 		if err != nil {
-			return TurnResult{}, fmt.Errorf("recovery user source: %w", err)
+			return snap, fmt.Errorf("recovery user source: %w", err)
 		}
 		userText = normalizeRecoveryPrompt(original)
+		snap.srcPath = "mapping"
 	}
-	if userText == "" || userText != want {
-		off := firstDiffByte(userText, want)
-		log.Printf("[chatgpt] adoption user-bubble mismatch rendered=%dB want=%dB diffoff=%d", len(userText), len(want), off)
-		return TurnResult{}, fmt.Errorf("stored user prompt does not exactly match original request (rendered %dB want %dB)", len(userText), len(want))
-	}
-	if !corr.AnswerNext {
-		return TurnResult{}, errors.New("current response is not finished and nonempty")
-	}
-	if corr.Answers != 1 {
-		return TurnResult{}, errors.New("ambiguous multiple assistant responses after stored user prompt")
-	}
+	snap.userText = userText
 	visible, err := responseProbe(tab, nil)
 	if err != nil {
-		return TurnResult{}, fmt.Errorf("recovery response probe: %w", err)
+		snap.probeErr = fmt.Errorf("recovery response probe: %w", err)
+		return snap, nil
 	}
+	snap.visible = visible
 	if visible.Last == "" && visible.Complete && corr.UserID != "" {
 		var empty bool
 		js := fmt.Sprintf("(async () => {const uid = %s, id = %s; const recheck = () => %s([]); %s})()", strconv.Quote(corr.UserID), strconv.Quote(visible.LastID), responseProbeJS, completedEmptyJS)
 		if err := chromedp.Run(tab, chromedp.Evaluate(js, &empty, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
-			return TurnResult{}, fmt.Errorf("recovery empty source: %w", err)
+			snap.emptyErr = fmt.Errorf("recovery empty source: %w", err)
+			return snap, nil
 		}
-		if empty {
-			return TurnResult{}, ErrCompletedEmpty
-		}
+		snap.emptyProved = empty
 	}
-	if visible.Last == "" || visible.StopBtn || visible.ErrorText || visible.ContinueBtn || !visible.Complete {
-		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
-	}
-	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
+	return snap, nil
 }
 
 // Only the observed empty DIL root's exact final source may establish rejection.
@@ -209,9 +405,26 @@ const completedEmptyJS = `
 
 const recoveryExpandJS = `(() => {
 	const h = [...document.querySelectorAll('h4')].filter(e => (e.textContent || '').trim() === 'You said:').at(-1);
-	const bs = [...(h?.nextElementSibling?.querySelectorAll('button') || [])].filter(b => (b.textContent || '').trim() === 'Show more');
-	if (bs.length !== 1) return false;
-	bs[0].click(); return true;
+	const sib = h ? h.nextElementSibling : null;
+	if (!sib) return false;
+	let clicked = false;
+	// A long prompt renders several collapsed regions; expand them all.
+	// Only exact "Show more" labels inside this bubble — never send,
+	// regenerate, edit, copy, or page-global buttons.
+	for (let round = 0; round < 10; round++) {
+		const bs = [...sib.querySelectorAll('button')].filter(b => (b.textContent || '').trim() === 'Show more');
+		if (bs.length === 0) break;
+		for (const b of bs) { try { b.click(); } catch (e) {} }
+		clicked = true;
+	}
+	return clicked;
+})()`
+
+// recoveryUserLenJS reports the rendered length of the last user bubble.
+const recoveryUserLenJS = `(() => {
+	const h = [...document.querySelectorAll('h4')].filter(e => (e.textContent || '').trim() === 'You said:').at(-1);
+	const sib = h ? h.nextElementSibling : null;
+	return sib ? sib.innerText.length : -1;
 })()`
 
 const recoveryUserJS = `(() => {

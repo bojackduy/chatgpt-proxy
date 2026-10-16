@@ -33,26 +33,21 @@ func incompleteJournalError(w http.ResponseWriter) {
 	}})
 }
 
-// tryAdoptInterrupted attempts bounded read-only recovery of an interrupted
-// final turn: it waits for the stored thread's answer to complete, validates
-// it against the pending prompt, and caches it exactly like a normal
-// completion (stable IDs from the pending transcript). On success it stores
-// the adopted transcript (Dirty and Phase cleared) and returns true; the
-// caller then falls through to normal request processing, so exact retries
-// hit the duplicate cache. On any failure it returns false and the caller
-// keeps terminal uncertainty. It never submits, never executes tools, and never clears an
-// ambiguous journal.
-// Adoption intentionally remains read-only: it never initiates a format repair.
-// A stored repair prompt is adopted against the original client request and
-// the durable RepairFingerprint budget is retained, so restart cannot re-ask.
-func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bool {
+// readPendingTurn waits for the stored thread's answer to complete and reads
+// it against the pending prompt. It returns adopted=true with the thread
+// result when the pending prompt matches (or when a completed-empty final is
+// durably rejected, which the caller treats as adopted-as-invalid). A typed
+// structural mismatch is returned separately so the caller can attempt
+// hash-lineage auto-resync; every other failure returns adopted=false with a
+// nil mismatch and the caller keeps terminal uncertainty.
+func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatgpt.TurnResult, *chatgpt.UserBubbleMismatchError, bool) {
 	pending := s.PendingRequest
 	if pending == nil || s.PendingPrompt == "" || s.URL == "" {
-		return false
+		return chatgpt.TurnResult{}, nil, false
 	}
 	backend, ok := h.client.(recoveryBackend)
 	if !ok {
-		return false
+		return chatgpt.TurnResult{}, nil, false
 	}
 	// Errors that waiting cannot fix: the stored prompt genuinely does not
 	// match, or the thread holds multiple candidate answers.
@@ -73,41 +68,73 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt)
 		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
 			if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
-				return false
+				return chatgpt.TurnResult{}, nil, false
 			}
 			log.Printf("[openai] session=%s bound completed empty final rejected; no calls delivered", id)
-			return true
+			return chatgpt.TurnResult{}, nil, true
 		}
 		if err == nil {
-			break
+			return res, nil, true
+		}
+		var mismatch *chatgpt.UserBubbleMismatchError
+		if errors.As(err, &mismatch) {
+			log.Printf("[openai] session=%s adoption impossible: %v", id, err)
+			return chatgpt.TurnResult{}, mismatch, false
 		}
 		if deterministic(err) {
 			log.Printf("[openai] session=%s adoption impossible: %v", id, err)
-			return false
+			return chatgpt.TurnResult{}, nil, false
 		}
 		if time.Now().After(deadline) {
 			log.Printf("[openai] session=%s adoption timed out waiting for stored answer: %v", id, err)
-			return false
+			return chatgpt.TurnResult{}, nil, false
 		}
 		timer := time.NewTimer(5 * time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return false
+			return chatgpt.TurnResult{}, nil, false
 		case <-timer.C:
 		}
+	}
+}
+
+// tryAdoptInterrupted attempts bounded read-only recovery of an interrupted
+// final turn: it waits for the stored thread's answer to complete, validates
+// it against the pending prompt, and caches it exactly like a normal
+// completion (stable IDs from the pending transcript). On success it stores
+// the adopted transcript (Dirty and Phase cleared) and returns true; the
+// caller then falls through to normal request processing, so exact retries
+// hit the duplicate cache. On any failure it returns false and the caller
+// keeps terminal uncertainty. It never submits, never executes tools, and never clears an
+// ambiguous journal.
+// Adoption intentionally remains read-only: it never initiates a format repair.
+// A stored repair prompt is adopted against the original client request and
+// the durable RepairFingerprint budget is retained, so restart cannot re-ask.
+//
+// The returned mismatch is non-nil only when adoption failed structurally
+// (typed user-bubble divergence with span evidence); the caller offers it to
+// tryAutoResync before giving up with a 409.
+func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (bool, *chatgpt.UserBubbleMismatchError) {
+	pending := s.PendingRequest
+	res, mismatch, adopted := h.readPendingTurn(r, id, s)
+	if mismatch != nil || !adopted {
+		return false, mismatch
+	}
+	if pending == nil {
+		return false, nil
 	}
 	out, err := parseAnswer(res.Answer, *pending)
 	if err != nil {
 		if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
-			return false
+			return false, nil
 		}
 		log.Printf("[openai] session=%s completed stored output rejected; no calls delivered", id)
-		return true
+		return true, nil
 	}
 	if out.Text == "" && len(out.Calls) == 0 {
 		log.Printf("[openai] session=%s adopted answer empty", id)
-		return false
+		return false, nil
 	}
 	out.Reasoning = res.Reasoning
 	b, _ := json.Marshal(struct {
@@ -129,10 +156,10 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) bo
 	s.RepairPendingPrompt = ""
 	if err := h.save(); err != nil {
 		*s = old // retain the original pending binding if adoption was not durable
-		return false
+		return false, nil
 	}
 	log.Printf("[openai] session=%s adopted interrupted final turn tool_calls=%d answer_bytes=%d", id, len(out.Calls), len(res.Answer))
-	return true
+	return true, nil
 }
 
 // A finished, bound response that failed strict validation cannot have delivered
@@ -201,7 +228,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s == nil || !s.Dirty || s.URL == "" {
-		apiError(w, 409, errors.New("no uncertain stored thread for this session"))
+		apiError(w, 409, fmt.Errorf("no uncertain stored thread for this session; %s", h.sentDiagnosis(id, s)))
 		return
 	}
 	if s.Phase == "replay" {
@@ -210,7 +237,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	}
 	req := s.PendingRequest
 	if supplied != nil && requestFingerprint(*supplied) != requestFingerprint(*req) {
-		apiError(w, 409, errors.New("supplied request does not match the exact original pending request"))
+		apiError(w, 409, fmt.Errorf("supplied request does not match the exact original pending request; %s", h.sentDiagnosis(id, s)))
 		return
 	}
 	prompt := s.PendingPrompt
@@ -232,7 +259,16 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		apiError(w, 409, err)
+		// Before giving up with a 409, attempt the recognized clear-cut
+		// shape: structural adoption failure plus a verifiably complete
+		// thread answer that the sent-log ties to this session.
+		var mismatch *chatgpt.UserBubbleMismatchError
+		if errors.As(err, &mismatch) && h.tryAutoResync(r, id, s, mismatch) {
+			out := s.Result
+			writeJSON(w, 200, map[string]any{"recovered": true, "session": id, "cached_tool_calls": len(out.Calls), "auto_resync": s.AutoResyncEvidence, "next": "retry the exact original completion request to receive the validated cache; transplanted calls were recorded, never executed by recovery"})
+			return
+		}
+		apiError(w, 409, fmt.Errorf("%w; %s", err, h.sentDiagnosis(id, s)))
 		return
 	}
 	out, err := parseAnswer(res.Answer, *req)
@@ -249,7 +285,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if out.Text == "" && len(out.Calls) == 0 {
-		apiError(w, 409, errors.New("empty stored response"))
+		apiError(w, 409, fmt.Errorf("empty stored response; %s", h.sentDiagnosis(id, s)))
 		return
 	}
 	out.Reasoning = res.Reasoning

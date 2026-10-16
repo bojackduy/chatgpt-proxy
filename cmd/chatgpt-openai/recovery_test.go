@@ -187,6 +187,206 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 		})
 	}
 }
+func TestSentLogDiagnosesPendingOverwrite(t *testing.T) {
+	// End-to-end through completions: the submitted H1 is logged, then a
+	// newer retry H3 overwrites pending. Diagnosis must name the desync.
+	f := &fakeBackend{answers: []string{weatherAnswer}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	if w := request(h, "diag", req); w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	s := h.sessions["diag"]
+	if len(h.sentLog) < 2 {
+		t.Fatalf("expected submitted+completed records, got %d", len(h.sentLog))
+	}
+	s.Dirty, s.Phase = true, "final"
+	s.PendingRequest = &req
+	s.PendingPrompt = "newer retry prompt H3 that the thread never received"
+	if d := h.sentDiagnosis("diag", s); !strings.Contains(d, "MISMATCH") || !strings.Contains(d, "pending-overwritten-by-retry") {
+		t.Fatalf("overwrite not diagnosed: %s", d)
+	}
+	// Consistent case: pending is exactly the submitted prompt.
+	s.PendingPrompt = f.prompts[0]
+	if d := h.sentDiagnosis("diag", s); !strings.Contains(d, "consistent") {
+		t.Fatalf("consistent state misdiagnosed: %s", d)
+	}
+	// Durability: a fresh handler with the same state path recovers the
+	// diagnosis from the file tail with an empty memory ring.
+	s.PendingPrompt = "newer retry prompt H3 that the thread never received"
+	h2 := testHandler(&fakeBackend{})
+	h2.statePath = h.statePath
+	if d := h2.sentDiagnosis("diag", s); !strings.Contains(d, "MISMATCH") {
+		t.Fatalf("file-tail diagnosis missed: %s", d)
+	}
+	if d := h2.sentDiagnosis("unknown-session", s); !strings.Contains(d, "no submission recorded") {
+		t.Fatalf("unknown session misdiagnosed: %s", d)
+	}
+}
+
+// resyncBackend is a fake that fails exact adoption structurally while the
+// thread holds a transplantable latest turn (or a configured latest error).
+type resyncBackend struct {
+	*fakeBackend
+	mismatch       *chatgpt.UserBubbleMismatchError
+	latestUser     string
+	latestAnswer   string
+	latestErr      error
+	reads, latests int
+}
+
+func (f *resyncBackend) ReadThreadTurn(ctx context.Context, url, prompt string) (chatgpt.TurnResult, error) {
+	f.reads++
+	if f.mismatch != nil {
+		return chatgpt.TurnResult{}, f.mismatch
+	}
+	return chatgpt.TurnResult{}, errors.New("original prompt mismatch")
+}
+
+func (f *resyncBackend) ReadLatestThreadTurn(ctx context.Context, url string) (string, chatgpt.TurnResult, error) {
+	f.latests++
+	if f.latestErr != nil {
+		return "", chatgpt.TurnResult{}, f.latestErr
+	}
+	return f.latestUser, chatgpt.TurnResult{Answer: f.latestAnswer, URL: url}, nil
+}
+
+func structuralMismatch() *chatgpt.UserBubbleMismatchError {
+	return &chatgpt.UserBubbleMismatchError{Path: "mapping", Rendered: 97805, Want: 102400, DiffOff: 100, Spans: "100-5000/200-5100,9000+rest/9100+rest"}
+}
+
+func TestSpansStructural(t *testing.T) {
+	for _, tc := range []struct {
+		spans string
+		want  bool
+	}{
+		{"", false},
+		{"10-40/10-35", false},        // one small span: bounded transform class
+		{"0-100/0-90", false},         // one span under the multi-KB bar
+		{"0-3000/0-2900", true},       // multi-KB interior region
+		{"1-2/3-4,50-60/70-80", true}, // scattered spans: rebuilt request
+		{"100+rest/200+rest", true},   // never re-converged
+		{"10-40/10-35,9000+rest/9100+rest", true},
+		{"garbage", false}, // unparseable fails closed
+	} {
+		if got := spansStructural(tc.spans); got != tc.want {
+			t.Errorf("spansStructural(%q) = %v, want %v", tc.spans, got, tc.want)
+		}
+	}
+}
+
+func TestAutoResyncRecognizedShape(t *testing.T) {
+	// ses_f1c7ba8b shape, resolved the ses_ee37 way but programmatically:
+	// thread holds the completed H1 submission, pending is the newer H3.
+	const h1 = "first submission prompt H1 with full context"
+	req := weatherReq()
+	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
+	h.appendSent(sentEntry{Event: "completed", Session: "auto", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	w := request(h, "auto", req)
+	got := assistant(t, w)
+	if len(got.ToolCalls) != 1 || f.latests != 1 || len(f.prompts) != 0 {
+		t.Fatalf("auto-resync did not transplant read-only: calls=%d latests=%d submits=%d", len(got.ToolCalls), f.latests, len(f.prompts))
+	}
+	s := h.sessions["auto"]
+	if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" {
+		t.Fatal("transplant left uncertainty behind")
+	}
+	// Stable IDs match adoption derivation exactly.
+	fp := requestFingerprint(req)
+	sum := sha256.Sum256([]byte("auto:" + fp + ":0"))
+	if want := fmt.Sprintf("call_%x", sum[:12]); got.ToolCalls[0].ID != want {
+		t.Fatalf("transplanted call ID %s != adoption-derived %s", got.ToolCalls[0].ID, want)
+	}
+	// Journal evidence: what was transplanted and why the shape was safe.
+	for _, want := range []string{"executed-by-resync", "pending-overwritten-by-retry", got.ToolCalls[0].ID, "structural spans"} {
+		if !strings.Contains(s.AutoResyncEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.AutoResyncEvidence)
+		}
+	}
+	// Exact retry hits the duplicate cache with no further reads or submits.
+	if retry := request(h, "auto", req); retry.Body.String() != w.Body.String() || f.latests != 1 || len(f.prompts) != 0 {
+		t.Fatal("retry after auto-resync resubmitted or re-read")
+	}
+	// Durable across restart.
+	loaded := testHandler(&fakeBackend{})
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil || loaded.sessions["auto"].Dirty || loaded.sessions["auto"].AutoResyncEvidence == "" {
+		t.Fatal("transplant not restart-safe", err)
+	}
+}
+
+func TestAutoResyncStays409WhenAmbiguous(t *testing.T) {
+	const h1 = "first submission prompt H1 with full context"
+	req := weatherReq()
+	setup := func(t *testing.T, spans string, latestErr error, logSubmission bool) (*handler, *resyncBackend) {
+		f := &resyncBackend{fakeBackend: &fakeBackend{}, latestUser: h1, latestAnswer: weatherAnswer, latestErr: latestErr}
+		if spans != "" {
+			f.mismatch = &chatgpt.UserBubbleMismatchError{Path: "mapping", Rendered: 100, Want: 120, DiffOff: 10, Spans: spans}
+		} else {
+			f.mismatch = structuralMismatch()
+		}
+		h := testHandler(f.fakeBackend)
+		h.client = f
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
+		if logSubmission {
+			h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+		}
+		return h, f
+	}
+	for _, tc := range []struct {
+		name           string
+		spans          string
+		latestErr      error
+		logSubmission  bool
+		wantDiagSubstr string
+	}{
+		{"no sent-log submission", "", nil, false, "no submission recorded"},
+		{"no complete thread answer", "", errors.New("stored thread holds no complete assistant answer to transplant"), true, "MISMATCH"},
+		{"bounded transform spans", "10-40/10-35", nil, true, "MISMATCH"},
+		{"thread turn is not ours", "", nil, true, "MISMATCH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, f := setup(t, tc.spans, tc.latestErr, tc.logSubmission)
+			if tc.name == "thread turn is not ours" {
+				f.latestUser = "some other session's prompt"
+			}
+			w := recoveryRequest(h, nil)
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "sent-log:") || !strings.Contains(w.Body.String(), tc.wantDiagSubstr) {
+				t.Fatalf("expected ambiguous 409 with diagnosis, got %d %s", w.Code, w.Body.String())
+			}
+			s := h.sessions["recover"]
+			if !s.Dirty || s.Phase != "final" || s.AutoResyncEvidence != "" || len(f.prompts) != 0 {
+				t.Fatal("ambiguous 409 changed uncertainty journal or submitted")
+			}
+		})
+	}
+}
+
+func TestRecover409CarriesSentLogDiagnosis(t *testing.T) {
+	// A structural adoption failure (thread holds earlier H1, pending is H3)
+	// must return 409 with the sent-log diagnosis line attached.
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, expected: "original pending", readErr: errors.New("stored user prompt does not exactly match original request (rendered 10B want 20B)")}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash("original submitted prompt H1"), Bytes: 100})
+	w := recoveryRequest(h, nil)
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "sent-log: MISMATCH") {
+		t.Fatalf("409 lacks diagnosis: %d %s", w.Code, w.Body.String())
+	}
+	if !h.sessions["recover"].Dirty {
+		t.Fatal("ambiguous 409 cleared Dirty")
+	}
+}
+
 func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 	for _, automatic := range []bool{false, true} {
 		t.Run(fmt.Sprintf("bound-completed-empty/automatic=%v", automatic), func(t *testing.T) {
@@ -310,5 +510,152 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 				t.Fatal("ambiguous recovery cleared/resubmitted", w.Code)
 			}
 		})
+	}
+}
+
+func TestDirtyRewriteReseedAbandonsUncertainPending(t *testing.T) {
+	// Turn1 commits a weather call; turn2 (result + follow-up) is
+	// interrupted at submit and stays Dirty/final. The client then forks
+	// history coherently, dropping the executed exchange. The bridge must
+	// reseed fresh: carried executed results travel as inert record, the
+	// never-delivered pending turn is listed as NOT carried, and the old
+	// thread is abandoned without adoption.
+	f := &fakeBackend{answers: []string{weatherAnswer, "", "ACK", "reseeded answer"}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	a := assistant(t, request(h, "rdirty", req))
+	callID := a.ToolCalls[0].ID
+	oldURL := h.sessions["rdirty"].URL
+	req.Messages = append(append([]message{}, req.Messages...), a, message{Role: "tool", ToolCallID: callID, Content: "25 C"}, message{Role: "user", Content: "and tomorrow?"})
+	req.ToolChoice = "none"
+	f.err, f.errorURL = context.Canceled, oldURL
+	if w := request(h, "rdirty", req); w.Code != 502 || !h.sessions["rdirty"].Dirty || h.sessions["rdirty"].Phase != "final" {
+		t.Fatalf("interrupted turn did not stay uncertain: %d %s", w.Code, w.Body.String())
+	}
+	rewritten := completionsRequest{Messages: []message{
+		{Role: "user", Content: "Call weather for Hanoi"},
+		{Role: "user", Content: "summarize instead"},
+	}, ToolChoice: "none"}
+	f.err = nil
+	got := assistant(t, request(h, "rdirty", rewritten))
+	if contentText(got) != "reseeded answer" {
+		t.Fatalf("dirty rewrite did not reseed fresh: %+v", got)
+	}
+	s := h.sessions["rdirty"]
+	if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" || s.URL == "" || s.URL == oldURL {
+		t.Fatalf("reseed left uncertainty behind or reused the thread: %+v", s)
+	}
+	if len(f.prompts) != 4 || f.urls[2] != "" || f.urls[3] != s.URL {
+		t.Fatalf("reseed did not seed a fresh thread record-first: urls=%v", f.urls)
+	}
+	if record := f.prompts[2]; !strings.Contains(record, "PRIOR EXECUTION RECORD") || !strings.Contains(record, callID) {
+		t.Fatal("carried executed exchange missing from record import")
+	}
+	if final := f.prompts[3]; strings.Contains(final, callID) || strings.Contains(final, "<opencode_bridge_call>") {
+		t.Fatal("carried call re-submitted in final prompt")
+	}
+	// Unknown-state items fail closed in the listing, reseed proceeds for
+	// the known-safe remainder.
+	for _, want := range []string{"rewrite-divergence", "old=" + oldURL, "new=" + s.URL, callID + "(get_weather)", "pending:", "outcome unknown"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
+	}
+	if s.ReseedFrom != oldURL {
+		t.Fatalf("linkage lost: %q", s.ReseedFrom)
+	}
+	if request(h, "rdirty", rewritten); len(f.prompts) != 4 {
+		t.Fatal("retry after dirty reseed resubmitted")
+	}
+	loaded := testHandler(&fakeBackend{})
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil || loaded.sessions["rdirty"].Dirty || loaded.sessions["rdirty"].ReseedEvidence == "" {
+		t.Fatal("dirty reseed not restart-safe", err)
+	}
+}
+
+func TestDirtyRewriteReseedLoadBearingKeepsUncertainty(t *testing.T) {
+	// A verifiable completed answer for the still-pending prompt exists on
+	// the old thread, but adoption fails structurally and auto-resync
+	// cannot transplant it. That unknown is load-bearing: a coherent
+	// rewrite must NOT abandon it silently — completions keeps terminal
+	// 422 and recover keeps 409, both with the sent-log diagnosis, Dirty
+	// untouched, nothing submitted.
+	const h1 = "first submission prompt H1 with full context"
+	req := weatherReq()
+	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer, latestErr: errors.New("stored thread holds no complete assistant answer to transplant")}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: req.Messages[:1]}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	rewritten := completionsRequest{Messages: []message{{Role: "user", Content: "something else entirely"}}, ToolChoice: "none"}
+	if w := request(h, "recover", rewritten); w.Code != 422 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
+		t.Fatalf("load-bearing rewrite abandoned uncertainty: %d %s", w.Code, w.Body.String())
+	}
+	s := h.sessions["recover"]
+	if !s.Dirty || s.Phase != "final" || s.PendingPrompt != h1 || s.ReseedEvidence != "" || s.ReseedFrom != "" {
+		t.Fatalf("load-bearing 422 changed the journal: %+v", s)
+	}
+	if w := recoveryRequest(h, nil); w.Code != 409 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
+		t.Fatalf("load-bearing recover lost diagnosis: %d %s", w.Code, w.Body.String())
+	}
+	if !h.sessions["recover"].Dirty {
+		t.Fatal("load-bearing 409 cleared Dirty")
+	}
+}
+
+func TestDirtyIncoherentHistoryKeepsUncertainty(t *testing.T) {
+	// A dirty session met with an internally incoherent rewrite (dangling
+	// tool call) is genuinely ambiguous: no reseed, terminal 422/409 with
+	// sent-log diagnosis, Dirty untouched, nothing submitted.
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, expected: "newer retry prompt H3", readErr: errors.New("stored user prompt does not exactly match original request (rendered 10B want 20B)")}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["recover"] = &session{
+		URL: "https://chatgpt.com/c/stored", Messages: []message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "ok"}},
+		Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3",
+	}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash("original submitted prompt H1"), Bytes: 100})
+	dangling := completionsRequest{Messages: []message{
+		{Role: "user", Content: "changed"},
+		{Role: "assistant", ToolCalls: []toolCall{{ID: "ghost", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Hanoi"}`}}}},
+	}, ToolChoice: "none"}
+	if w := request(h, "recover", dangling); w.Code != 422 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
+		t.Fatalf("incoherent rewrite abandoned uncertainty: %d %s", w.Code, w.Body.String())
+	}
+	s := h.sessions["recover"]
+	if !s.Dirty || s.Phase != "final" || s.ReseedEvidence != "" || s.ReseedFrom != "" {
+		t.Fatalf("incoherent 422 changed the journal: %+v", s)
+	}
+	if w := recoveryRequest(h, nil); w.Code != 409 || !strings.Contains(w.Body.String(), "sent-log:") || !h.sessions["recover"].Dirty {
+		t.Fatalf("incoherent recover lost diagnosis or Dirty: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRewriteReseedNeverFiresOnAppend(t *testing.T) {
+	// Coherent append-only histories never trigger reseed: same thread,
+	// no evidence, no sent-log reseed event.
+	f := &fakeBackend{answers: []string{weatherAnswer, "23 C"}}
+	h := testHandler(f)
+	req := weatherReq()
+	a := assistant(t, request(h, "happy", req))
+	thread := h.sessions["happy"].URL
+	req.Messages = append(req.Messages, a, message{Role: "tool", ToolCallID: a.ToolCalls[0].ID, Content: "23 C"})
+	req.ToolChoice = "none"
+	if got := assistant(t, request(h, "happy", req)); contentText(got) != "23 C" {
+		t.Fatal(got)
+	}
+	s := h.sessions["happy"]
+	if s.Dirty || s.URL != thread || f.urls[1] != thread || s.ReseedEvidence != "" || s.ReseedFrom != "" {
+		t.Fatalf("happy path reseeded or left the thread: %+v urls=%v", s, f.urls)
+	}
+	for _, e := range h.sentLog {
+		if e.Event == "reseed" {
+			t.Fatalf("happy path logged a reseed: %+v", e)
+		}
 	}
 }

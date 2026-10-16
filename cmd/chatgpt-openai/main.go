@@ -173,6 +173,17 @@ type session struct {
 	Phase          string    `json:",omitempty"`
 	ResyncMessages []message `json:",omitempty"`
 	ResyncFrom     string    `json:",omitempty"`
+	// AutoResyncEvidence records a hash-lineage auto-resync transplant: what
+	// was transplanted and why the shape was deemed safe. Empty unless an
+	// automatic resync cleared Dirty; it never alters transcript matching.
+	AutoResyncEvidence string `json:",omitempty"`
+	// ReseedEvidence records a history-rewrite fresh-thread reseed: the
+	// rewrite classification, the old→new thread linkage, and the
+	// carried/not-carried executed-result lists. ReseedFrom is the
+	// abandoned thread URL. Both persist across restart like any journal
+	// field; empty unless a reseed committed.
+	ReseedEvidence string `json:",omitempty"`
+	ReseedFrom     string `json:",omitempty"`
 	// Project is the session's dedicated ChatGPT project URL, set only when
 	// the CHATGPT_BRIDGE_PROJECT_PER_SESSION rotation minted one. Empty means
 	// the grandfathered shared project (today's behavior, unchanged).
@@ -191,6 +202,9 @@ type handler struct {
 	transactionOwner *handler
 	transactionID    string
 	browserPool      *chatgpt.Pool
+	// sentLog is the bounded in-memory ring of the append-only sent-log
+	// (see sentlog.go); the durable record is sent-log.jsonl next to state.
+	sentLog []sentEntry
 }
 
 func (h *handler) routes() http.Handler {
@@ -905,7 +919,11 @@ func packPieces(pieces []piece, limit int) [][]piece {
 		flush()
 		head := p.atts
 		for len(p.text)+1 > limit {
-			seg := p.text[:safeCut(p.text, max(1, limit-1))]
+			cut, warn := wrapperCut(p.text, max(1, limit-1))
+			if warn {
+				log.Printf("[openai] chunk: single bridge wrapper exceeds chunk budget (%d bytes into %d-byte text); splitting inside wrapper", cut, len(p.text))
+			}
+			seg := p.text[:cut]
 			p.text = p.text[len(seg):]
 			out = append(out, []piece{{text: seg, atts: head}})
 			head = nil
@@ -917,6 +935,80 @@ func packPieces(pieces []piece, limit int) [][]piece {
 	}
 	flush()
 	return out
+}
+
+// Bridge wrapper tag spellings: literal and Markdown-escaped (observed live
+// in model output). A wrapper split across chunks is a guaranteed tool-parse
+// failure, so chunking must never cut inside one.
+var bridgeOpenTags = []string{"<opencode_bridge_call>", `<opencode\_bridge\_call>`}
+var bridgeCloseTags = []string{"</opencode_bridge_call>", `</opencode\_bridge\_call>`}
+
+// wrapperCut returns a byte index <= n on a wrapper boundary: before an
+// opening tag or after a closing tag, so no chunk ever holds half a wrapper.
+// It falls back to safeCut (warn=true) only when a single wrapper region
+// covers the whole budget — an oversized wrapper that cannot be placed whole.
+func wrapperCut(s string, n int) (int, bool) {
+	if n >= len(s) {
+		return len(s), false
+	}
+	if n <= 0 {
+		return safeCut(s, 1), true
+	}
+	type tag struct {
+		pos   int
+		end   int
+		open  bool
+		close bool
+	}
+	var tags []tag
+	for _, t := range bridgeOpenTags {
+		for i := 0; i+len(t) <= len(s); {
+			p := strings.Index(s[i:], t)
+			if p < 0 {
+				break
+			}
+			tags = append(tags, tag{pos: i + p, end: i + p + len(t), open: true})
+			i += p + len(t)
+		}
+	}
+	for _, t := range bridgeCloseTags {
+		for i := 0; i+len(t) <= len(s); {
+			p := strings.Index(s[i:], t)
+			if p < 0 {
+				break
+			}
+			tags = append(tags, tag{pos: i + p, end: i + p + len(t), close: true})
+			i += p + len(t)
+		}
+	}
+	cut := n
+	// A cut landing inside a tag spelling moves back to the tag start.
+	for _, t := range tags {
+		if cut > t.pos && cut < t.end {
+			cut = t.pos
+		}
+	}
+	// Pair opens with their next close (sequential, non-nesting); an unpaired
+	// open runs to end of text. A cut strictly inside a region moves back to
+	// that region's opening tag: the region travels whole into the next chunk.
+	for _, t := range tags {
+		if !t.open {
+			continue
+		}
+		end := len(s)
+		for _, c := range tags {
+			if c.close && c.pos >= t.end && c.end < end {
+				end = c.end
+			}
+		}
+		if cut > t.pos && cut < end {
+			cut = t.pos
+		}
+	}
+	if cut <= 0 {
+		return safeCut(s, n), true
+	}
+	return cut, false
 }
 
 // safeCut returns a byte index <= n that does not split a UTF-8 rune.
@@ -1216,6 +1308,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var reseedPlan *rewritePlan
 	if s.Dirty && !resync {
 		if s.incompleteJournal() {
 			incompleteJournalError(w)
@@ -1227,15 +1320,30 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// the normal delta machinery resumes the import. Duplicating an
 			// inert chunk is harmless; no tool turn can execute twice.
 			log.Printf("[openai] session=%s resuming interrupted replay without 409; final turn never submitted", id)
-		} else if h.tryAdoptInterrupted(r, id, s) {
+		} else if adopted, mismatch := h.tryAdoptInterrupted(r, id, s); adopted {
 			// Adopted the completed answer above; fall through to normal
 			// processing (exact retries hit the duplicate cache below).
 			log.Printf("[openai] session=%s adopted interrupted final turn; continuing request", id)
+		} else if h.tryAutoResync(r, id, s, mismatch) {
+			// Transplanted the thread's real answer for the recognized
+			// pending-overwritten-by-retry shape; fall through to normal
+			// processing (exact retries hit the duplicate cache below).
+			log.Printf("[openai] session=%s auto-resynced recognized desync shape; continuing request", id)
+		} else if plan := h.planDirtyReseed(id, s, req); plan != nil {
+			// Coherent history rewrite over uncertainty: the client's
+			// current timeline supersedes the pending turn, whose answer
+			// was never delivered (so it caused no external execution).
+			// Abandon the old thread without adoption and continue below
+			// as a fresh reseed; the commit records the linkage. A
+			// load-bearing unknown (a verifiable completed answer for the
+			// pending prompt) refuses above and keeps terminal 422.
+			reseedPlan = plan
+			log.Printf("[openai] session=%s rewrite-reseed armed classification=%s carried=%d not_carried=%d; abandoning uncertain thread without adoption", id, plan.classification, len(plan.carriedIDs), len(plan.notCarried))
 		} else {
 			// Installed v2 retries HTTP409 as provider.internal. This request
 			// cannot safely progress without recovery, so return terminal422
 			// while retaining the exact same uncertainty/adoption protections.
-			apiError(w, 422, errors.New("session has an uncertain submitted turn; switching models does not resolve it. POST /v1/sessions/recover with the same session header and exact original request for read-only validation/cache; do not resubmit the original turn. If the original browser response cannot be verified, explicitly POST /v1/sessions/resync with the recorded completed transcript and tool results, then send a new user message; historical tools will not be rerun"))
+			apiError(w, 422, fmt.Errorf("session has an uncertain submitted turn; switching models does not resolve it. POST /v1/sessions/recover with the same session header and exact original request for read-only validation/cache; do not resubmit the original turn. If the original browser response cannot be verified, explicitly POST /v1/sessions/resync with the recorded completed transcript and tool results, then send a new user message; historical tools will not be rerun; %s", h.sentDiagnosis(id, s)))
 			return
 		}
 	}
@@ -1320,6 +1428,21 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
 			}
+			// History-rewrite reseed: the incoming history is a coherent
+			// rewrite (revert/fork/compaction) of committed state, so seed
+			// a fresh thread with the rewritten timeline plus carried
+			// executed results instead of replaying blind. Incoherent
+			// input plans nothing and keeps the legacy reset-replay below
+			// (clean sessions hold no uncertainty to protect); a plan
+			// armed by the dirty branch above (uncertainty abandoned)
+			// is reused as-is.
+			if reseedPlan == nil {
+				reseedPlan = h.planCleanReseed(s, req)
+			}
+			if reseedPlan != nil {
+				decision = "rewrite-reseed"
+				log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+			}
 		}
 	}
 	if resync {
@@ -1343,6 +1466,14 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	turns := h.buildTurns(req, delta, head)
 	if resync {
 		turns = h.buildResyncTurns(req, s.ResyncMessages, head)
+	}
+	// A rewrite reseed travels with its prior-execution record first: the
+	// carried exchanges as inert ACK history imports ahead of the rewritten
+	// transcript, never as pending calls.
+	if reseedPlan != nil && !resync {
+		if record := h.buildReseedRecordTurns(reseedPlan.carried); len(record) > 0 {
+			turns = append(record, turns...)
+		}
 	}
 	for i, t := range turns {
 		if h.maxChars > 0 && len(t.prompt) > h.maxChars {
@@ -1392,7 +1523,22 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if id != "" {
+			h.appendSent(sentEntry{Event: "submitted", Session: id, URL: url, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(turns)})
+		}
 		res, err := h.eagerThreadTurn(r, id, lane, req, s, t, url, thinking, decision, resync)
+		if id != "" {
+			disp, answerHash := "completed", ""
+			if err != nil {
+				disp = "interrupted"
+				if errors.Is(err, chatgpt.ErrNotSubmitted) {
+					disp = "failed"
+				}
+			} else {
+				answerHash = promptHash(res.Answer)
+			}
+			h.appendSent(sentEntry{Event: disp, Session: id, URL: res.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(turns), AnswerHash: answerHash})
+		}
 		if err != nil {
 			// Persist the URL only when the turn really reached a conversation,
 			// so the dirty journal records a usable repair target, not a page
@@ -1418,7 +1564,11 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[openai] failed session=%s turn=%d/%d uncertain=%v thread=%s", id, i+1, len(turns), s.Dirty, s.URL)
 			// The normal poll already waited through its empty-answer grace. Settle
 			// only an exact read-only completed-empty proof, never resubmit a turn.
-			if !t.replay && id != "" && errors.Is(err, chatgpt.ErrMissingAnswer) && h.tryAdoptInterrupted(r, id, s) {
+			adopted := false
+			if !t.replay && id != "" && errors.Is(err, chatgpt.ErrMissingAnswer) {
+				adopted, _ = h.tryAdoptInterrupted(r, id, s)
+			}
+			if adopted {
 				if s.Phase == "invalid" {
 					apiError(w, 422, errors.New("completed model output was empty or invalid; no new tool calls were delivered; send a distinct new ordinary user message to continue"))
 				} else {
@@ -1495,11 +1645,25 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	s.URL, s.Fingerprint, s.Result, s.Dirty = url, fingerprint, out, false
 	s.ToolsFP = toolsFP // this thread now knows exactly this tool set
 	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt, s.Phase = nil, "", "", ""
+	seedBytes := 0
+	if reseedPlan != nil {
+		// The new thread URL is known only now: record the old→new
+		// linkage with classification and item lists in the journal.
+		// Restart keeps it: these are plain journal fields saved below.
+		s.ReseedFrom = reseedPlan.oldURL
+		for _, t := range turns {
+			seedBytes += len(t.prompt)
+		}
+		s.ReseedEvidence = reseedPlan.evidence(url, len(turns), seedBytes)
+	}
 	if id != "" {
 		if err := h.save(); err != nil {
 			*s = beforeCommit
 			h.backendError(w, err)
 			return
+		}
+		if reseedPlan != nil {
+			h.appendSent(sentEntry{Event: "reseed", Session: id, URL: url, PromptHash: promptHash(turns[len(turns)-1].prompt), Bytes: seedBytes, Note: reseedPlan.note(url)})
 		}
 	}
 	log.Printf("[openai] session=%s done tool_calls=%d answer_bytes=%d thread=%s", id, len(out.Calls), len(answer), url)
