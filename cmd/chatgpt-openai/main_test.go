@@ -2027,3 +2027,84 @@ func TestRotationUnificationCarriesRecordAndFreshEvidence(t *testing.T) {
 		t.Fatalf("sent-log rotation linkage missing: %+v", last)
 	}
 }
+
+const tinyPNGDataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+func TestRasterImagesServedOnWireNotInTranscript(t *testing.T) {
+	img := chatgpt.RasterImage{Alt: "Elimination; rotation 4 eliminated", DataURL: tinyPNGDataURL}
+	f := &fakeBackend{turn: func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+		return chatgpt.TurnResult{Answer: "Here is the result.\n\n[SVG: Elimination; rotation 4 eliminated]", URL: "https://chatgpt.com/c/thread-1", Images: []chatgpt.RasterImage{img}}, nil
+	}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "draw it"}}}
+	a := assistant(t, request(h, "session-img", req))
+	body := contentText(a)
+	if !strings.Contains(body, "![Elimination; rotation 4 eliminated]("+tinyPNGDataURL+")") {
+		t.Fatalf("wire content missing png attachment: %q", body)
+	}
+	if !strings.Contains(body, "[SVG: Elimination; rotation 4 eliminated]") {
+		t.Fatalf("text fallback lost: %q", body)
+	}
+	// The stored replay transcript stays text-only: base64 payloads are never
+	// pasted back into the ChatGPT thread.
+	s := h.sessions["session-img"]
+	if s == nil || len(s.Messages) == 0 {
+		t.Fatal("no transcript stored")
+	}
+	for _, m := range s.Messages {
+		if strings.Contains(contentText(m), "data:image/png") {
+			t.Fatalf("base64 leaked into replay transcript: %q", contentText(m))
+		}
+	}
+	// Duplicate retry re-serves the attachment without resubmitting.
+	dup := assistant(t, request(h, "session-img", req))
+	if !strings.Contains(contentText(dup), tinyPNGDataURL) {
+		t.Fatal("duplicate cache dropped raster images")
+	}
+}
+
+func TestRasterImagesInvalidNeverReachWire(t *testing.T) {
+	f := &fakeBackend{turn: func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+		return chatgpt.TurnResult{Answer: "diagram below", URL: "https://chatgpt.com/c/thread-1", Images: []chatgpt.RasterImage{
+			{Alt: "svg stays text", DataURL: "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="},
+			{Alt: "broken]", DataURL: "data:image/png;base64,!!!not-base64!!!"},
+		}}, nil
+	}}
+	h := testHandler(f)
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "draw it"}}}
+	a := assistant(t, request(h, "session-img-bad", req))
+	if body := contentText(a); body != "diagram below" {
+		t.Fatalf("invalid images altered the answer: %q", body)
+	}
+}
+
+func TestImageMarkdownAltSanitized(t *testing.T) {
+	got := imageMarkdown([]chatgpt.RasterImage{{Alt: "a]b[c\nnewline", DataURL: tinyPNGDataURL}})
+	if !strings.HasPrefix(got, "\n\n![abc newline]("+tinyPNGDataURL+")") {
+		t.Fatalf("alt not sanitized: %q", got)
+	}
+	if imageMarkdown(nil) != "" || imageMarkdown([]chatgpt.RasterImage{{Alt: "x", DataURL: "data:image/gif;base64,R0lGOD"}}) != "" {
+		t.Fatal("empty/non-png input must yield no attachment")
+	}
+}
+
+func TestParseAnswerToleratesImageMarkdown(t *testing.T) {
+	out, err := parseAnswer("See the result.\n\n![diagram]("+tinyPNGDataURL+")", completionsRequest{})
+	if err != nil || len(out.Calls) != 0 || !strings.Contains(out.Text, "![diagram](") {
+		t.Fatalf("image markdown rejected: %+v %v", out, err)
+	}
+}
+
+func TestRasterImagesStreamedAsDelta(t *testing.T) {
+	img := chatgpt.RasterImage{Alt: "d", DataURL: tinyPNGDataURL}
+	f := &fakeBackend{turn: func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+		return chatgpt.TurnResult{Answer: "done", URL: "https://chatgpt.com/c/thread-1", Images: []chatgpt.RasterImage{img}}, nil
+	}}
+	h := testHandler(f)
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "draw it"}}, Stream: true}
+	w := request(h, "session-img-stream", req)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), tinyPNGDataURL) || !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
+		t.Fatalf("stream missing png delta: %d %q", w.Code, w.Body.String())
+	}
+}

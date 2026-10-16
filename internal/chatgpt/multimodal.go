@@ -39,6 +39,10 @@ type TurnResult struct {
 	Answer    string
 	Reasoning string
 	URL       string
+	// Images holds model SVGs rasterized bridge-side to PNG data URLs. Empty
+	// on text-only answers and on any rasterization failure (the "[SVG: ...]"
+	// text fallback in Answer still stands).
+	Images []RasterImage
 	// ProjectURL echoes the project a new chat was started in (empty when an
 	// existing thread was continued or the shared project was used).
 	ProjectURL string

@@ -437,6 +437,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		return true
 	}
 	out.Reasoning = res.Reasoning
+	out.Images = res.Images
 	out.ID, out.Created = fmt.Sprintf("chatcmpl-%x", sha256.Sum256([]byte(id+":"+fingerprint))), time.Now().Unix()
 	for i := range out.Calls {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", id, fingerprint, i)))

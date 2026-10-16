@@ -889,6 +889,12 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	log.Printf("[chatgpt] waiting for answer (timeout: %v)...", timeout)
 	answer, reasoning, err := c.waitForAnswer(ctx, tab, timeout, pollInterval, onProgress, before.IDs)
 	out.Answer, out.Reasoning = answer, reasoning
+	if err == nil {
+		// Rasterize substantive answer SVGs to PNG bridge-side: the TUI
+		// demotes SVG to plain text while raster image parts preview.
+		// Best-effort; a nil result keeps the text fallback.
+		out.Images = c.rasterizeAnswerSVG(tab, answer, before.IDs)
+	}
 	var url string
 	// Capture an uncertain submitted turn's URL even after request cancellation.
 	// This bounded, read-only diagnostic never sends or retries a browser action.

@@ -507,3 +507,44 @@ func TestFinishedEmptyBoundAndGenerationGrace(t *testing.T) {
 }
 
 func quoteJS(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+func TestRasterImageValidation(t *testing.T) {
+	png := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	if !ValidRasterImage(png) {
+		t.Fatal("valid PNG data URL rejected")
+	}
+	gif := "data:image/gif;base64,R0lGODdhAQABAPAAAP8AAAAAACwAAAAAAQABAAACAkQBADs="
+	if ValidRasterImage(gif) {
+		t.Fatal("non-PNG media accepted")
+	}
+	if ValidRasterImage("data:image/png;base64,!!!not-base64!!!") {
+		t.Fatal("undecodable base64 accepted")
+	}
+	if ValidRasterImage("data:image/png;base64,") {
+		t.Fatal("empty payload accepted")
+	}
+	// JPEG bytes under a PNG prefix must not pass the signature check.
+	jpeg := "data:image/png;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCwAA8A/9k="
+	if ValidRasterImage(jpeg) {
+		t.Fatal("non-PNG bytes accepted")
+	}
+	big := "data:image/png;base64," + strings.Repeat("iVBORw0KGgo", 700000)
+	if ValidRasterImage(big) {
+		t.Fatal("oversized payload accepted")
+	}
+}
+
+func TestSanitizeRasterAlt(t *testing.T) {
+	if got := sanitizeRasterAlt("Elimination; rotation 4\neliminated"); got != "Elimination; rotation 4 eliminated" {
+		t.Fatalf("newline not folded: %q", got)
+	}
+	if got := sanitizeRasterAlt("a]b[c"); got != "abc" {
+		t.Fatalf("brackets leaked: %q", got)
+	}
+	if got := sanitizeRasterAlt("   "); got != "diagram" {
+		t.Fatalf("empty alt has no fallback: %q", got)
+	}
+	if got := sanitizeRasterAlt(strings.Repeat("x", 200)); len([]rune(got)) != 100 {
+		t.Fatalf("alt not capped: %d runes", len([]rune(got)))
+	}
+}

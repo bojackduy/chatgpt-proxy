@@ -145,6 +145,11 @@ type result struct {
 	Text      string
 	Reasoning string
 	Calls     []toolCall
+	// Images holds model SVGs rasterized bridge-side to PNG data URLs. They
+	// are served as Markdown image attachments in the wire content only and
+	// never enter the stored replay transcript (which stays text-only so
+	// history imports remain bounded and paste-safe).
+	Images []chatgpt.RasterImage
 }
 type session struct {
 	URL                 string
@@ -1505,6 +1510,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		// with the phase and source binding before the FIRST submission too.
 	}
 	var answer, reasoning string
+	var images []chatgpt.RasterImage
 	finalTurn := false
 	for i, t := range turns {
 		finalTurn = !t.replay
@@ -1605,7 +1611,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[openai] session=%s replayed chunk=%d/%d bytes=%d thread=%s", id, i+1, len(turns), len(t.prompt), url)
 			continue
 		}
-		answer, reasoning = res.Answer, res.Reasoning
+		answer, reasoning, images = res.Answer, res.Reasoning, res.Images
 	}
 	out, err := parseAnswer(answer, req)
 	// Zero calls were delivered, so one bounded repair turn cannot duplicate
@@ -1638,6 +1644,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Reasoning = reasoning
+	out.Images = images
 	out.ID, out.Created = fmt.Sprintf("chatcmpl-%x", sha256.Sum256([]byte(id+":"+fingerprint))), time.Now().Unix()
 	for i := range out.Calls {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", id, fingerprint, i)))
@@ -1684,6 +1691,35 @@ func (h *handler) backendError(w http.ResponseWriter, err error) {
 	}
 	apiError(w, 502, err)
 }
+
+// imageMarkdown renders bridge-rasterized PNGs as Markdown image attachments
+// appended to the assistant text on the wire. The TUI demotes SVG to plain
+// text while raster image parts reach terminal graphics, so converting
+// bridge-side flows through the existing preview path with no client change.
+// The stored transcript keeps only out.Text (the "[SVG: ...]" fallback), so
+// base64 payloads are never replayed into the ChatGPT thread.
+func imageMarkdown(images []chatgpt.RasterImage) string {
+	var b strings.Builder
+	for _, im := range images {
+		// Re-validate at the wire boundary: results may arrive from
+		// recovery/rotation paths as well as live rasterization.
+		if !chatgpt.ValidRasterImage(im.DataURL) {
+			continue
+		}
+		alt := strings.ReplaceAll(im.Alt, "\n", " ")
+		alt = strings.ReplaceAll(alt, "]", "")
+		alt = strings.ReplaceAll(alt, "[", "")
+		alt = strings.TrimSpace(strings.Join(strings.Fields(alt), " "))
+		if r := []rune(alt); len(r) > 100 {
+			alt = string(r[:100])
+		}
+		if alt == "" {
+			alt = "diagram"
+		}
+		b.WriteString("\n\n![" + alt + "](" + im.DataURL + ")")
+	}
+	return b.String()
+}
 func (h *handler) respond(w http.ResponseWriter, req completionsRequest, out result) {
 	id, created := out.ID, out.Created
 	if id == "" {
@@ -1695,7 +1731,7 @@ func (h *handler) respond(w http.ResponseWriter, req completionsRequest, out res
 		finish = "tool_calls"
 	}
 	if !req.Stream {
-		msg := map[string]any{"role": "assistant", "content": out.Text}
+		msg := map[string]any{"role": "assistant", "content": out.Text + imageMarkdown(out.Images)}
 		if out.Reasoning != "" {
 			msg["reasoning_content"] = out.Reasoning
 		}
@@ -1722,6 +1758,9 @@ func (h *handler) respond(w http.ResponseWriter, req completionsRequest, out res
 	}
 	if out.Text != "" {
 		send(map[string]any{"content": out.Text}, nil)
+	}
+	if imgs := imageMarkdown(out.Images); imgs != "" {
+		send(map[string]any{"content": imgs}, nil)
 	}
 	for i, c := range out.Calls {
 		send(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": c.ID, "type": c.Type, "function": c.Function}}}, nil)
