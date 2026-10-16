@@ -16,8 +16,9 @@ import (
 // internally coherent but does not prefix-match the journal).
 //
 // Order in the completions path: normal delta → tryAutoResync (interrupt
-// shape) → rewrite-reseed (rewrite shape) → 409/422 with sent-log diagnosis
-// (genuinely ambiguous only). The old thread is abandoned truthfully — no
+// shape) → rewrite-reseed (rewrite shape, record-first; project rotation
+// carries the same plan record-first when enabled, never shadowing it) →
+// 409/422 with sent-log diagnosis (genuinely ambiguous only). The old thread is abandoned truthfully — no
 // adoption comparison against it, no resync of it — and the turn continues
 // on a fresh thread as a normal submission (chunked and boundary-aware like
 // any fresh history).

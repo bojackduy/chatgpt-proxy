@@ -22,6 +22,7 @@ import (
 
 type fakeBackend struct {
 	prompts, urls []string
+	projects      []string // project target per turn: opt.ProjectURL, else opt.ProjectName
 	answers       []string
 	atts          []int
 	thinking      []bool
@@ -30,6 +31,9 @@ type fakeBackend struct {
 	errorURL      string
 	failAt        int
 	probe         int
+	// projectEcho, when set, is returned as res.ProjectURL for
+	// project-targeted new chats (simulating the project mint).
+	projectEcho string
 	turn          func(context.Context, chatgpt.TurnOptions) (chatgpt.TurnResult, error)
 }
 
@@ -42,6 +46,11 @@ func (f *fakeBackend) AskThreadTurn(ctx context.Context, opt chatgpt.TurnOptions
 	}
 	f.prompts = append(f.prompts, opt.Prompt)
 	f.urls = append(f.urls, opt.URL)
+	proj := opt.ProjectURL
+	if proj == "" {
+		proj = opt.ProjectName
+	}
+	f.projects = append(f.projects, proj)
 	f.atts = append(f.atts, len(opt.Attachments))
 	f.thinking = append(f.thinking, opt.Thinking)
 	if f.err != nil && (f.failAt == 0 || len(f.prompts) == f.failAt) {
@@ -59,7 +68,13 @@ func (f *fakeBackend) AskThreadTurn(ctx context.Context, opt chatgpt.TurnOptions
 	if i < len(f.answers) {
 		answer = f.answers[i]
 	}
-	return chatgpt.TurnResult{Answer: answer, URL: url, Reasoning: f.reasoning}, nil
+	resProj := ""
+	if opt.ProjectURL != "" {
+		resProj = opt.ProjectURL
+	} else if opt.ProjectName != "" {
+		resProj = f.projectEcho
+	}
+	return chatgpt.TurnResult{Answer: answer, URL: url, Reasoning: f.reasoning, ProjectURL: resProj}, nil
 }
 func (f *fakeBackend) LoginState(context.Context) (*chatgpt.Status, error) {
 	f.probe++
@@ -403,7 +418,7 @@ func TestMalformedCalls(t *testing.T) {
 			req := weatherReq()
 			s := &session{URL: "https://chatgpt.com/c/previous"}
 			w := httptest.NewRecorder()
-			if !h.serveRotation(w, httptest.NewRequest("POST", "/", nil), "rotate-repair", "test", req, s) || len(f.prompts) != 2 || f.urls[1] != "https://chatgpt.com/c/thread-1" || s.RepairFingerprint != requestFingerprint(req) {
+			if !h.serveRotation(w, httptest.NewRequest("POST", "/", nil), "rotate-repair", "test", req, s, nil) || len(f.prompts) != 2 || f.urls[1] != "https://chatgpt.com/c/thread-1" || s.RepairFingerprint != requestFingerprint(req) {
 				t.Fatal("rotation repair unbound/budget missing")
 			}
 			if cancelRepair {
@@ -740,7 +755,7 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 		h := testHandler(f)
 		s := &session{URL: "https://chatgpt.com/c/old"}
 		w := httptest.NewRecorder()
-		if handled := h.serveRotation(w, httptest.NewRequest("POST", "/v1/chat/completions", nil), "rotate", "main", weatherReq(), s); handled != tc.handled || len(f.prompts) != 1 {
+		if handled := h.serveRotation(w, httptest.NewRequest("POST", "/v1/chat/completions", nil), "rotate", "main", weatherReq(), s, nil); handled != tc.handled || len(f.prompts) != 1 {
 			t.Fatal("rotation retried uncertain turn", handled)
 		}
 		if tc.handled && (!s.Dirty || s.Phase != "final" || s.URL != tc.url || w.Code != 502) {
@@ -1687,15 +1702,34 @@ func TestCompactionCreatesNewThreadAndVideoGap(t *testing.T) {
 	assistant(t, request(h2, "rich", req2))
 	req2.Messages = []message{{Role: "system", Content: "Compacted summary"}, {Role: "user", Content: "next after compact"}}
 	assistant(t, request(h2, "rich", req2))
-	if len(f2.prompts) != 2 {
-		t.Fatalf("rich rotation submitted %d prompts, want 2", len(f2.prompts))
+	// Unified rotation: the carried executed exchange travels as an inert
+	// record import ahead of the rotation card (record + card).
+	if len(f2.prompts) != 3 {
+		t.Fatalf("rich rotation submitted %d prompts, want 3 (record + card)", len(f2.prompts))
 	}
+	record := f2.prompts[1]
+	for _, want := range []string{"PRIOR EXECUTION RECORD", "call_1", big[:500]} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("rotation record import missing %q", want[:20])
+		}
+	}
+	if f2.urls[1] != "" || f2.urls[2] != h2.sessions["rich"].URL || h2.sessions["rich"].URL == "" {
+		t.Fatalf("rotation record did not seed the project thread record-first: urls=%v thread=%s", f2.urls, h2.sessions["rich"].URL)
+	}
+	card := f2.prompts[2]
 	for _, want := range []string{big, "do the thing", "next", "CONTEXT CARD"} {
-		if !strings.Contains(f2.prompts[1], want) {
+		if !strings.Contains(card, want) {
 			t.Fatalf("rotation prompt missing %q", want[:20])
 		}
 	}
-	// Ladder degrades monotonically and bottoms out at the legacy shape,
+	if strings.Contains(card, "call_1") {
+		t.Fatal("rotation card re-submitted the carried call ID")
+	}
+	for _, want := range []string{"rewrite-compaction", "via=rotation", "call_1(f)"} {
+		if !strings.Contains(h2.sessions["rich"].ReseedEvidence, want) {
+			t.Fatalf("rotation evidence lacks %q: %s", want, h2.sessions["rich"].ReseedEvidence)
+		}
+	}	// Ladder degrades monotonically and bottoms out at the legacy shape,
 	// judged on the pre-rotation history the card was built from (the live
 	// session now holds the rotated transcript).
 	head := toolPrompt(req2)
@@ -1881,5 +1915,115 @@ func TestRewriteReseedCarriesExecutedResults(t *testing.T) {
 	last := loaded.lastSentFor("reseed")
 	if last == nil || last.Event != "reseed" || last.URL != s.URL || !strings.Contains(last.Note, "old="+oldURL) || !strings.Contains(last.Note, "rewrite-divergence") || !strings.Contains(last.Note, callID) {
 		t.Fatalf("sent-log reseed linkage missing: %+v", last)
+	}
+}
+
+func TestRotationUnificationCarriesRecordAndFreshEvidence(t *testing.T) {
+	// Live defect: a prefix-mismatched project session rotated via the
+	// legacy path, shadowing the rewrite-reseed plan — no carried executed
+	// results, and the journal kept stale evidence from an earlier event.
+	// Rotation must travel record-first and always overwrite the evidence
+	// with this event's linkage.
+	t.Setenv("CHATGPT_BRIDGE_PROJECT_PER_SESSION", "1")
+	const projectURL = "https://chatgpt.com/g/g-p-proj/project"
+	f := &fakeBackend{answers: []string{weatherAnswer, "noted", "ACK", "rotated summary"}, projectEcho: projectURL}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	a := assistant(t, request(h, "proj", req))
+	callID := a.ToolCalls[0].ID
+	req.Messages = append(req.Messages, a, message{Role: "tool", ToolCallID: callID, Content: "25 C"}, message{Role: "user", Content: "and tomorrow?"})
+	req.ToolChoice = "none"
+	if got := assistant(t, request(h, "proj", req)); contentText(got) != "noted" {
+		t.Fatal("follow-up did not commit", got)
+	}
+	s := h.sessions["proj"]
+	oldURL := s.URL
+	if oldURL == "" || s.Dirty {
+		t.Fatal("turns did not commit cleanly")
+	}
+	// Plant the stale entry the defect left behind: an earlier event's
+	// linkage that this rotation must overwrite, never keep.
+	s.ReseedEvidence = "rewrite-reseed 2026-10-16T10:02:38Z classification=rewrite-divergence mismatch=1:content old=https://chatgpt.com/c/ancient new=https://chatgpt.com/c/stale carried=[] not-carried=[] seed=2turns/100B record-first"
+	s.ReseedFrom = "https://chatgpt.com/c/ancient"
+	if err := h.save(); err != nil {
+		t.Fatal(err)
+	}
+	rewritten := completionsRequest{Messages: []message{
+		{Role: "user", Content: "Call weather for Hanoi"},
+		{Role: "user", Content: "and tomorrow?"},
+	}, ToolChoice: "none"}
+	got := assistant(t, request(h, "proj", rewritten))
+	if contentText(got) != "rotated summary" {
+		t.Fatalf("rotation did not answer fresh: %+v", got)
+	}
+	s = h.sessions["proj"]
+	if s.Dirty || s.URL == "" || s.URL == oldURL {
+		t.Fatalf("rotation reused or abandoned the thread: old=%s new=%s dirty=%v", oldURL, s.URL, s.Dirty)
+	}
+	// Four submissions: turn1, turn2, record import (mints the project
+	// thread), rotation card (continues it). Nothing new lands on the old
+	// thread after the rotation.
+	if len(f.prompts) != 4 || f.urls[2] != "" || f.urls[3] != s.URL {
+		t.Fatalf("rotation did not seed the project thread record-first: urls=%v", f.urls)
+	}
+	for _, u := range f.urls[2:] {
+		if u == oldURL {
+			t.Fatalf("rotation touched the old thread: urls=%v", f.urls)
+		}
+	}
+	record, card := f.prompts[2], f.prompts[3]
+	for _, want := range []string{historyIntro, "PRIOR EXECUTION RECORD", callID, "get_weather", "25 C", "END PRIOR EXECUTION RECORD"} {
+		if !strings.Contains(record, want) {
+			t.Fatalf("rotation record import lacks %q", want)
+		}
+	}
+	if strings.Contains(card, callID) {
+		t.Fatal("rotation card re-submitted the carried call ID")
+	}
+	for _, want := range []string{"BRIDGE SESSION ROTATION", "CONTEXT CARD", "and tomorrow?"} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("rotation card lacks %q", want)
+		}
+	}
+	// Fresh evidence for THIS event: classification, carried IDs, old→new
+	// linkage, rotation marker — and no trace of the planted stale entry.
+	for _, want := range []string{"rewrite-divergence", "old=" + oldURL, "new=" + s.URL, callID + "(get_weather)", "via=rotation"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("rotation evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
+	}
+	for _, stale := range []string{"ancient", "10:02:38Z", "c/stale"} {
+		if strings.Contains(s.ReseedEvidence, stale) {
+			t.Fatalf("rotation kept stale evidence %q: %s", stale, s.ReseedEvidence)
+		}
+	}
+	if s.ReseedFrom != oldURL {
+		t.Fatalf("rotation linkage lost: %q", s.ReseedFrom)
+	}
+	// The new thread landed in the session project.
+	if s.Project != projectURL {
+		t.Fatalf("rotation left the session project: %q", s.Project)
+	}
+	if f.projects[2] == "" {
+		t.Fatalf("record import did not target the session project: %v", f.projects)
+	}
+	// Stable duplicate cache + restart survival, like the shared path.
+	body := request(h, "proj", rewritten).Body.String()
+	if retry := request(h, "proj", rewritten); retry.Body.String() != body || len(f.prompts) != 4 {
+		t.Fatal("retry after rotation resubmitted")
+	}
+	loaded := testHandler(&fakeBackend{})
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	ls := loaded.sessions["proj"]
+	if ls.ReseedEvidence != s.ReseedEvidence || ls.ReseedFrom != oldURL || ls.Dirty || ls.Project != projectURL {
+		t.Fatal("rotation evidence lost across restart")
+	}
+	last := loaded.lastSentFor("proj")
+	if last == nil || last.Event != "reseed" || last.URL != s.URL || !strings.Contains(last.Note, "old="+oldURL) || !strings.Contains(last.Note, "via=rotation") {
+		t.Fatalf("sent-log rotation linkage missing: %+v", last)
 	}
 }

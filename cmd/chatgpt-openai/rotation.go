@@ -245,13 +245,18 @@ func buildRotationPromptLevel(req completionsRequest, s *session, head string, l
 
 // serveRotation attempts a project-per-session rotation for a prefix-mismatched
 // stateful session: a fresh working chat in the session's dedicated project
-// seeded with one context-card turn. It returns true when it wrote the HTTP
-// response (success or terminal model-protocol failure). On ANY project/chat
-// creation or submission failure it restores the session untouched and
-// returns false so the caller falls back to the legacy shared-project
-// reset-replay for that turn — never fail-closed, never 409 where the old
-// path would have proceeded.
-func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane string, req completionsRequest, s *session) bool {
+// seeded with one context-card turn. The rewrite classifier runs BEFORE this
+// (planCleanReseed, or the dirty branch's armed plan) and travels in via plan:
+// carried executed results are submitted as inert ACK record imports ahead of
+// the rotation card, and a fresh ReseedEvidence/linkage is always committed
+// on success so evidence never goes stale. A nil plan (incoherent rewrite)
+// rotates as before but still stamps fresh evidence recording the ambiguity.
+// It returns true when it wrote the HTTP response (success or terminal
+// model-protocol failure). On ANY project/chat creation or submission failure
+// it restores the session untouched and returns false so the caller falls
+// back to the legacy shared-project reset-replay for that turn — never
+// fail-closed, never 409 where the old path would have proceeded.
+func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane string, req completionsRequest, s *session, plan *rewritePlan) bool {
 	snapshot := *s
 	name := sessionProjectName(id, req)
 	projectURL := s.Project
@@ -280,6 +285,29 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	for _, m := range recent {
 		atts = append(atts, attachmentsOf(m)...)
 	}
+	// The prior-execution record travels first when the classifier carried
+	// executed results, built exactly like the shared-project reseed path
+	// (inert ACK imports, never pending calls). Nil when nothing executed
+	// is missing from the rewritten history: legacy single-card rotation.
+	var recordTurns []turn
+	if plan != nil {
+		recordTurns = h.buildReseedRecordTurns(plan.carried)
+	}
+	// Fresh linkage for THIS rotation, never the previous event's entry. A
+	// nil plan means the rewrite was incoherent: record the ambiguity
+	// truthfully with empty item lists rather than leaving stale evidence.
+	evidencePlan := plan
+	if evidencePlan == nil {
+		kind, mm := classifyHistoryRewrite(req.Messages, snapshot.Messages)
+		idx, field := -1, "unknown"
+		if mm != nil {
+			idx, field = mm.Index, mm.Field
+		}
+		if kind == "" {
+			kind = "rotation"
+		}
+		evidencePlan = &rewritePlan{classification: kind, mismatchIndex: idx, mismatchField: field, oldURL: snapshot.URL}
+	}
 	restore := func() {
 		*s = snapshot
 		_ = h.save()
@@ -295,11 +323,61 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		return true
 	}
 	thinking := h.forceThinking || (req.ReasoningEffort != nil && req.ReasoningEffort != "none") || (req.Reasoning != nil && req.Reasoning != false)
-	log.Printf("[openai] session=%s lane=%s decision=rotation project=%q thread=%s", id, lane, name, projectURL)
-	res, err := h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{
-		Prompt: prompt, URL: "", ProjectURL: projectURL, ProjectName: name,
-		Attachments: atts, Thinking: thinking,
-	})
+	log.Printf("[openai] session=%s lane=%s decision=rotation project=%q thread=%s record_turns=%d", id, lane, name, projectURL, len(recordTurns))
+	// Seed the new project thread record-first, then the rotation card. The
+	// first submission mints the project chat (empty URL + project
+	// targeting); every later turn continues the minted thread. Record turns
+	// are inert history imports: each must ACK, exactly like the normal path.
+	threadURL, newProjectURL := "", ""
+	seedTurns, seedBytes := 0, 0
+	for i, rt := range recordTurns {
+		opt := chatgpt.TurnOptions{Prompt: rt.prompt, URL: threadURL, Thinking: thinking}
+		if threadURL == "" {
+			opt.ProjectURL, opt.ProjectName = projectURL, name
+		}
+		res, err := h.client.AskThreadTurn(r.Context(), opt)
+		seedTurns++
+		seedBytes += len(rt.prompt)
+		if err != nil {
+			if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
+				s.URL = res.URL
+				if serr := h.save(); serr != nil {
+					h.backendError(w, serr)
+					return true
+				}
+				h.backendError(w, err)
+				return true // submission may have happened: no automatic reset-replay
+			}
+			// Provably pre-submission for this turn, and every earlier
+			// record turn was an inert ACK import: falling back to the
+			// shared-project reseed (which replays the same record) cannot
+			// duplicate execution.
+			log.Printf("[openai] session=%s lane=%s rotation_fallback reason=pre_submission_navigation record_turn=%d; using shared-project reset-replay", id, lane, i+1)
+			restore()
+			return false
+		}
+		if res.ProjectURL != "" {
+			newProjectURL = res.ProjectURL
+		}
+		threadURL = res.URL
+		if strings.TrimSpace(res.Answer) != "ACK" {
+			s.URL = threadURL
+			if serr := h.save(); serr != nil {
+				h.backendError(w, serr)
+				return true
+			}
+			h.backendError(w, errors.New("rotation record import did not acknowledge with ACK; session remains uncertain"))
+			return true
+		}
+		log.Printf("[openai] session=%s lane=%s rotation record imported chunk=%d/%d thread=%s", id, lane, i+1, len(recordTurns), threadURL)
+	}
+	cardOpt := chatgpt.TurnOptions{Prompt: prompt, URL: threadURL, Attachments: atts, Thinking: thinking}
+	if threadURL == "" {
+		cardOpt.ProjectURL, cardOpt.ProjectName = projectURL, name
+	}
+	res, err := h.client.AskThreadTurn(r.Context(), cardOpt)
+	seedTurns++
+	seedBytes += len(prompt)
 	if err != nil {
 		if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
 			s.URL = res.URL
@@ -368,7 +446,10 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	s.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	s.URL = res.URL
 	if res.ProjectURL != "" {
-		s.Project = res.ProjectURL
+		newProjectURL = res.ProjectURL
+	}
+	if newProjectURL != "" {
+		s.Project = newProjectURL
 	} else if projectURL != "" {
 		s.Project = projectURL
 	}
@@ -376,11 +457,16 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	s.ToolsFP = toolsFP
 	s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
 	s.RepairPendingPrompt = ""
+	// The new thread URL is known only now: overwrite any previous event's
+	// entry with this rotation's linkage so evidence never goes stale.
+	s.ReseedFrom = evidencePlan.oldURL
+	s.ReseedEvidence = evidencePlan.evidence(s.URL, seedTurns, seedBytes) + " via=rotation"
 	if err := h.save(); err != nil {
 		*s = beforeCommit
 		h.backendError(w, err)
 		return true
 	}
+	h.appendSent(sentEntry{Event: "reseed", Session: id, URL: s.URL, PromptHash: promptHash(prompt), Bytes: seedBytes, Note: evidencePlan.note(s.URL) + " via=rotation"})
 	log.Printf("[openai] session=%s lane=%s done decision=rotation tool_calls=%d answer_bytes=%d thread=%s project=%s", id, lane, len(out.Calls), len(res.Answer), res.URL, s.Project)
 	h.respond(w, req, out)
 	return true

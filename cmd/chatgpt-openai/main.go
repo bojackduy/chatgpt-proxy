@@ -1418,26 +1418,30 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// failing or concatenating it into one paste. The old thread is
 			// left untouched.
 			decision, start, url = "reset-replay", 0, ""
-			// Flag-gated project-per-session: rotate into the session's
-			// dedicated project instead of reset-replaying. serveRotation
-			// falls back only on a proved pre-submission navigation failure;
-			// a possibly submitted turn remains protected.
-			if projectPerSessionEnabled() && id != "" && !resync {
-				if h.serveRotation(w, r, id, lane, req, s) {
-					return
-				}
-				log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
-			}
 			// History-rewrite reseed: the incoming history is a coherent
 			// rewrite (revert/fork/compaction) of committed state, so seed
 			// a fresh thread with the rewritten timeline plus carried
-			// executed results instead of replaying blind. Incoherent
-			// input plans nothing and keeps the legacy reset-replay below
-			// (clean sessions hold no uncertainty to protect); a plan
-			// armed by the dirty branch above (uncertainty abandoned)
-			// is reused as-is.
+			// executed results instead of replaying blind. The classifier
+			// runs BEFORE any rotation below so the rotation travels with
+			// the prior-execution record and always commits fresh evidence
+			// instead of shadowing the reseed. Incoherent input plans
+			// nothing and keeps the legacy reset-replay below (clean
+			// sessions hold no uncertainty to protect); a plan armed by
+			// the dirty branch above (uncertainty abandoned) is reused
+			// as-is.
 			if reseedPlan == nil {
 				reseedPlan = h.planCleanReseed(s, req)
+			}
+			// Flag-gated project-per-session: rotate into the session's
+			// dedicated project instead of reset-replaying, carrying the
+			// plan above record-first. serveRotation falls back only on a
+			// proved pre-submission navigation failure; a possibly
+			// submitted turn remains protected.
+			if projectPerSessionEnabled() && id != "" && !resync {
+				if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
+					return
+				}
+				log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
 			}
 			if reseedPlan != nil {
 				decision = "rewrite-reseed"
