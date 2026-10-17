@@ -87,6 +87,34 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 	if len(f.prompts) != 0 || f.reads != 1 || h.sessions["recover"].Dirty {
 		t.Fatal("recovery submitted or failed")
 	}
+	// A lost URL may be supplied explicitly, but is not evidence by itself:
+	// exact client fingerprint and full source/prompt verification still apply.
+	for _, valid := range []bool{false, true} {
+		h.sessions["recover"] = &session{Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected}
+		if !valid {
+			f.readErr = errors.New("stored user prompt does not exactly match original request")
+		} else {
+			f.readErr = nil
+		}
+		payload := struct {
+			completionsRequest
+			ThreadURL string `json:"thread_url"`
+		}{req, "https://chatgpt.com/c/stored"}
+		body, _ := json.Marshal(payload)
+		r := httptest.NewRequest("POST", "/v1/sessions/recover", bytes.NewReader(body))
+		r.Header.Set("X-Session-Id", "recover")
+		w := httptest.NewRecorder()
+		h.routes().ServeHTTP(w, r)
+		if valid && (w.Code != 200 || h.sessions["recover"].Dirty || h.sessions["recover"].URL != payload.ThreadURL) {
+			t.Fatal("verified lost URL did not recover", w.Code)
+		}
+		if !valid && (w.Code != 409 || !h.sessions["recover"].Dirty || h.sessions["recover"].URL != "") {
+			t.Fatal("candidate URL adopted without full prompt proof", w.Code)
+		}
+		if len(f.prompts) != 0 {
+			t.Fatal("lost URL recovery submitted a new turn")
+		}
+	}
 	cached := assistant(t, request(h, "recover", req))
 	if len(cached.ToolCalls) != 1 || len(f.prompts) != 0 {
 		t.Fatal("retry missed validated cache")

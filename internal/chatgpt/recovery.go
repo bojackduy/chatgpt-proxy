@@ -162,7 +162,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	if prompt == "" {
 		return TurnResult{}, errors.New("recovery requires a stored thread and exact original prompt")
 	}
-	snap, err := c.snapshotThread(ctx, url)
+	snap, err := c.snapshotThread(ctx, url, prompt)
 	if err != nil {
 		return TurnResult{}, err
 	}
@@ -250,7 +250,7 @@ func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
 // active adapter tab. Probe-phase failures are captured in the snapshot (not
 // returned) so ReadThreadTurn still reports a prompt mismatch first,
 // preserving adoption error order.
-func (c *Client) snapshotThread(ctx context.Context, url string) (threadSnapshot, error) {
+func (c *Client) snapshotThread(ctx context.Context, url string, expected ...string) (threadSnapshot, error) {
 	var snap threadSnapshot
 	if !threadPattern.MatchString(url) {
 		return snap, errors.New("recovery requires a stored thread and exact original prompt")
@@ -347,7 +347,7 @@ func (c *Client) snapshotThread(ctx context.Context, url string) (threadSnapshot
 	userText := normalizeRecoveryPrompt(corr.User)
 	snap.srcPath = "bubble"
 	if corr.UserID != "" {
-		original, err := originalUserText(tab, corr.UserID)
+		original, err := originalUserText(tab, corr.UserID, expected...)
 		if err != nil {
 			return snap, fmt.Errorf("recovery user source: %w", err)
 		}
@@ -454,7 +454,29 @@ const recoveryUserJS = `(() => {
 	  return {user: norm(parts.join('\n')), userID, answerNext: next, answers};
 	})()`
 
-func originalUserText(tab context.Context, id string) (string, error) {
+var equalLabelURLLink = regexp.MustCompile(`\[(https?://[^\s\[\]()]+)\]\((https?://[^\s\[\]()]+)\)`)
+
+// Return a source projection only if it binds the ENTIRE expected prompt.
+// The source's declared Markdown serializer may wrap a bare URL with itself
+// as label and target. Unequal labels/targets and other characters stay exact.
+func projectSourceURLLinks(text, expected string) string {
+	if normalizeRecoveryPrompt(text) == normalizeRecoveryPrompt(expected) {
+		return text
+	}
+	projected := equalLabelURLLink.ReplaceAllStringFunc(text, func(link string) string {
+		parts := equalLabelURLLink.FindStringSubmatch(link)
+		if parts[1] == parts[2] {
+			return parts[1]
+		}
+		return link
+	})
+	if normalizeRecoveryPrompt(projected) == normalizeRecoveryPrompt(expected) {
+		return projected
+	}
+	return text
+}
+
+func originalUserText(tab context.Context, id string, expected ...string) (string, error) {
 	var source struct {
 		Text     string
 		Markdown bool
@@ -492,5 +514,8 @@ func originalUserText(tab context.Context, id string) (string, error) {
 	// Detached parse only: no HTML, scripts, links or resources enter the page.
 	decode := fmt.Sprintf(`(() => {const d = new DOMParser().parseFromString(%s, 'text/html');for(const e of d.querySelectorAll('br'))e.replaceWith(d.createTextNode('\n'));for(const e of d.querySelectorAll('p'))e.append(d.createTextNode('\n'));return d.body.textContent || '';})()`, strconv.Quote(rendered.String()))
 	err := chromedp.Run(tab, chromedp.Evaluate(decode, &text))
+	if err == nil && len(expected) == 1 {
+		text = projectSourceURLLinks(text, expected[0])
+	}
 	return text, err
 }

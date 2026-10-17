@@ -753,6 +753,17 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 		if err != nil && !submissionAttempted {
 			err = errors.Join(ErrNotSubmitted, err)
 		}
+		if err != nil && submissionAttempted && out.URL == "" && c.tab != nil {
+			// A failed click or cancelled poll can return before the normal
+			// URL capture. Preserve an already-minted thread for read-only
+			// recovery; never replace it with a project/homepage URL.
+			probe, done := context.WithTimeout(c.tab, 2*time.Second)
+			defer done()
+			var url string
+			if chromedp.Run(probe, chromedp.Location(&url)) == nil && threadPattern.MatchString(url) {
+				out.URL = url
+			}
+		}
 	}()
 	tab, err := c.tabCtx(ctx)
 	if err != nil {
@@ -1292,6 +1303,13 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 		}
 		if empty.expired(st, time.Now()) {
 			return "", "", ErrMissingAnswer
+		}
+		if st.SourceVerified && st.Fresh && st.Complete && st.Last != "" && !st.StopBtn && !st.ContinueBtn {
+			// Finished/end_turn source and ancestry were verified in one
+			// readback. Repeating the same authenticated fetch twice adds
+			// seconds without providing another completion guarantee.
+			log.Printf("[chatgpt] target=%s final_source_verified bytes=%d", chromedp.FromContext(tab).Target.TargetID, len(st.Last))
+			return strings.TrimSpace(st.Last), strings.TrimSpace(st.Reasoning), nil
 		}
 		if st.StopBtn {
 			stablePolls = 0

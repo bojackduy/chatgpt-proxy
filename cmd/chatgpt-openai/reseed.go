@@ -213,8 +213,9 @@ func carryExecuted(s *session, pending []message, incoming []message) (carried [
 // adoption nor auto-resync could bind, so abandoning it silently would lose
 // work — fail closed to 409/422, never guess.
 func (h *handler) sentCompletedFor(session, url, promptHash string) bool {
-	for i := len(h.sentLog) - 1; i >= 0; i-- {
-		e := h.sentLog[i]
+	entries := h.sentEntries()
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
 		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
 			return true
 		}

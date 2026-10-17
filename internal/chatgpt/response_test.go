@@ -372,6 +372,31 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "" {
 			t.Fatal("non-DIL empty rendering adopted unverified prose", err)
 		}
+		// Actual 2026-10-17 history import: completed final source contains
+		// exactly ACK, but its non-DIL renderer shows an empty answer.
+		m["content"] = map[string]any{"content_type": "text", "parts": []string{"ACK"}}
+		publish()
+		set(emptyPlain)
+		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "ACK" || !got.SourceVerified {
+			t.Fatal("exact completed import acknowledgement was lost", err)
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackFetch=window.fetch;window.__ackReads=0;window.fetch=(...a)=>{if(String(a[0]).includes('/backend-api/conversation/'))window.__ackReads++;return window.__ackFetch(...a)}`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		text, _, waitErr := (&Client{}).waitForAnswer(context.Background(), tab, time.Second, time.Millisecond, nil, before.IDs)
+		var reads int
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackReads`, &reads), chromedp.Evaluate(`window.fetch=window.__ackFetch;delete window.__ackFetch;delete window.__ackReads`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if waitErr != nil || text != "ACK" || reads != 1 {
+			t.Fatal("completed source was redundantly fetched for stability polls", waitErr, text, reads)
+		}
+		node["parent"] = "different-user"
+		publish()
+		if got, _ := responseProbe(tab, before.IDs); got.Last != "" {
+			t.Fatal("unrelated acknowledgement adopted")
+		}
+		node["parent"] = "fixture-user"
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{mixed}}
 		publish()
 		set(plainHTML)

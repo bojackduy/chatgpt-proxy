@@ -15,6 +15,20 @@ import (
 )
 
 func TestSameURL(t *testing.T) {
+	for _, tc := range []struct {
+		stored, expected string
+		match            bool
+	}{
+		{"before [https://example.com/path](https://example.com/path) after", "before https://example.com/path after", true},
+		{"[https://example.com/a](https://example.com/b)", "https://example.com/a", false},
+		{"before [https://example.com/a](https://example.com/a) changed", "before https://example.com/a after", false},
+		{`literal \* and [https://example.com](https://example.com)`, `literal * and https://example.com`, false},
+	} {
+		got := projectSourceURLLinks(tc.stored, tc.expected)
+		if (normalizeRecoveryPrompt(got) == normalizeRecoveryPrompt(tc.expected)) != tc.match {
+			t.Fatal("source URL projection lost full prompt binding", tc)
+		}
+	}
 	t.Run("URL defusing preserves full prompt identity", func(t *testing.T) {
 		for _, tc := range []struct {
 			want, actual string

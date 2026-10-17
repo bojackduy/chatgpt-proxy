@@ -3,6 +3,7 @@ package main
 import (
 	"chatgpt-proxy/internal/chatgpt"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -58,6 +59,9 @@ func shortHash12(full string) string {
 }
 
 func (h *handler) sentLogPath() string {
+	if h.transactionOwner != nil {
+		return h.transactionOwner.sentLogPath()
+	}
 	if h.statePath == "" {
 		return ""
 	}
@@ -65,6 +69,14 @@ func (h *handler) sentLogPath() string {
 }
 
 func (h *handler) appendSent(e sentEntry) {
+	if h.transactionOwner != nil {
+		h.transactionOwner.appendSent(e)
+		return
+	}
+	if h.parallel != nil {
+		h.parallel.mu.Lock()
+		defer h.parallel.mu.Unlock()
+	}
 	e.At = time.Now().UTC().Format(time.RFC3339)
 	h.sentLog = append(h.sentLog, e)
 	if len(h.sentLog) > maxSentLogMemory {
@@ -87,7 +99,41 @@ func (h *handler) appendSent(e sentEntry) {
 	defer f.Close()
 	if _, err := f.Write(append(b, '\n')); err != nil {
 		log.Printf("[openai] sent-log write: %v", err)
+		return
 	}
+	if err := f.Sync(); err != nil {
+		log.Printf("[openai] sent-log sync: %v", err)
+	}
+}
+
+// Parallel handlers are short-lived request snapshots. The durable log and
+// memory ring belong to their shared owner, just like the committed journal.
+func (h *handler) sentEntries() []sentEntry {
+	if h.transactionOwner != nil {
+		return h.transactionOwner.sentEntries()
+	}
+	if h.parallel != nil {
+		h.parallel.mu.Lock()
+		defer h.parallel.mu.Unlock()
+	}
+	return append([]sentEntry(nil), h.sentLog...)
+}
+
+func (h *handler) recordTurnOutcome(id, prompt, previousURL string, res chatgpt.TurnResult, err error, chunk, chunks int) {
+	disposition, answer := "completed", ""
+	if err != nil {
+		disposition = "interrupted"
+		if errors.Is(err, chatgpt.ErrNotSubmitted) {
+			disposition = "failed"
+		}
+	} else {
+		answer = promptHash(res.Answer)
+	}
+	url := res.URL
+	if url == "" {
+		url = previousURL
+	}
+	h.appendSent(sentEntry{Event: disposition, Session: id, URL: url, PromptHash: promptHash(prompt), Bytes: len(prompt), Chunk: chunk, Chunks: chunks, AnswerHash: answer})
 }
 
 // sentLogTail parses the durable file tail (last n lines), oldest first.
@@ -123,12 +169,13 @@ func (h *handler) sentLogTail(n int) []sentEntry {
 }
 
 // lastSentFor returns the most recent entry for a session, scanning memory
-// first and the durable file tail (last 300 lines) on a miss — e.g. after a
-// restart that loaded the journal but not the ring.
+// first and the durable log on a miss — e.g. after a restart. An old session's
+// record must not disappear merely because other sessions made 300 entries.
 func (h *handler) lastSentFor(session string) *sentEntry {
-	for i := len(h.sentLog) - 1; i >= 0; i-- {
-		if h.sentLog[i].Session == session {
-			e := h.sentLog[i]
+	entries := h.sentEntries()
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Session == session {
+			e := entries[i]
 			return &e
 		}
 	}
@@ -141,12 +188,8 @@ func (h *handler) lastSentFor(session string) *sentEntry {
 		return nil
 	}
 	lines := strings.Split(string(b), "\n")
-	start := 0
-	if len(lines) > 300 {
-		start = len(lines) - 300
-	}
 	var last *sentEntry
-	for _, ln := range lines[start:] {
+	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
@@ -170,9 +213,10 @@ func (h *handler) lastSentFor(session string) *sentEntry {
 // submitted to the given thread URL (memory ring first, durable file tail on
 // a miss). A nil return means the thread cannot be tied to this session.
 func (h *handler) sentEntryForThread(session, url string) *sentEntry {
-	for i := len(h.sentLog) - 1; i >= 0; i-- {
-		if h.sentLog[i].Session == session && h.sentLog[i].URL == url {
-			e := h.sentLog[i]
+	entries := h.sentEntries()
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Session == session && entries[i].URL == url {
+			e := entries[i]
 			return &e
 		}
 	}
@@ -185,12 +229,8 @@ func (h *handler) sentEntryForThread(session, url string) *sentEntry {
 		return nil
 	}
 	lines := strings.Split(string(b), "\n")
-	start := 0
-	if len(lines) > 300 {
-		start = len(lines) - 300
-	}
 	var last *sentEntry
-	for _, ln := range lines[start:] {
+	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
@@ -228,5 +268,5 @@ func (h *handler) sentDiagnosis(id string, s *session) string {
 	if last := h.lastSentFor(id); last != nil {
 		return fmt.Sprintf("sent-log: last submit %s (%s %s) with no stored thread URL; vs pending %s", shortHash12(last.PromptHash), last.Event, last.At, pending)
 	}
-	return "sent-log: no submission recorded for this session (genuinely unknown thread state)"
+	return "sent-log: no submission recorded in the durable log; legacy or previously unlogged path is possible; outcome needs validation"
 }

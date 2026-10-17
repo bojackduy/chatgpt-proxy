@@ -335,12 +335,16 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		if threadURL == "" {
 			opt.ProjectURL, opt.ProjectName = projectURL, name
 		}
+		h.appendSent(sentEntry{Event: "submitted", Session: id, URL: threadURL, PromptHash: promptHash(rt.prompt), Bytes: len(rt.prompt), Chunk: i + 1, Chunks: len(recordTurns) + 1, Note: "rotation-import intent"})
 		res, err := h.client.AskThreadTurn(r.Context(), opt)
+		h.recordTurnOutcome(id, rt.prompt, threadURL, res, err, i+1, len(recordTurns)+1)
 		seedTurns++
 		seedBytes += len(rt.prompt)
 		if err != nil {
 			if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
-				s.URL = res.URL
+				if res.URL != "" {
+					s.URL = res.URL
+				}
 				if serr := h.save(); serr != nil {
 					h.backendError(w, serr)
 					return true
@@ -360,6 +364,11 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 			newProjectURL = res.ProjectURL
 		}
 		threadURL = res.URL
+		s.URL = threadURL
+		if err := h.save(); err != nil {
+			h.backendError(w, err)
+			return true
+		}
 		if strings.TrimSpace(res.Answer) != "ACK" {
 			s.URL = threadURL
 			if serr := h.save(); serr != nil {
@@ -375,12 +384,22 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	if threadURL == "" {
 		cardOpt.ProjectURL, cardOpt.ProjectName = projectURL, name
 	}
+	// Bind this actual final prompt only after any inert imports complete.
+	s.URL, s.Phase, s.PendingPrompt = threadURL, "final", prompt
+	if err := h.save(); err != nil {
+		h.backendError(w, err)
+		return true
+	}
+	h.appendSent(sentEntry{Event: "submitted", Session: id, URL: threadURL, PromptHash: promptHash(prompt), Bytes: len(prompt), Chunk: len(recordTurns) + 1, Chunks: len(recordTurns) + 1, Note: "rotation-final intent"})
 	res, err := h.client.AskThreadTurn(r.Context(), cardOpt)
+	h.recordTurnOutcome(id, prompt, threadURL, res, err, len(recordTurns)+1, len(recordTurns)+1)
 	seedTurns++
 	seedBytes += len(prompt)
 	if err != nil {
 		if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
-			s.URL = res.URL
+			if res.URL != "" {
+				s.URL = res.URL
+			}
 			if serr := h.save(); serr != nil {
 				h.backendError(w, serr)
 				return true

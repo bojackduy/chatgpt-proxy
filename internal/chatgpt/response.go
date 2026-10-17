@@ -24,6 +24,7 @@ type responseState struct {
 	Fresh          bool     `json:"fresh"`
 	Complete       bool     `json:"complete"`
 	SourceRequired bool     `json:"sourceRequired"`
+	SourceVerified bool     `json:"-"` // exact completed final readback, not a DOM inference
 }
 
 type emptyAnswerWatch struct {
@@ -72,6 +73,7 @@ func responseProbe(tab context.Context, baseline []string) (responseState, error
 		js := "(async () => {const recheck = () => " + probe + "; const st = recheck(); if (st.lastID !== " + string(expected) + ") return '';" + nullDILWireJS + "})()"
 		if rerr := chromedp.Run(read, chromedp.Evaluate(js, &recovered, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); rerr == nil && recovered != "" {
 			st.Last = recovered
+			st.SourceVerified = true
 		} else if st.SourceRequired {
 			return st, errors.New("completed protocol source could not be verified against its DOM identity; rendered arguments are not safe")
 		}
@@ -129,7 +131,10 @@ const nullDILWireJS = `
     // Refuse rather than rewriting source: JSON strings inside exact wrappers
     // (e.g. {"value":"<escape>"}) remain byte-for-byte unchanged.
     if (/(?:^|\n)[ \t]*(?:<escape>\s*<\/escape>[ \t]*)+(?=\n|$)/.test(text)) return '';
-     if (!bound || !((st.sourceRequired || !dilRoot) ? /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/ : /^<opencode(?:\\)?_bridge(?:\\)?_call\b/).test(text)) return '';
+     // History imports can finish with an exact ACK source and an empty
+     // renderer too. Do not expand this to arbitrary unrendered prose.
+     const acknowledgement = text.trim() === 'ACK';
+     if (!bound || (!acknowledgement && !((st.sourceRequired || !dilRoot) ? /<\/?opencode(?:\\)?_bridge(?:\\)?_call\b/ : /^<opencode(?:\\)?_bridge(?:\\)?_call\b/).test(text))) return '';
     // React can finish hydrating this SAME final answer while source fetches
     // await network. Visual text/sourceRequired can change without identity
     // changing. Fence on immutable source IDs, completion and user ancestry,

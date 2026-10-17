@@ -50,6 +50,8 @@ function laneProviderEntry(lane: string): any {
       package: V2_PROVIDER_PACKAGE,
       settings: {
         baseURL: ADAPTER_BASE_URL,
+        headerTimeout: false,
+        chunkTimeout: false,
         timeout: false,
         ...(lane === "main" ? {} : { headers: { "X-OpenCode-Request-Lane": lane } }),
       },

@@ -768,7 +768,9 @@ func (h *handler) requestFormatRepair(r *http.Request, id, lane, url string, req
 		return chatgpt.TurnResult{}, repairStoreFailed
 	}
 	log.Printf("[openai] session=%s lane=%s format repair requested", id, lane)
+	h.appendSent(sentEntry{Event: "submitted", Session: id, URL: url, PromptHash: promptHash(prompt), Bytes: len(prompt), Chunk: 1, Chunks: 1, Note: "format-repair intent"})
 	res, err := h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{Prompt: prompt, URL: url, Thinking: thinking})
+	h.recordTurnOutcome(id, prompt, url, res, err, 1, 1)
 	if err != nil {
 		if errors.Is(err, chatgpt.ErrNotSubmitted) || chatgpt.IsNavigateError(err) {
 			s.PendingPrompt, s.RepairPendingPrompt = oldPrompt, ""

@@ -1,5 +1,76 @@
 # Backlog
 
+## 2026-10-17: empty-rendered history ACK and repeated source-fetch latency
+
+**Fixed and deployed locally; uncommitted.** In ses_ebbd828b, a187950-byte
+history import (chunk1/7) generated from18:18:57 to18:19:29, but rendered zero
+answer bytes and failed missing-answer at18:19:45. The source-bound finished
+final was exactly `ACK` (3bytes), not empty or a malformed tool call. Its decoded
+full input normalized hash equals sent-log f21d3815…; user/assistant ancestry
+and completion/end_turn are verified. The fallback supported protocol source
+but not this acknowledgement. It now admits only exact trimmed ACK in addition
+to the existing protocol cases, never arbitrary hidden prose; other identities
+and unfinished answers remain rejected.
+
+Read-only production ReadThreadTurn on the original conversation returned exact
+ACK in29.2s, with the full original input hash verified and journal SHA unchanged.
+This verifies readback, NOT completion of the remaining six import chunks or
+execution/delivery of the user's final task. The interrupted replay checkpoint
+is preserved and continues through the existing replay phase path.
+
+Latency evidence: an earlier finished answer was observed18:18:22 but returned
+18:18:35 after two duplicate source-verification polls. responseState now marks
+an exact completed-final readback SourceVerified; waitForAnswer returns it once,
+without two redundant authenticated fetches. Ordinary renderer-only answers
+retain stability checks. Existing DOM suite proves exact ACK recovery, wrong
+ancestry refusal, and exactly one source fetch for this verified final.
+Full vet/tests/race/build passed. Guarded idle deployment preserved journal hash
+and returned ready=true active0/available2. This is not incremental streaming
+or a fix for every visual-answer variant, rotation cause or recovery UX case.
+
+## 2026-10-17: parallel sent-log ownership and lost rotation target
+
+**Implemented and deployed locally; uncommitted.** Request-local parallel
+handlers did not inherit statePath or forward sent-log operations to the shared
+owner. Their logs vanished after each request, leaving no durable sent-log even
+though browser submissions occurred. Rotation imports/finals and format repairs
+also bypassed submission logging. These paths now log intent/outcome, share the
+owner's synchronized ring/file, sync appended records and retain old-session
+lookup beyond the previous 300-line tail. Diagnostic absence no longer claims
+that no browser action happened. Intent is not proof of a successful Send.
+
+Error paths preserve an observed conversation URL even for cancelled polls or
+failed send actions, and rotation no longer replaces a known target with an
+empty failed return. Recovery can accept an explicit thread_url only with the
+exact pending request, restricted ChatGPT URL and full prompt/source proof;
+candidate failure leaves the journal untouched. It cannot override a different
+already-stored target or manufacture historical sent-log records.
+
+Read-only inspection of ses_ebbd828b showed four equal-label/equal-target URL
+wrappers in declared Markdown source accounting for exactly119 extra characters.
+An optional source projection is accepted ONLY when the entire projected prompt
+matches; literal argument backslashes and unequal links remain significant.
+The installed /recover returned HTTP200 in11.14s, recovered1698B with2 validated
+cached calls, Dirty=false,105messages, restored thread6ad30058…, all other
+journals semantically unchanged. No model generation or tool execution occurred.
+The client has not been proved to consume those calls. Tests/vet/race/build
+passed, including durable parallel log/restart, rotation lineage and candidate
+target rejection cases, using existing test files/functions.
+
+Initial guarded deployment refused an active turn. A later idle deployment
+installed the binaries, but readiness exposed a separately dead Chrome/profile
+lock. The owner PID was proved absent and its Unix socket refused connections;
+only stale Singleton symlinks were moved to a private diagnostic backup before
+relaunching the dedicated ChatGPT browser. Final readiness:9222, logged-in,
+composer present, active0/available2. No active browser was killed.
+
+**Still open:** an explicit client-authoritative continuation/abandonment policy
+that does not require original-response adoption for a new ordinary user turn.
+The current exact pending-response recovery guard still exists; do not claim
+all uncertainty errors are eliminated or that history rewrites themselves are
+the same as unknown submission outcomes. Ordinary ChatGPT output img extraction
+also remains distinct from inline SVG rasterization and Gemini image handling.
+
 ## 2026-10-15 ec597: source-bound recovery, not guessed text matching
 
 Direct investigation of `ses_ec5972388ffeVexnQwYcnwkZ1K` traced the current

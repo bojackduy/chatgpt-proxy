@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -200,7 +201,10 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, errors.New("session header required"))
 		return
 	}
-	var supplied *completionsRequest
+	var supplied *struct {
+		completionsRequest
+		ThreadURL string `json:"thread_url,omitempty"`
+	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&supplied); err != nil {
 			apiError(w, 400, err)
@@ -227,7 +231,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with a distinct new ordinary user message at the end of the authoritative transcript"))
 		return
 	}
-	if s == nil || !s.Dirty || s.URL == "" {
+	if s == nil || !s.Dirty {
 		apiError(w, 409, fmt.Errorf("no uncertain stored thread for this session; %s", h.sentDiagnosis(id, s)))
 		return
 	}
@@ -236,8 +240,20 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := s.PendingRequest
-	if supplied != nil && requestFingerprint(*supplied) != requestFingerprint(*req) {
+	if supplied != nil && requestFingerprint(supplied.completionsRequest) != requestFingerprint(*req) {
 		apiError(w, 409, fmt.Errorf("supplied request does not match the exact original pending request; %s", h.sentDiagnosis(id, s)))
+		return
+	}
+	threadURL := s.URL
+	if supplied != nil && supplied.ThreadURL != "" {
+		if !regexp.MustCompile(`^https://chatgpt\.com/(?:g/g-p-[a-zA-Z0-9-]+/)?c/[a-zA-Z0-9-]+$`).MatchString(supplied.ThreadURL) || (s.URL != "" && s.URL != supplied.ThreadURL) {
+			apiError(w, 422, errors.New("recovery thread_url must be an exact ChatGPT conversation URL and cannot replace an existing journal target"))
+			return
+		}
+		threadURL = supplied.ThreadURL
+	}
+	if threadURL == "" {
+		apiError(w, 409, fmt.Errorf("pending turn has no saved thread URL; supply a candidate thread_url with the exact pending request for read-only full-prompt validation; %s", h.sentDiagnosis(id, s)))
 		return
 	}
 	prompt := s.PendingPrompt
@@ -246,9 +262,10 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 503, errors.New("backend cannot inspect stored responses"))
 		return
 	}
-	res, err := backend.ReadThreadTurn(r.Context(), s.URL, prompt)
+	res, err := backend.ReadThreadTurn(r.Context(), threadURL, prompt)
 	if errors.Is(err, chatgpt.ErrCompletedEmpty) {
 		old := *s
+		s.URL = threadURL // completed-empty proof includes exact pending binding
 		s.PendingRequest, s.PendingPrompt = req, prompt
 		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
 			*s = old
@@ -263,7 +280,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		// shape: structural adoption failure plus a verifiably complete
 		// thread answer that the sent-log ties to this session.
 		var mismatch *chatgpt.UserBubbleMismatchError
-		if errors.As(err, &mismatch) && h.tryAutoResync(r, id, s, mismatch) {
+		if s.URL != "" && errors.As(err, &mismatch) && h.tryAutoResync(r, id, s, mismatch) {
 			out := s.Result
 			writeJSON(w, 200, map[string]any{"recovered": true, "session": id, "cached_tool_calls": len(out.Calls), "auto_resync": s.AutoResyncEvidence, "next": "retry the exact original completion request to receive the validated cache; transplanted calls were recorded, never executed by recovery"})
 			return
@@ -275,6 +292,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Retain the bound original request for the new-user continuation gate.
 		old := *s
+		s.URL = threadURL // source-bound answer was received, even if invalid
 		s.PendingRequest, s.PendingPrompt = req, prompt
 		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
 			*s = old
@@ -301,6 +319,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		out.Calls[i].ID = fmt.Sprintf("call_%x", sum[:12])
 	}
 	recovered := *s
+	recovered.URL = threadURL
 	recovered.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	recovered.Fingerprint, recovered.Result, recovered.Dirty, recovered.Phase = fp, out, false, ""
 	recovered.ToolsFP = toolsFingerprint(req.Tools)
@@ -311,5 +330,6 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, err)
 		return
 	}
+	h.appendSent(sentEntry{Event: "recovered", Session: id, URL: recovered.URL, PromptHash: promptHash(prompt), Bytes: len(prompt), AnswerHash: promptHash(res.Answer), Note: "read-only exact-source validation; no submission or execution"})
 	writeJSON(w, 200, map[string]any{"recovered": true, "session": id, "cached_tool_calls": len(out.Calls), "response_bytes": len(res.Answer), "next": "retry the exact original completion request to receive the validated cache; no tools were executed by recovery"})
 }

@@ -34,7 +34,7 @@ type fakeBackend struct {
 	// projectEcho, when set, is returned as res.ProjectURL for
 	// project-targeted new chats (simulating the project mint).
 	projectEcho string
-	turn          func(context.Context, chatgpt.TurnOptions) (chatgpt.TurnResult, error)
+	turn        func(context.Context, chatgpt.TurnOptions) (chatgpt.TurnResult, error)
 }
 
 func (f *fakeBackend) AskThreadTurn(ctx context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
@@ -1187,6 +1187,13 @@ func TestConcurrentDuplicateAndCancellation(t *testing.T) {
 			if s == nil || s.Dirty || s.Result.ID == "" || len(s.Result.Calls) != 1 {
 				t.Fatalf("lost or dirty concurrent committed session %s: %+v", id, s)
 			}
+			entry := restarted.lastSentFor(id)
+			if entry == nil || entry.Event != "completed" || entry.URL != s.URL || entry.PromptHash == "" {
+				t.Fatalf("parallel transaction lost durable sent-log after restart: %s %+v", id, entry)
+			}
+			if h.lastSentFor(id) == nil {
+				t.Fatal("parallel owner's shared in-memory log lost", id)
+			}
 		}
 		if len(restarted.sessions) != 2 || len(h.parallel.locks) != 0 || len(h.parallel.clients) != 2 {
 			t.Fatal("canceled queue leaked journal/session lock/tab lease")
@@ -1729,7 +1736,7 @@ func TestCompactionCreatesNewThreadAndVideoGap(t *testing.T) {
 		if !strings.Contains(h2.sessions["rich"].ReseedEvidence, want) {
 			t.Fatalf("rotation evidence lacks %q: %s", want, h2.sessions["rich"].ReseedEvidence)
 		}
-	}	// Ladder degrades monotonically and bottoms out at the legacy shape,
+	} // Ladder degrades monotonically and bottoms out at the legacy shape,
 	// judged on the pre-rotation history the card was built from (the live
 	// session now holds the rotated transcript).
 	head := toolPrompt(req2)
@@ -2025,6 +2032,20 @@ func TestRotationUnificationCarriesRecordAndFreshEvidence(t *testing.T) {
 	last := loaded.lastSentFor("proj")
 	if last == nil || last.Event != "reseed" || last.URL != s.URL || !strings.Contains(last.Note, "old="+oldURL) || !strings.Contains(last.Note, "via=rotation") {
 		t.Fatalf("sent-log rotation linkage missing: %+v", last)
+	}
+	var imports, finals int
+	for _, e := range loaded.sentLogTail(50) {
+		if e.Event == "completed" && e.Session == "proj" && e.URL == s.URL {
+			if e.PromptHash == promptHash(f.prompts[2]) {
+				imports++
+			}
+			if e.PromptHash == promptHash(f.prompts[3]) {
+				finals++
+			}
+		}
+	}
+	if imports != 1 || finals != 1 {
+		t.Fatalf("rotation submissions missing from durable lineage: imports=%d finals=%d", imports, finals)
 	}
 }
 
