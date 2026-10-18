@@ -1,29 +1,34 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { Plugin as V2Plugin } from "@opencode/plugin"
 
+const LANE_MAIN = "chatgpt-web"
+const LANES = ["title", "summary", "compaction"] as const
+
+/** One lane decision, shared by both hosts: primary agent switches stay "main". */
+function laneFor(agent: string): string {
+  return (LANES as readonly string[]).includes(agent) ? agent : "main"
+}
+
+// ─── v1 (chat.headers) ─────────────────────────────────────────────────────
 // Scope this protocol to the local ChatGPT bridge provider; unrelated providers
-// and existing headers remain untouched. Primary agent switches stay "main".
+// and existing headers remain untouched.
 const server: Plugin = async () => ({
   "chat.headers": async (input, output) => {
-    if (input.model.providerID !== "chatgpt-web") return
-    output.headers["X-OpenCode-Request-Lane"] =
-      ["title", "summary", "compaction"].includes(input.agent) ? input.agent : "main"
+    if (input.model.providerID !== LANE_MAIN) return
+    output.headers["X-OpenCode-Request-Lane"] = laneFor(input.agent)
   },
 })
 
-// ─── v2 (opencode v2 host) ─────────────────────────────────────────────────
-// v2 has no chat.headers hook: per-request headers cannot be injected. Lane
-// identity therefore travels as STATIC per-entry headers instead — one
-// provider entry per auxiliary lane, all serving the same chatgpt-web model
-// against the same adapter. Agents already on chatgpt-web are retargeted to
-// their lane entry; every other agent (ollama, etc.) is left untouched.
-// Shape parity with the manual `chatgpt-web` provider entry is intentional:
-// same model id, same input modalities, same limits.
+// ─── v2 (session "model.request") ──────────────────────────────────────────
+// v2 has no chat.headers hook, but its session "model.request" hook carries the
+// same agent identity plus a mutable per-request header bag seeded from the
+// existing request headers. So lane identity travels per REQUEST and one
+// provider entry serves every lane, instead of one visible provider per lane.
+// evt.agent is the discriminator core already uses: the title agent for title
+// requests, the compaction agent for compaction, and the real session agent
+// (which maps to "main") for primary turns.
 const ADAPTER_BASE_URL = "http://127.0.0.1:8788/v1"
 const V2_PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible"
-
-const LANE_MAIN = "chatgpt-web"
-const LANES = ["title", "summary", "compaction"] as const
 
 function laneModel(): any {
   return {
@@ -41,11 +46,11 @@ function laneModel(): any {
   }
 }
 
-function laneProviderEntry(lane: string): any {
+function laneProviderEntry(): any {
   return {
     info: {
-      id: lane === "main" ? LANE_MAIN : `${LANE_MAIN}-${lane}`,
-      name: lane === "main" ? "ChatGPT Web (browser tool bridge)" : `ChatGPT Web (${lane} lane)`,
+      id: LANE_MAIN,
+      name: "ChatGPT Web (browser tool bridge)",
       activation: "enabled",
       package: V2_PROVIDER_PACKAGE,
       settings: {
@@ -53,7 +58,6 @@ function laneProviderEntry(lane: string): any {
         headerTimeout: false,
         chunkTimeout: false,
         timeout: false,
-        ...(lane === "main" ? {} : { headers: { "X-OpenCode-Request-Lane": lane } }),
       },
     },
     models: [laneModel()],
@@ -63,29 +67,20 @@ function laneProviderEntry(lane: string): any {
 async function setup(context: V2Plugin.Context) {
   const registrations: Array<{ dispose(): Promise<void> }> = []
   registrations.push(
-    await context.provider.transform((editor: any) => {
-      // Fill-missing-only: the manual opencode.jsonc entry (or the
-      // opencode-chatgpt plugin) owns `chatgpt-web` when present.
-      for (const lane of ["main", ...LANES]) {
-        const id = lane === "main" ? LANE_MAIN : `${LANE_MAIN}-${lane}`
-        if (!editor.get(id)) editor.add(laneProviderEntry(lane))
-      }
-    }),
+    await context.session.hook(
+      "model.request",
+      (input) => {
+        if (input.model.providerID !== LANE_MAIN) return
+        input.headers["X-OpenCode-Request-Lane"] = laneFor(input.agent)
+      },
+      { providerID: LANE_MAIN },
+    ),
   )
+  // Fill-missing-only: the manual opencode.jsonc entry (or the
+  // opencode-chatgpt plugin) owns `chatgpt-web` when present.
   registrations.push(
-    await context.agent.transform((editor: any) => {
-      // Retarget ONLY agents explicitly on chatgpt-web. Anything else
-      // (ollama title, other backends, unset models) is none of our business.
-      // Idempotent: an already lane-mapped agent no longer matches the guard.
-      for (const lane of LANES) {
-        const agent = editor.get(lane)
-        const model = agent?.model
-        if (model && (model.providerID === LANE_MAIN || (model as any).id === LANE_MAIN)) {
-          editor.update(lane, (a: any) => {
-            a.model = { id: "chatgpt-web", providerID: `${LANE_MAIN}-${lane}` }
-          })
-        }
-      }
+    await context.provider.transform((editor: any) => {
+      if (!editor.get(LANE_MAIN)) editor.add(laneProviderEntry())
     }),
   )
   return async () => {

@@ -243,15 +243,25 @@ Session identity comes from `X-Session-Id`, `x-opencode-session`, or
 send one of these headers themselves.
 
 OpenCode's title generator uses the **same session ID** as its main agent but
-different system/user messages. Install the `chat.headers` hook in
-`docs/opencode-session-lanes.ts` as an OpenCode plugin and restart OpenCode to
-load it. For the `chatgpt-web` provider it adds `X-OpenCode-Request-Lane`:
-`main` for primary agents (including agent switches), and `title`, `summary`, or
-`compaction` for internal agents. Auxiliary lanes have separate persistent
-journals and cannot overwrite or dirty the main thread. Clients may explicitly
-use `auxiliary` for other background requests. Unknown lanes return HTTP400.
-Without the hook/header, the adapter preserves legacy main-session behavior;
-it does not guess a request's purpose from tool counts or prompt text.
+different system/user messages. Install `docs/opencode-session-lanes.ts` as an
+OpenCode plugin and restart OpenCode to load it. It registers one hook per
+host, both keyed off the request's agent, and both adding `X-OpenCode-Request-Lane`
+for the `chatgpt-web` provider: `main` for primary agents (including agent
+switches), and `title`, `summary`, or `compaction` for internal agents.
+Auxiliary lanes have separate persistent journals and cannot overwrite or dirty
+the main thread. Clients may explicitly use `auxiliary` for other background
+requests. Unknown lanes return HTTP400. Without the hook/header, the adapter
+preserves legacy main-session behavior; it does not guess a request's purpose
+from tool counts or prompt text.
+
+v1 uses the `chat.headers` hook. v2 has no such hook, so it registers
+`session` `model.request` instead, which carries the same agent plus a mutable
+per-request header bag seeded from the request's existing headers. Lane identity
+therefore travels per request and **one** `chatgpt-web` provider entry serves
+every lane. Earlier revisions instead registered one visible provider per lane
+(`chatgpt-web-title`, `-summary`, `-compaction`) with the lane baked into static
+headers, because the per-request hook was assumed not to exist; that showed four
+duplicate "ChatGPT Web" entries in the v2 model picker.
 
 On a genuine prefix difference, logs report `prefix_mismatch` with the first
 zero-based message index, structural field, original content encodings,
