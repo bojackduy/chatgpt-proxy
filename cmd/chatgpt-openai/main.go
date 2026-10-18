@@ -156,8 +156,14 @@ type session struct {
 	Messages            []message
 	Fingerprint         string
 	RejectedFingerprint string `json:",omitempty"`
-	Result              result
-	Dirty               bool // an interrupted/failed submitted turn must not be silently retried
+	// RejectReason is the content-free class recorded with RejectedFingerprint:
+	// "empty_final" means the vendor backend proved the assistant produced no
+	// content at all; "tool_protocol" means the model produced output that
+	// failed strict tool validation. It selects the terminal 422 wording only;
+	// no acceptance decision reads it.
+	RejectReason string `json:",omitempty"`
+	Result       result
+	Dirty        bool // an interrupted/failed submitted turn must not be silently retried
 	// ToolsFP is the fingerprint of the tool set whose full schemas were last
 	// taught to this thread. The thread holds them server-side afterwards, so
 	// later turns only need a compact reminder (see toolReminder).
@@ -1355,7 +1361,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.RejectedFingerprint == fingerprint || (s.Phase == "invalid" && s.Fingerprint == fingerprint) {
-		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message to continue in a fresh thread"))
+		apiError(w, 422, errors.New(rejectionAdvice(s.RejectReason)))
 		return
 	}
 	if s.Fingerprint == fingerprint {
@@ -1582,7 +1588,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			}
 			if adopted {
 				if s.Phase == "invalid" {
-					apiError(w, 422, errors.New("completed model output was empty or invalid; no new tool calls were delivered; send a distinct new ordinary user message to continue"))
+					apiError(w, 422, errors.New(rejectionAdvice(s.RejectReason)))
 				} else {
 					h.respond(w, req, s.Result)
 				}
@@ -1636,7 +1642,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.URL = url
 		if id != "" {
-			if serr := h.rejectCompleted(s, fingerprint); serr != nil {
+			if serr := h.rejectCompleted(s, fingerprint, rejectToolProtocol); serr != nil {
 				h.backendError(w, serr)
 				return
 			}

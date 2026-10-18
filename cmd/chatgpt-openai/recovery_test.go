@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -740,5 +742,97 @@ func TestRewriteReseedNeverFiresOnAppend(t *testing.T) {
 		if e.Event == "reseed" {
 			t.Fatalf("happy path logged a reseed: %+v", e)
 		}
+	}
+}
+
+// rejectionClass reads the refusal class durably recorded with
+// RejectedFingerprint from the persisted journal, so the test observes what a
+// restart would see rather than in-memory bookkeeping.
+func rejectionClass(t *testing.T, statePath, id string) string {
+	t.Helper()
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]map[string]any
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	class, _ := state[id]["RejectReason"].(string)
+	return class
+}
+
+// A completed-empty final is cause (a): the vendor backend proved the assistant
+// produced no content at all. It must be recorded and reported as an empty
+// final, and that empty answer must never be parsed again — doing so produced a
+// SECOND rejection log that read as if the model had emitted an invalid call.
+func TestCompletedEmptyFinalIsReportedAsEmptyNotRefused(t *testing.T) {
+	req := weatherReq()
+	req.ToolChoice = "auto"
+	req.Messages = append(req.Messages, message{Role: "assistant", ToolCalls: []toolCall{{ID: "already-delivered", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`}}}}, message{Role: "tool", ToolCallID: "already-delivered", Content: "result already produced"})
+	f := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{"ACK", "continue safely"}}, expected: "full pending tool-result prompt", readErr: chatgpt.ErrCompletedEmpty}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", Messages: append([]message{}, req.Messages[:len(req.Messages)-1]...), PendingRequest: &req, PendingPrompt: f.expected}
+	h.sessions["recover"] = s
+
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(prev)
+
+	w := request(h, "recover", req)
+	if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
+		t.Fatalf("completed empty final not durably rejected: %d %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "completed model output was empty; no new tool calls were delivered") {
+		t.Fatalf("empty final misreported: %s", body)
+	}
+	if strings.Contains(body, "strict tool protocol validation") {
+		t.Fatalf("empty final reported as a protocol refusal: %s", body)
+	}
+	if got := rejectionClass(t, h.statePath, "recover"); got != "empty_final" {
+		t.Fatalf("empty final refusal class not durable: %q", got)
+	}
+	if n := strings.Count(logs.String(), "completed stored output rejected"); n != 0 {
+		t.Fatalf("empty final re-parsed into %d protocol refusal log(s): %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "bound completed empty final rejected"); n != 1 {
+		t.Fatalf("expected exactly one empty-final rejection log, got %d: %s", n, logs.String())
+	}
+}
+
+// A refusal of output the model DID produce is cause (b): the stored answer
+// failed strict tool validation. It must be recorded as a protocol refusal and
+// must never be reported as an empty final, including at the recover gate.
+func TestProtocolRefusalIsReportedAsRefusedNotEmpty(t *testing.T) {
+	req := weatherReq()
+	req.Messages = append([]message{{Role: "system", Content: "context"}}, req.Messages...)
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: `<opencode_bridge_call>{"name":"get_weather","arguments":{}}</opencode_bridge_call>`}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
+	h.sessions["recover"] = s
+	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	pending := req
+	s.Phase, s.PendingRequest, s.PendingPrompt = "final", &pending, f.expected
+
+	w := recoveryRequest(h, &req)
+	if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
+		t.Fatalf("schema-invalid stored answer not refused: %d %s", w.Code, w.Body.String())
+	}
+	if body := w.Body.String(); !strings.Contains(body, "strict protocol validation") || strings.Contains(body, "was empty") {
+		t.Fatalf("protocol refusal misreported: %s", body)
+	}
+	if got := rejectionClass(t, h.statePath, "recover"); got != "tool_protocol" {
+		t.Fatalf("protocol refusal class not durable: %q", got)
+	}
+	// The recover gate must name the refusal, never emptiness.
+	gate := recoveryRequest(h, nil)
+	if gate.Code != 422 || !strings.Contains(gate.Body.String(), "strict tool protocol validation") || strings.Contains(gate.Body.String(), "was empty") {
+		t.Fatalf("recover gate misreported the refusal: %d %s", gate.Code, gate.Body.String())
 	}
 }

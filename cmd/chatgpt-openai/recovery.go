@@ -40,15 +40,16 @@ func incompleteJournalError(w http.ResponseWriter) {
 // durably rejected, which the caller treats as adopted-as-invalid). A typed
 // structural mismatch is returned separately so the caller can attempt
 // hash-lineage auto-resync; every other failure returns adopted=false with a
-// nil mismatch and the caller keeps terminal uncertainty.
-func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatgpt.TurnResult, *chatgpt.UserBubbleMismatchError, bool) {
+// nil mismatch and the caller keeps terminal uncertainty. The returned class
+// is non-empty only when this read itself durably rejected the bound turn.
+func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatgpt.TurnResult, *chatgpt.UserBubbleMismatchError, bool, string) {
 	pending := s.PendingRequest
 	if pending == nil || s.PendingPrompt == "" || s.URL == "" {
-		return chatgpt.TurnResult{}, nil, false
+		return chatgpt.TurnResult{}, nil, false, ""
 	}
 	backend, ok := h.client.(recoveryBackend)
 	if !ok {
-		return chatgpt.TurnResult{}, nil, false
+		return chatgpt.TurnResult{}, nil, false, ""
 	}
 	// Errors that waiting cannot fix: the stored prompt genuinely does not
 	// match, or the thread holds multiple candidate answers.
@@ -68,33 +69,33 @@ func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatg
 		var err error
 		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt)
 		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
-			if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
-				return chatgpt.TurnResult{}, nil, false
+			if err := h.rejectCompleted(s, requestFingerprint(*pending), rejectEmptyFinal); err != nil {
+				return chatgpt.TurnResult{}, nil, false, ""
 			}
-			log.Printf("[openai] session=%s bound completed empty final rejected; no calls delivered", id)
-			return chatgpt.TurnResult{}, nil, true
+			log.Printf("[openai] session=%s bound completed empty final rejected class=%s; no calls delivered", id, rejectEmptyFinal)
+			return chatgpt.TurnResult{}, nil, true, rejectEmptyFinal
 		}
 		if err == nil {
-			return res, nil, true
+			return res, nil, true, ""
 		}
 		var mismatch *chatgpt.UserBubbleMismatchError
 		if errors.As(err, &mismatch) {
 			log.Printf("[openai] session=%s adoption impossible: %v", id, err)
-			return chatgpt.TurnResult{}, mismatch, false
+			return chatgpt.TurnResult{}, mismatch, false, ""
 		}
 		if deterministic(err) {
 			log.Printf("[openai] session=%s adoption impossible: %v", id, err)
-			return chatgpt.TurnResult{}, nil, false
+			return chatgpt.TurnResult{}, nil, false, ""
 		}
 		if time.Now().After(deadline) {
 			log.Printf("[openai] session=%s adoption timed out waiting for stored answer: %v", id, err)
-			return chatgpt.TurnResult{}, nil, false
+			return chatgpt.TurnResult{}, nil, false, ""
 		}
 		timer := time.NewTimer(5 * time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return chatgpt.TurnResult{}, nil, false
+			return chatgpt.TurnResult{}, nil, false, ""
 		case <-timer.C:
 		}
 	}
@@ -118,19 +119,26 @@ func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatg
 // tryAutoResync before giving up with a 409.
 func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (bool, *chatgpt.UserBubbleMismatchError) {
 	pending := s.PendingRequest
-	res, mismatch, adopted := h.readPendingTurn(r, id, s)
+	res, mismatch, adopted, rejected := h.readPendingTurn(r, id, s)
 	if mismatch != nil || !adopted {
 		return false, mismatch
 	}
 	if pending == nil {
 		return false, nil
 	}
+	// A read that already durably rejected this binding (an authoritative
+	// completed-empty proof from the vendor backend) left nothing to parse.
+	// Parsing that empty answer again would log a second rejection and report a
+	// genuine empty final as a protocol refusal of output the model produced.
+	if rejected != "" {
+		return true, nil
+	}
 	out, err := parseAnswer(res.Answer, *pending)
 	if err != nil {
-		if err := h.rejectCompleted(s, requestFingerprint(*pending)); err != nil {
+		if err := h.rejectCompleted(s, requestFingerprint(*pending), rejectToolProtocol); err != nil {
 			return false, nil
 		}
-		log.Printf("[openai] session=%s completed stored output rejected; no calls delivered", id)
+		log.Printf("[openai] session=%s stored answer refused class=%s; no calls delivered", id, rejectToolProtocol)
 		return true, nil
 	}
 	if out.Text == "" && len(out.Calls) == 0 {
@@ -164,12 +172,33 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (b
 	return true, nil
 }
 
+// Content-free classes for a durable Phase=="invalid" rejection. They keep a
+// genuine empty final (the model produced nothing) distinct from a refusal of
+// output the model did produce, in both the log and the terminal 422. Message
+// selection only: no acceptance decision reads either value.
+const (
+	rejectEmptyFinal   = "empty_final"
+	rejectToolProtocol = "tool_protocol"
+)
+
+// rejectionAdvice is the terminal 422 text for a Phase=="invalid" journal. An
+// empty final has no answer to retry, so a new ordinary user message is the
+// way forward; a protocol refusal means the model DID produce output, so it is
+// reported as a refusal rather than as empty output.
+func rejectionAdvice(reason string) string {
+	if reason == rejectEmptyFinal {
+		return "completed model output was empty; no new tool calls were delivered; send a distinct new ordinary user message to continue"
+	}
+	return "completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message to continue in a fresh thread"
+}
+
 // A finished, bound response that failed strict validation cannot have delivered
-// partial calls. Retain its fingerprint so exact retries never resubmit it.
-func (h *handler) rejectCompleted(s *session, fingerprint string) error {
+// partial calls. Retain its fingerprint and refusal class so exact retries
+// never resubmit it and diagnostics can name why it was refused.
+func (h *handler) rejectCompleted(s *session, fingerprint, reason string) error {
 	old := *s
 	s.Dirty, s.Phase, s.Fingerprint, s.Result = false, "invalid", fingerprint, result{}
-	s.RejectedFingerprint = fingerprint
+	s.RejectedFingerprint, s.RejectReason = fingerprint, reason
 	if err := h.save(); err != nil {
 		*s = old
 		return err
@@ -229,7 +258,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s != nil && s.Phase == "invalid" {
-		apiError(w, 422, errors.New("completed output was rejected; no tool calls were delivered; continue with a distinct new ordinary user message at the end of the authoritative transcript"))
+		apiError(w, 422, errors.New(rejectionAdvice(s.RejectReason)))
 		return
 	}
 	if s == nil || !s.Dirty {
@@ -268,7 +297,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		old := *s
 		s.URL = threadURL // completed-empty proof includes exact pending binding
 		s.PendingRequest, s.PendingPrompt = req, prompt
-		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
+		if serr := h.rejectCompleted(s, requestFingerprint(*req), rejectEmptyFinal); serr != nil {
 			*s = old
 			apiError(w, 500, serr)
 			return
@@ -295,7 +324,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		old := *s
 		s.URL = threadURL // source-bound answer was received, even if invalid
 		s.PendingRequest, s.PendingPrompt = req, prompt
-		if serr := h.rejectCompleted(s, requestFingerprint(*req)); serr != nil {
+		if serr := h.rejectCompleted(s, requestFingerprint(*req), rejectToolProtocol); serr != nil {
 			*s = old
 			apiError(w, 500, serr)
 			return

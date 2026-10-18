@@ -447,7 +447,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		} else if projectURL != "" {
 			s.Project = projectURL
 		}
-		if serr := h.rejectCompleted(s, fingerprint); serr != nil {
+		if serr := h.rejectCompleted(s, fingerprint, rejectToolProtocol); serr != nil {
 			h.backendError(w, serr)
 			return true
 		}
