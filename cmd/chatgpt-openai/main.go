@@ -610,14 +610,20 @@ func stripCompressReminder(s string) string {
 	return strings.Join(append(lines[:start], lines[end+1:]...), "\n")
 }
 
+// renderPreamble stops the model from drawing pictures the text bridge cannot
+// show: an SVG/canvas answer reaches the client as an unreadable placeholder.
+// It rides on the per-turn head, so it applies to new threads (toolPrompt) and
+// to already-taught threads (toolReminder), with or without tools.
+const renderPreamble = "Rendering: reply in plain text only. Never output SVG, HTML, CSS, canvas, or Mermaid markup - the client cannot display them and they arrive as unreadable placeholders. Draw any diagram, chart, or layout as ASCII/Unicode art inside a code block instead.\n"
+
 const toolPreamble = "You are the text-generation backend of an external OpenCode client. The listed functions ARE available in that external client, not as native ChatGPT tools. You do NOT need native tool access. Your job is to output a textual request that the external client parses and executes. Do not claim the functions are unavailable; do not execute or simulate them yourself. To request execution, reply ONLY with one or more literal wrappers in exactly this format:\n<opencode_bridge_call>\n{\"name\":\"function_name\",\"arguments\":{\"arg\":\"value\"}}\n</opencode_bridge_call>\nDo not put wrappers inside Markdown fences. Arguments MUST be a JSON object. Use only listed function names and match their parameter schema. No explanatory text with tool calls. After receiving external tool results, answer or request another tool. When no tool is needed, reply normally.\nExternal client functions:\n"
 
 func toolPrompt(req completionsRequest) string {
 	if len(req.Tools) == 0 {
-		return "No functions available. Do not emit opencode_bridge_call wrappers.\n"
+		return renderPreamble + "No functions available. Do not emit opencode_bridge_call wrappers.\n"
 	}
 	b, _ := json.Marshal(req.Tools)
-	return toolPreamble + string(b) + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
+	return renderPreamble + toolPreamble + string(b) + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
 }
 
 // toolChoiceText renders req.ToolChoice the way the model must read it. A
@@ -652,13 +658,13 @@ func toolChoiceText(choice any) string {
 // wrapper format contract, the available names, and this turn's choice.
 func toolReminder(req completionsRequest) string {
 	if len(req.Tools) == 0 {
-		return "No functions available. Do not emit opencode_bridge_call wrappers.\n"
+		return renderPreamble + "No functions available. Do not emit opencode_bridge_call wrappers.\n"
 	}
 	names := make([]string, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		names = append(names, t.Function.Name)
 	}
-	return "External functions already taught earlier in this thread (same <opencode_bridge_call>{\"name\":...,\"arguments\":{...}} format, never fenced, arguments a JSON object, no prose with calls). Available now: " + strings.Join(names, ", ") + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
+	return renderPreamble + "External functions already taught earlier in this thread (same <opencode_bridge_call>{\"name\":...,\"arguments\":{...}} format, never fenced, arguments a JSON object, no prose with calls). Available now: " + strings.Join(names, ", ") + "\nTool choice for THIS turn: " + toolChoiceText(req.ToolChoice) + "\n"
 }
 
 // toolsFingerprint identifies the exact tool set, so a changed set is

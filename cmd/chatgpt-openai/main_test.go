@@ -1285,7 +1285,10 @@ func maxPrompt(t *testing.T, f *fakeBackend, max int) {
 func TestFreshLongHistoryReplaysInChunkedTurns(t *testing.T) {
 	f := &fakeBackend{}
 	h := testHandler(f)
-	h.maxChars = 700
+	// The budget must leave room for the per-turn head (tool/rendering preamble)
+	// plus the chunk envelope; otherwise pieces split mid-message and the
+	// codeword fragments instead of landing in the first replay chunk.
+	h.maxChars = 1200
 	var msgs []message
 	for i := range 24 {
 		msgs = append(msgs, message{Role: "user", Content: fmt.Sprintf("turn %02d %s", i, strings.Repeat("x", 90))})
@@ -2114,6 +2117,23 @@ func TestParseAnswerToleratesImageMarkdown(t *testing.T) {
 	out, err := parseAnswer("See the result.\n\n![diagram]("+tinyPNGDataURL+")", completionsRequest{})
 	if err != nil || len(out.Calls) != 0 || !strings.Contains(out.Text, "![diagram](") {
 		t.Fatalf("image markdown rejected: %+v %v", out, err)
+	}
+}
+
+// An SVG/canvas answer reaches the text client as an unreadable placeholder,
+// so the plain-text rendering rule must ride EVERY head variant: full teaching,
+// compact reminder, and the no-functions path in both.
+func TestRenderingRuleRidesEveryHead(t *testing.T) {
+	req := weatherReq()
+	for _, tc := range []struct{ name, head string }{
+		{"teach full", toolPrompt(req)},
+		{"reminder", toolReminder(req)},
+		{"teach full without tools", toolPrompt(completionsRequest{})},
+		{"reminder without tools", toolReminder(completionsRequest{})},
+	} {
+		if !strings.Contains(tc.head, "ASCII/Unicode art") || !strings.Contains(tc.head, "Never output SVG") {
+			t.Fatalf("%s head missing the plain-text rendering rule: %q", tc.name, tc.head)
+		}
 	}
 }
 
