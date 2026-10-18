@@ -138,6 +138,7 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (b
 		return false, nil
 	}
 	out.Reasoning = res.Reasoning
+	out.Images = res.Images
 	b, _ := json.Marshal(struct {
 		Messages []message
 		Tools    []toolDef
@@ -307,6 +308,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Reasoning = res.Reasoning
+	out.Images = res.Images
 	b, _ := json.Marshal(struct {
 		Messages []message
 		Tools    []toolDef

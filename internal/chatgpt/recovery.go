@@ -148,6 +148,7 @@ type threadSnapshot struct {
 	answerNext  bool
 	answers     int
 	visible     responseState
+	images      []RasterImage
 	probeErr    error
 	emptyProved bool
 	emptyErr    error
@@ -224,7 +225,7 @@ func (c *Client) ReadLatestThreadTurn(ctx context.Context, url string) (string, 
 	if snap.visible.StopBtn || snap.visible.ErrorText || snap.visible.ContinueBtn || !snap.visible.Complete {
 		return "", TurnResult{}, errors.New("stored latest answer is not a finished rendering; inspect before recovery")
 	}
-	return snap.userText, TurnResult{Answer: snap.visible.Last, Reasoning: snap.visible.Reasoning, URL: url}, nil
+	return snap.userText, TurnResult{Answer: snap.visible.Last, Reasoning: snap.visible.Reasoning, Images: snap.images, URL: url}, nil
 }
 
 // gateThreadAnswer applies the exact-adoption finishedness proof to an
@@ -240,7 +241,7 @@ func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
 	if visible.Last == "" || visible.StopBtn || visible.ErrorText || visible.ContinueBtn || !visible.Complete {
 		return TurnResult{}, errors.New("finished stored response is not identically rendered; inspect before recovery")
 	}
-	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, URL: url}, nil
+	return TurnResult{Answer: visible.Last, Reasoning: visible.Reasoning, Images: snap.images, URL: url}, nil
 }
 
 // snapshotThread navigates a throwaway background target to url and captures
@@ -369,6 +370,13 @@ func (c *Client) snapshotThread(ctx context.Context, url string, expected ...str
 			return snap, nil
 		}
 		snap.emptyProved = empty
+	}
+	// Recovered turns must carry the same image parts as a live turn: rasterize
+	// the adopted answer's substantive SVGs from this owned background target.
+	// Best-effort — a failure leaves the "[SVG: ...]" text fallback standing, so
+	// recovery semantics never change.
+	if visible.Last != "" {
+		snap.images = c.rasterizeIDs(tab, visible.LastID)
 	}
 	return snap, nil
 }

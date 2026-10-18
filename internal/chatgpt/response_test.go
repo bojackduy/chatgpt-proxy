@@ -107,6 +107,47 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			t.Fatalf("possibly submitted turn repeated: clicks=%d err=%v", clicks, err)
 		}
 	})
+	t.Run("chrome icon svgs are not answer visuals", func(t *testing.T) {
+		// A real ChatGPT message with no ".markdown" container exposes the whole
+		// block, including 16-24px UI icon SVGs. Those are page chrome, not answer
+		// visuals: they must not become "[SVG: no accessible description...]"
+		// placeholders nor near-blank 40x40 PNGs (a 20px icon at 2x).
+		fixture := `<div data-message-author-role="user">ask</div>` +
+			`<div data-talvt-turn-state="complete"><div data-chatgpt-search-message-ids="msg-1">` +
+			`<h4 data-conversation-role="assistant">ChatGPT said:</h4><div>` +
+			`<button><svg width="20" height="20" aria-hidden="true"><path d="M0 0h20v20H0z"/></svg></button>` +
+			`<svg width="20" height="20"><path d="M0 0h20v20H0z"/></svg>` +
+			`<div data-d-component="row"><svg width="1em" height="1em" data-d-component="icon"><path d="M0 0h10v10H0z"/></svg><span>Alpha</span></div>` +
+			`<svg width="600" height="400" viewBox="0 0 600 400"><title>Diagram</title><rect width="600" height="400" fill="#eee"/></svg>` +
+			`</div></div></div>`
+		set(fixture)
+		st, err := responseProbe(tab, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(st.Last, "no accessible description") {
+			t.Fatalf("chrome icon serialized as an answer visual: %q", st.Last)
+		}
+		if strings.Count(st.Last, "[SVG: Diagram]") != 1 {
+			t.Fatalf("diagram fallback missing or duplicated: %q", st.Last)
+		}
+		// Rasterization must select only the substantive diagram. The previous
+		// unfiltered scan also returned the two icon-sized SVGs as blank PNGs.
+		var raw []struct {
+			Alt     string `json:"alt"`
+			DataURL string `json:"dataURL"`
+		}
+		js := "(" + rasterSVGJS + ")('msg-1')"
+		if err := chromedp.Run(tab, chromedp.Evaluate(js, &raw, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) != 1 || raw[0].Alt != "Diagram" {
+			t.Fatalf("rasterized chrome/icon svgs instead of the diagram: %+v", raw)
+		}
+		if !ValidRasterImage(raw[0].DataURL) {
+			t.Fatalf("diagram did not rasterize to a valid PNG: %d bytes", len(raw[0].DataURL))
+		}
+	})
 	old := `<div data-chatgpt-search-message-ids="old"><h4>ChatGPT said:</h4><div>OLD TOOL CALL</div></div>`
 	set(old + `<div data-chatgpt-search-message-ids="analysis"><h4>ChatGPT said:</h4><div>Thought for 4 seconds</div></div>`)
 	before, err := responseProbe(tab, nil)
@@ -648,6 +689,26 @@ func TestRasterImageValidation(t *testing.T) {
 	big := "data:image/png;base64," + strings.Repeat("iVBORw0KGgo", 700000)
 	if ValidRasterImage(big) {
 		t.Fatal("oversized payload accepted")
+	}
+}
+
+func TestRecoveredSnapshotThreadCarriesImages(t *testing.T) {
+	// gateThreadAnswer is what ReadThreadTurn returns; the images captured from
+	// the recovered DOM must survive into the returned TurnResult, otherwise the
+	// adoption/auto-resync paths serve the "[SVG: ...]" text fallback while a
+	// live turn of the same answer serves a PNG.
+	img := RasterImage{Alt: "diagram", DataURL: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="}
+	snap := threadSnapshot{
+		answerNext: true, answers: 1,
+		visible: responseState{Last: "here is the diagram", Complete: true},
+		images:  []RasterImage{img},
+	}
+	got, err := gateThreadAnswer("https://chatgpt.com/c/x", snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Images) != 1 || got.Images[0].DataURL != img.DataURL {
+		t.Fatalf("adopted snapshot dropped images: %+v", got)
 	}
 }
 

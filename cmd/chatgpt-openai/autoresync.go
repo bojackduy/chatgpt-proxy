@@ -112,6 +112,7 @@ func (h *handler) tryAutoResync(r *http.Request, id string, s *session, mismatch
 		return false
 	}
 	out.Reasoning = res.Reasoning
+	out.Images = res.Images
 	fp := requestFingerprint(*pending)
 	// Stable IDs derive exactly as adoption derives them, so a transplanted
 	// result is indistinguishable from an adopted one downstream.

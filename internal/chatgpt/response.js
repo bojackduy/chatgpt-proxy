@@ -93,6 +93,23 @@
       const children = (e, cell = false) => [...e.childNodes].map(n => render(n, cell)).join('');
       const block = s => '\n\n' + s + '\n\n';
       const codeBlocks = [];
+      // ChatGPT UI chrome ships 16-24px icon SVGs (copy/thumbs/action icons) that
+      // survive the cleanup below when they are not inside a button, toolbar, or
+      // aria-hidden node. Serializing them produced bogus
+      // "[SVG: no accessible description...]" placeholders for page UI. Judge by
+      // the width/height attributes: em/rem are font-sized icons; a real diagram
+      // is unitless-with-viewBox or hundreds of px.
+      const svgChrome = e => !!e.closest('button, [role="toolbar"], [hidden], [aria-hidden="true"], script, style, [data-markdown-copy="exclude"], [data-testid="thought-block"], [data-thinking], [data-d-component="badge"]');
+      const svgAutoDim = v => {
+        const m = /^\s*([\d.]+)\s*(px|em|rem|%)?\s*$/.exec(v || '');
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        return (m[2] === 'em' || m[2] === 'rem') ? n * 16 : n;
+      };
+      const svgIconSized = e => {
+        const w = svgAutoDim(e.getAttribute('width')), h = svgAutoDim(e.getAttribute('height'));
+        return w !== null && h !== null && w > 0 && h > 0 && Math.max(w, h) <= 24;
+      };
       const render = (e, cell = false) => {
         if (e.nodeType === Node.TEXT_NODE) {
           return escape(e.textContent.replace(/\s+/g, ' '));
@@ -112,6 +129,11 @@
           return nested ? flat : '\n- ' + flat + '\n';
         }
         if (tag === 'IMG' || tag.toLowerCase() === 'svg' || tag === 'CANVAS') {
+          // An icon-sized or chrome SVG is page UI, not answer content: never
+          // emit a "[SVG: no accessible description...]" placeholder for it.
+          // Rendered size is unavailable on a detached clone, so judge by the
+          // width/height attributes (em/rem are font-sized icons).
+          if (tag.toLowerCase() === 'svg' && (svgChrome(e) || svgIconSized(e))) return '';
           // Decorative icon in an observed textual row: the caption carries
           // its meaning. No inference from its danger/success color.
           if (e.matches('[data-d-component="icon"]') && e.closest('[data-d-component="row"]') &&

@@ -83,13 +83,25 @@ func (c *Client) rasterizeAnswerSVG(tab context.Context, answer string, baseline
 	if err != nil || st.LastID == "" {
 		return nil
 	}
+	return c.rasterizeIDs(tab, st.LastID)
+}
+
+// rasterizeIDs renders the substantive SVGs rendered under one assistant
+// message id to PNG data URLs. Shared by the normal path (rasterizeAnswerSVG)
+// and the recovery/adoption path (snapshotThread), so a recovered turn carries
+// the same image parts as a live one. Best-effort: any failure yields nil and
+// the "[SVG: ...]" text fallback stands.
+func (c *Client) rasterizeIDs(tab context.Context, lastID string) []RasterImage {
+	if lastID == "" {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(tab, 45*time.Second)
 	defer cancel()
 	var raw []struct {
 		Alt     string `json:"alt"`
 		DataURL string `json:"dataURL"`
 	}
-	js := "(" + rasterSVGJS + ")(" + strconv.Quote(st.LastID) + ")"
+	js := "(" + rasterSVGJS + ")(" + strconv.Quote(lastID) + ")"
 	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &raw,
 		chromedp.EvalAsValue,
 		func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) },

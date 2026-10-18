@@ -17,6 +17,7 @@ import (
 type inspectBackend struct {
 	*fakeBackend
 	answer, expected string
+	images           []chatgpt.RasterImage
 	readErr          error
 	reads            int
 }
@@ -26,7 +27,7 @@ func (f *inspectBackend) ReadThreadTurn(ctx context.Context, url, prompt string)
 	if prompt != f.expected {
 		return chatgpt.TurnResult{}, errors.New("original prompt mismatch")
 	}
-	return chatgpt.TurnResult{Answer: f.answer, URL: url}, f.readErr
+	return chatgpt.TurnResult{Answer: f.answer, Images: f.images, URL: url}, f.readErr
 }
 func recoveryRequest(h *handler, req *completionsRequest) *httptest.ResponseRecorder {
 	var b []byte
@@ -215,6 +216,41 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 		})
 	}
 }
+func TestRecoveredTurnCarriesRasterImages(t *testing.T) {
+	// Adopted/recovered turns must serve the same raster image parts as a live
+	// turn: tryAdoptInterrupted once dropped res.Images, so an interrupted
+	// diagram turn came back as the "[SVG: ...]" text fallback only.
+	const png1x1 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+	img := chatgpt.RasterImage{Alt: "diagram", DataURL: png1x1}
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: weatherAnswer, images: []chatgpt.RasterImage{img}}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected}
+	w := recoveryRequest(h, &req)
+	if w.Code != 200 {
+		t.Fatalf("adoption failed: %d %s", w.Code, w.Body.String())
+	}
+	// The recover endpoint only reports the cache; the images reach the wire on
+	// the exact-retry completion that serves the validated cache.
+	got := assistant(t, request(h, "recover", req))
+	if !strings.Contains(contentText(got), "data:image/png;base64,") {
+		t.Fatalf("adopted turn dropped raster images: %+v", got)
+	}
+	// Durable across restart: the recovered result is served from the cache
+	// without another browser read, still carrying the image.
+	loaded := testHandler(&fakeBackend{})
+	loaded.statePath = h.statePath
+	if err := loaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	if retry := request(loaded, "recover", req); f.reads != 1 || !strings.Contains(retry.Body.String(), "data:image/png;base64,") {
+		t.Fatal("cached recovered result lost its image")
+	}
+}
+
 func TestSentLogDiagnosesPendingOverwrite(t *testing.T) {
 	// End-to-end through completions: the submitted H1 is logged, then a
 	// newer retry H3 overwrites pending. Diagnosis must name the desync.
@@ -260,6 +296,7 @@ type resyncBackend struct {
 	mismatch       *chatgpt.UserBubbleMismatchError
 	latestUser     string
 	latestAnswer   string
+	latestImages   []chatgpt.RasterImage
 	latestErr      error
 	reads, latests int
 }
@@ -277,7 +314,7 @@ func (f *resyncBackend) ReadLatestThreadTurn(ctx context.Context, url string) (s
 	if f.latestErr != nil {
 		return "", chatgpt.TurnResult{}, f.latestErr
 	}
-	return f.latestUser, chatgpt.TurnResult{Answer: f.latestAnswer, URL: url}, nil
+	return f.latestUser, chatgpt.TurnResult{Answer: f.latestAnswer, Images: f.latestImages, URL: url}, nil
 }
 
 func structuralMismatch() *chatgpt.UserBubbleMismatchError {
@@ -345,6 +382,24 @@ func TestAutoResyncRecognizedShape(t *testing.T) {
 	loaded.statePath = h.statePath
 	if err := loaded.load(); err != nil || loaded.sessions["auto"].Dirty || loaded.sessions["auto"].AutoResyncEvidence == "" {
 		t.Fatal("transplant not restart-safe", err)
+	}
+}
+
+func TestAutoResyncTransplantsRasterImages(t *testing.T) {
+	// The auto-resync transplant must carry rasters the same way adoption does.
+	const png1x1 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+	const h1 = "first submission prompt H1 with full context"
+	req := weatherReq()
+	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer,
+		latestImages: []chatgpt.RasterImage{{Alt: "diagram", DataURL: png1x1}}}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
+	h.appendSent(sentEntry{Event: "completed", Session: "auto", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	w := request(h, "auto", req)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "data:image/png;base64,") {
+		t.Fatalf("auto-resync transplant dropped raster images: %d %s", w.Code, w.Body.String())
 	}
 }
 

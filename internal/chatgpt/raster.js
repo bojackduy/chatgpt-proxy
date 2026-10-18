@@ -12,13 +12,7 @@
     const heading = [...document.querySelectorAll('h4')].filter(e => e.getAttribute('data-conversation-role') === 'assistant' || (e.textContent || '').trim() === 'ChatGPT said:').find(e => ownerID(e.closest('[data-chatgpt-search-message-ids], [data-message-id]')) === lastID) || null;
     const body = (heading && heading.nextElementSibling) || dilRoot;
     if (!body || !body.isConnected) return out;
-    const svgs = [...body.querySelectorAll('svg')].filter(svg => {
-      // Same decorative-icon rule as the text serializer: an icon inside a
-      // semantic row carries no meaning of its own.
-      if (svg.matches('[data-d-component="icon"]') && svg.closest('[data-d-component="row"]') &&
-          !svg.hasAttribute('aria-label') && !svg.hasAttribute('aria-labelledby') && !svg.querySelector('title, desc, text')) return false;
-      return true;
-    }).slice(0, 4);
+    const svgs = [...body.querySelectorAll('svg')].filter(substantive).slice(0, 4);
     for (const svg of svgs) {
       try {
         const dataURL = await rasterizeOne(svg);
@@ -27,6 +21,36 @@
     }
   } catch (_) {}
   return out;
+
+  // Only a substantive <svg> is an answer diagram. ChatGPT UI chrome ships
+  // 16-24px icon SVGs (copy/thumbs/action icons) that are not always wrapped in
+  // a button or marked aria-hidden, so rasterizing the body's SVGs unfiltered
+  // produced near-blank 40x40 PNGs (a 20px icon at 2x) instead of the diagram.
+  // Skip chrome, semantic-row decorative icons, and icon-sized glyphs; a real
+  // diagram is unitless-with-viewBox or hundreds of px.
+  function chromeSvg(e) {
+    return !!e.closest('button, [role="toolbar"], [hidden], [aria-hidden="true"], script, style, [data-markdown-copy="exclude"], [data-testid="thought-block"], [data-thinking], [data-d-component="badge"]');
+  }
+  function autoDim(v) {
+    const m = /^\s*([\d.]+)\s*(px|em|rem|%)?\s*$/.exec(v || '');
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    return (m[2] === 'em' || m[2] === 'rem') ? n * 16 : n;
+  }
+  function iconSized(e) {
+    const w = autoDim(e.getAttribute('width')), h = autoDim(e.getAttribute('height'));
+    return w !== null && h !== null && w > 0 && h > 0 && Math.max(w, h) <= 24;
+  }
+  function renderedSmall(e) {
+    try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && Math.max(r.width, r.height) <= 24; } catch (_) { return false; }
+  }
+  function decorative(e) {
+    return e.matches('[data-d-component="icon"]') && e.closest('[data-d-component="row"]') &&
+      !e.hasAttribute('aria-label') && !e.hasAttribute('aria-labelledby') && !e.querySelector('title, desc, text');
+  }
+  function substantive(e) {
+    return !chromeSvg(e) && !iconSized(e) && !renderedSmall(e) && !decorative(e);
+  }
 
   function describe(svg) {
     const labelled = (svg.getAttribute('aria-label') || '').trim();
