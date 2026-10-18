@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/chromedp/cdproto/input"
@@ -412,14 +413,26 @@ func (c *Client) launch(ctx context.Context, port int) error {
 	if err := os.MkdirAll(c.ProfileDir, 0o755); err != nil {
 		return err
 	}
-	// Never forward launch arguments into an existing non-debuggable Chrome
-	// using this profile, or remove a potentially live singleton lock.
+	// Never forward launch arguments into a live non-debuggable Chrome using
+	// this profile. A singleton whose owner is provably gone is a different
+	// thing: Chrome is launched detached, so killing this process strands a
+	// lock that would otherwise refuse every relaunch until someone moved it by
+	// hand. Chrome needs the same proof we do and reclaims such a lock itself,
+	// so nothing is removed here; a live or unprovable owner still fails closed.
+	lockPath := filepath.Join(c.ProfileDir, "SingletonLock")
+	singleton := false
 	for _, name := range []string{"SingletonLock", "SingletonSocket"} {
 		if _, err := os.Lstat(filepath.Join(c.ProfileDir, name)); err == nil {
-			return fmt.Errorf("%w: dedicated profile is already locked; inspect its owning Chrome and start its exact configured debugging port; no lock was removed", ErrChromeLaunch)
+			singleton = true
 		} else if !os.IsNotExist(err) {
 			return err
 		}
+	}
+	if singleton {
+		if !orphanedSingleton(lockPath) {
+			return fmt.Errorf("%w: dedicated profile is already locked; inspect its owning Chrome and start its exact configured debugging port; no lock was removed", ErrChromeLaunch)
+		}
+		log.Printf("[chatgpt] profile singleton owner is gone; relaunching so Chrome can reclaim the stale lock")
 	}
 	args := []string{
 		"--enable-automation",
@@ -447,6 +460,50 @@ func (c *Client) launch(ctx context.Context, port int) error {
 	// Detach: the Chrome process outlives this one.
 	go cmd.Wait() //nolint:errcheck
 	return nil
+}
+
+// singletonOwner reads the "<nodename>-<pid>" owner Chrome records in a
+// profile's SingletonLock symlink. Any other shape proves nothing.
+func singletonOwner(path string) (host string, pid int, ok bool) {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", 0, false
+	}
+	cut := strings.LastIndex(target, "-")
+	if cut <= 0 || cut == len(target)-1 {
+		return "", 0, false
+	}
+	pid, err = strconv.Atoi(target[cut+1:])
+	if err != nil || pid <= 0 {
+		return "", 0, false
+	}
+	return target[:cut], pid, true
+}
+
+// processAlive reports whether pid is a live process. EPERM means it exists but
+// belongs to someone else, which still counts.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// orphanedSingleton reports whether this profile's lock was left behind by a
+// Chrome on THIS machine that is no longer running. A foreign nodename, an
+// unparsable target, or a live PID is not proof and stays fail-closed.
+func orphanedSingleton(lockPath string) bool {
+	host, pid, ok := singletonOwner(lockPath)
+	if !ok {
+		return false
+	}
+	ourHost, err := os.Hostname()
+	if err != nil || host != ourHost {
+		return false
+	}
+	return !processAlive(pid)
 }
 
 func findChrome() string {

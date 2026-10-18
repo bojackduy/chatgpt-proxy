@@ -46,6 +46,48 @@ func TestBrowserAlive(t *testing.T) {
 			t.Fatal("singleton modified")
 		}
 	})
+	t.Run("orphaned singleton from a dead local Chrome is reclaimed, a live one still refuses", func(t *testing.T) {
+		host, err := os.Hostname()
+		if err != nil {
+			t.Skip("hostname unavailable")
+		}
+		// Dead local owner. Chrome is launched detached, so killing the proxy
+		// strands exactly this lock on every restart; it must not brick launch.
+		dead := t.TempDir()
+		pid := 1 << 30
+		for pid > 1 && processAlive(pid) {
+			pid--
+		}
+		target := fmt.Sprintf("%s-%d", host, pid)
+		lock := filepath.Join(dead, "SingletonLock")
+		if err := os.Symlink(target, lock); err != nil {
+			t.Fatal(err)
+		}
+		c := New(9222, dead, "/usr/bin/true")
+		if err := c.launch(context.Background(), 9222); err != nil {
+			t.Fatalf("stale lock blocked relaunch: %v", err)
+		}
+		if got, err := os.Readlink(lock); err != nil || got != target {
+			t.Fatal("stale lock removed or rewritten")
+		}
+		// Live local owner: the case the refusal exists for. Pointing a second
+		// Chrome at a profile a running Chrome owns must stay impossible.
+		live := t.TempDir()
+		if err := os.Symlink(fmt.Sprintf("%s-%d", host, os.Getpid()), filepath.Join(live, "SingletonLock")); err != nil {
+			t.Fatal(err)
+		}
+		if err := New(9222, live, "/usr/bin/true").launch(context.Background(), 9222); !errors.Is(err, ErrChromeLaunch) || !strings.Contains(err.Error(), "already locked") {
+			t.Fatalf("live owner accepted: %v", err)
+		}
+		// A foreign nodename's PID says nothing about this machine.
+		foreign := t.TempDir()
+		if err := os.Symlink("other-host-1", filepath.Join(foreign, "SingletonLock")); err != nil {
+			t.Fatal(err)
+		}
+		if err := New(9222, foreign, "/usr/bin/true").launch(context.Background(), 9222); !errors.Is(err, ErrChromeLaunch) {
+			t.Fatalf("foreign lock accepted: %v", err)
+		}
+	})
 	t.Run("absent configured port never attaches adjacent provider", func(t *testing.T) {
 		var requests atomic.Int32
 		var adjacent, configured net.Listener
