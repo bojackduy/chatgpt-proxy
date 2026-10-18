@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/target"
+	"github.com/chromedp/chromedp"
 	"github.com/gorilla/websocket"
 )
 
@@ -276,6 +279,72 @@ func TestBrowserAlive(t *testing.T) {
 		}
 		if _, err := os.Stat(state + ".owner.lock"); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("owned live composer insertion settles the patched full document", func(t *testing.T) {
+		if os.Getenv("CHATGPT_LIVE_COMPOSER") != "1" {
+			t.Skip("set CHATGPT_LIVE_COMPOSER=1 to run against the dedicated logged-in Chrome")
+		}
+		// Read-only against existing threads: a new owned target, and only
+		// insertion. No Send, no journal, no shared tab file, no adapter restart.
+		base := fmt.Sprintf("http://127.0.0.1:%d", DefaultChromePort)
+		resp, err := http.Get(base + "/json/version")
+		if err != nil {
+			t.Skipf("dedicated Chrome unavailable: %v", err)
+		}
+		var ver struct {
+			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&ver)
+		resp.Body.Close()
+		if err != nil || ver.WebSocketDebuggerURL == "" {
+			t.Skipf("no debugger endpoint: %v", err)
+		}
+		req, _ := http.NewRequest(http.MethodPut, base+"/json/new?about:blank", nil)
+		created, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Skipf("cannot create owned target: %v", err)
+		}
+		var tgt struct {
+			ID string `json:"id"`
+		}
+		err = json.NewDecoder(created.Body).Decode(&tgt)
+		created.Body.Close()
+		if err != nil || tgt.ID == "" {
+			t.Skipf("owned target id missing: %v", err)
+		}
+		defer http.Get(base + "/json/close/" + tgt.ID) //nolint:errcheck
+		alloc, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), ver.WebSocketDebuggerURL)
+		defer cancelAlloc()
+		tab, cancelTab := chromedp.NewContext(alloc, chromedp.WithTargetID(target.ID(tgt.ID)))
+		defer cancelTab()
+		tab, cancelTimeout := context.WithTimeout(tab, 120*time.Second)
+		defer cancelTimeout()
+		if err := chromedp.Run(tab, chromedp.Navigate("https://chatgpt.com/")); err != nil {
+			t.Skipf("navigate failed: %v", err)
+		}
+		c := &Client{}
+		// Medium multiline Unicode with tabs and a URL, then a small followup on
+		// the same editor. Detecting any leftover concat relies on exact model
+		// equality, so a partial read here is a real failure, not a flake.
+		line := "Dữ liệu 😀 https://example.com/a\tvalue " + strings.Repeat("x", 160) + "\n"
+		prompts := []string{
+			strings.Repeat(line, 120)[:19000],
+			line[:120],
+		}
+		for _, prompt := range prompts {
+			if err := c.typePrompt(tab, tab, prompt); err != nil {
+				t.Fatalf("patched typePrompt failed for %d bytes: %v", len(prompt), err)
+			}
+			var exact bool
+			if err := chromedp.Run(tab, chromedp.Evaluate(`(() => {const e=document.querySelector('.ProseMirror[contenteditable="true"]');const n=e&&e.pmViewDesc&&e.pmViewDesc.node;return n&&n.type&&n.type.name==='doc'&&n.textBetween(0,n.content.size,'\n','\n')===`+quoteJS(prompt)+`})()`, &exact)); err != nil || !exact {
+				t.Fatalf("model does not hold the full prompt: bytes=%d exact=%v err=%v", len(prompt), exact, err)
+			}
+		}
+		// Clean only this owned draft; never submit.
+		if err := chromedp.Run(tab, chromedp.Evaluate(`(() => {const e=document.querySelector('.ProseMirror[contenteditable="true"]');if(e){e.focus();document.execCommand('selectAll');document.execCommand('delete')}})()`, nil)); err != nil {
+			t.Fatalf("cleanup failed: %v", err)
 		}
 	})
 

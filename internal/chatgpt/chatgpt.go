@@ -891,8 +891,11 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 		return out, err
 	}
 	log.Printf("[chatgpt] target=%s submitting prompt...", chromedp.FromContext(tab).Target.TargetID)
-	submissionAttempted = true // Even a failed click can have an unknown outcome.
-	if err := c.submit(ctx, tab); err != nil {
+	// A click whose outcome is unknown must stay uncertain, so mark the attempt
+	// up front. submit still downgrades this to ErrNotSubmitted when the DOM
+	// proves the turn never reached the thread.
+	submissionAttempted = true
+	if err := c.submit(ctx, tab, opt.Prompt); err != nil {
 		return out, err
 	}
 
@@ -1053,6 +1056,11 @@ func (c *Client) startNewChat(ctx context.Context, tab context.Context) error {
 }
 
 func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt string) error {
+	tab, cancelRequest := requestContext(ctx, tab)
+	defer cancelRequest()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Wait for the composer to render — after a Navigate the SPA can take a
 	// moment, and failing immediately breaks follow-ups (new_session=false).
 	deadline := time.Now().Add(30 * time.Second)
@@ -1161,7 +1169,10 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		// 4. Fallback: legacy execCommand/paste for renderers where trusted
 		//    input cannot land. Composer is verified empty above, so nothing
 		//    can mix. Partial content skips this and fails loud below.
-		fbCtx, fbCancel := context.WithTimeout(tab, 10*time.Second)
+		// Large multiline editor commands can take tens of seconds even though
+		// no turn is being submitted. Preserve request cancellation and allow the
+		// bounded insertion to finish rather than abandoning a live DOM mutation.
+		fbCtx, fbCancel := context.WithTimeout(tab, 90*time.Second)
 		defer fbCancel()
 		legacyJS := fmt.Sprintf(`(() => {
 		  const t = %s;
@@ -1185,35 +1196,45 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			return ErrNoComposer
 		}
 	}
-	// Confirm the composer actually holds the payload. If the renderer converted
-	// it into an attachment, click "Show in text field" until it expands inline.
-	minLen := len(prompt)
-	if minLen > 200 {
-		minLen = 200
-	}
+	// DOM text can appear before ProseMirror absorbs an execCommand insertion.
+	// Settle the full logical document, not a 200-character visual prefix, before
+	// returning to the identical pre-submit check. Never submit partial input.
+	exactReads := 0
 	deadline = time.Now().Add(15 * time.Second)
 	for {
 		var state struct {
 			Len      int  `json:"len"`
+			Exact    bool `json:"exact"`
 			Expand   bool `json:"expand"`
 			Attached bool `json:"attached"`
 		}
 		probe, probeCancel := context.WithTimeout(tab, 3*time.Second)
-		err := chromedp.Run(probe, chromedp.Evaluate(`(() => {
+		err := chromedp.Run(probe, chromedp.Evaluate(fmt.Sprintf(`(() => {
 		  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
 		  const btn = [...document.querySelectorAll('button')].find(e => (e.innerText || '').trim() === 'Show in text field');
+		  const node = el?.pmViewDesc?.node;
+		  const text = node?.type?.name === 'doc' && typeof node.textBetween === 'function'
+		    ? node.textBetween(0, node.content.size, '\n', '\n')
+		    : el?.tagName === 'TEXTAREA' ? el.value : null;
+		  const canonical = s => (s || '').replace(/\r\n?/g, '\n').trim().replace(/([<(\"]) ?(https?:\/\/)/g, '$1$2');
 		  return {
-		    len: el ? (el.innerText || el.value || '').length : 0,
+		    len: text === null ? 0 : text.length,
+		    exact: text !== null && canonical(text) === canonical(%s),
 		    expand: !!btn,
 		    attached: !!document.querySelector('button[aria-label="Remove pasted text attachment"]')
 		  };
-		})()`, &state))
+		})()`, strconv.Quote(prompt)), &state))
 		probeCancel()
 		if err != nil {
 			return err
 		}
-		if state.Len >= minLen {
-			return nil
+		if state.Exact {
+			exactReads++
+			if exactReads >= 3 {
+				return nil
+			}
+		} else {
+			exactReads = 0
 		}
 		if state.Expand {
 			clickCtx, clickCancel := context.WithTimeout(tab, 3*time.Second)
@@ -1224,7 +1245,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			clickCancel()
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("composer holds %d/%d bytes (attached=%v); REPAIR: inspect the Project paste/attachment UI in internal/chatgpt/chatgpt.go", state.Len, minLen, state.Attached)
+			return fmt.Errorf("composer did not settle to the complete prompt (model_chars=%d prompt_bytes=%d attached=%v); nothing submitted", state.Len, len(prompt), state.Attached)
 		}
 		if err := pause(tab, 300*time.Millisecond); err != nil {
 			return err
@@ -1232,7 +1253,12 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	}
 }
 
-func (c *Client) submit(ctx context.Context, tab context.Context) error {
+func (c *Client) submit(ctx context.Context, tab context.Context, prompt string) error {
+	tab, cancelRequest := requestContext(ctx, tab)
+	defer cancelRequest()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sendJS := `(() => {
 	  const btn = document.querySelector('[data-testid="send-button"]')
 	    || document.querySelector('form[data-chatgpt-composer] button[aria-label^="Send"]')
@@ -1248,34 +1274,110 @@ func (c *Client) submit(ctx context.Context, tab context.Context) error {
 	  }
 	  return false;
 	})()`
-	// Submit and VERIFY: an attachment upload can make an early Send click a
-	// no-op, leaving the prompt in the composer. Retry click then Enter until
-	// the composer is empty or a stop button appears.
+	// Wait for an enabled Send, dispatch at most once, then observe. An intact
+	// composer is not proof a dispatched action was swallowed: the request may
+	// be in flight while React has not yet cleared the draft or rendered a turn.
 	deadline := time.Now().Add(15 * time.Second)
+	retries := 0
+	actionAttempted := false
 	for time.Now().Before(deadline) {
+		retries++
 		if err := tab.Err(); err != nil {
 			return err
 		}
-		clickCtx, cancel := context.WithTimeout(tab, 3*time.Second)
-		_ = chromedp.Run(clickCtx, chromedp.Evaluate(sendJS, nil))
-		cancel()
+		if !actionAttempted {
+			clickCtx, cancel := context.WithTimeout(tab, 3*time.Second)
+			var clicked bool
+			err := chromedp.Run(clickCtx, chromedp.Evaluate(sendJS, &clicked))
+			cancel()
+			// An interrupted evaluation may have dispatched before its reply
+			// was lost. Neither retry nor downgrade that outcome.
+			if err != nil {
+				return fmt.Errorf("send action outcome unknown: %w", err)
+			}
+			actionAttempted = clicked
+		}
 		if err := pause(tab, 700*time.Millisecond); err != nil {
 			return err
 		}
-		if sent, err := c.turnSubmitted(tab); err == nil && sent {
-			return nil
-		}
-		keyCtx, cancel2 := context.WithTimeout(tab, 5*time.Second)
-		_ = chromedp.Run(keyCtx, chromedp.Focus(`.ProseMirror[contenteditable="true"]`, chromedp.ByQuery), chromedp.KeyEvent("\r"))
-		cancel2()
-		if err := pause(tab, 700*time.Millisecond); err != nil {
-			return err
-		}
-		if sent, err := c.turnSubmitted(tab); err == nil && sent {
-			return nil
+		if actionAttempted {
+			if sent, err := c.turnSubmitted(tab); err == nil && sent {
+				return nil
+			}
 		}
 	}
-	return errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM (attachment upload may be stuck)")
+	// Only a turn with NO dispatched action can be proven unsubmitted. Missing
+	// or disabled controls can be retried later; a swallowed/in-flight click
+	// cannot, even if the DOM still looks identical to the pre-send snapshot.
+	proof, perr := c.turnUnsubmitted(tab, prompt)
+	proof.ActionAttempted = actionAttempted
+	if perr == nil && proof.provenUnsubmitted() {
+		log.Printf("[chatgpt] send verified no-op after %d retries: compLen=%d wantLen=%d userBubble=%v generating=%v sendDisabled=%v",
+			retries, proof.CompLen, proof.WantLen, proof.UserBubble, proof.Generating, proof.SendDisabled)
+		return fmt.Errorf("%w: no enabled Send action after %d checks; composer still holds the prompt, no user bubble, no generation indicator", ErrNotSubmitted, retries)
+	}
+	log.Printf("[chatgpt] send did not submit, outcome unproven after %d retries: readable=%v compLen=%d wantLen=%d composerExact=%v userBubble=%v generating=%v sendDisabled=%v probe=%v",
+		retries, proof.Readable, proof.CompLen, proof.WantLen, proof.ComposerExact, proof.UserBubble, proof.Generating, proof.SendDisabled, perr)
+	return errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM — outcome unproven")
+}
+
+// sendProof is the read-only DOM evidence used to decide whether a Send that
+// did not start a turn provably never reached the thread. Sizes and flags only:
+// no prompt text reaches this struct or its logs.
+type sendProof struct {
+	ActionAttempted bool `json:"-"`             // any dispatched or uncertain Send remains uncertain
+	Readable        bool `json:"readable"`      // composer text could be read at all
+	ComposerExact   bool `json:"composerExact"` // composer still holds the expected prompt
+	UserBubble      bool `json:"userBubble"`    // a user bubble already holds this prompt
+	Generating      bool `json:"generating"`    // a generation indicator is present
+	SendDisabled    bool `json:"sendDisabled"`  // the Send control is missing or disabled
+	CompLen         int  `json:"compLen"`
+	WantLen         int  `json:"wantLen"`
+}
+
+// provenUnsubmitted reports whether this evidence PROVES the turn never
+// reached the thread, so the caller may retry instead of going uncertain.
+// Every condition must hold: no Send was dispatched, the composer was readable
+// and still holds the exact prompt, no user bubble carries it, and nothing is generating. Any
+// missing condition stays uncertain — never resubmit on an incomplete read.
+func (p sendProof) provenUnsubmitted() bool {
+	return !p.ActionAttempted && p.Readable && p.ComposerExact && !p.UserBubble && !p.Generating
+}
+
+// turnUnsubmitted gathers sendProof from the live DOM. Read-only: it never
+// clicks, types, or submits, so it is safe on an already-submitted turn.
+func (c *Client) turnUnsubmitted(tab context.Context, prompt string) (sendProof, error) {
+	probe, cancel := context.WithTimeout(tab, 3*time.Second)
+	defer cancel()
+	var p sendProof
+	err := chromedp.Run(probe, chromedp.Evaluate(fmt.Sprintf(`(() => {
+	  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
+	  const norm = s => (s || '').replace(/\r\n?/g, '\n').trim();
+	  // Only the observed URL defusing space is equivalent, in either direction.
+	  const canonical = s => norm(s).replace(/([<(\"]) ?(https?:\/\/)/g, '$1$2');
+	  const want = canonical(%s);
+	  const node = e?.pmViewDesc?.node;
+	  const text = node?.type?.name === 'doc' && typeof node.textBetween === 'function'
+	    ? node.textBetween(0, node.content.size, '\n', '\n')
+	    : e?.tagName === 'TEXTAREA' ? e.value : null;
+	  if (!e || text === null) return {readable:false};
+	  const comp = canonical(text);
+	  const send = document.querySelector('[data-testid="send-button"]');
+	  const stop = !!document.querySelector('[data-testid="stop-button"]') || [...document.querySelectorAll('button')].some(b => /stop/i.test(b.getAttribute('aria-label') || ''));
+	  const bubbles = [...document.querySelectorAll('[data-message-author-role="user"]')];
+	  const last = bubbles[bubbles.length - 1];
+	  const bubble = last ? canonical(last.innerText || '') : '';
+	  return {
+	    readable: true,
+	    composerExact: comp === want,
+	    userBubble: bubble !== '' && bubble === want,
+	    generating: stop,
+	    sendDisabled: !send || send.disabled === true,
+	    compLen: comp.length,
+	    wantLen: want.length,
+	  };
+	})()`, strconv.Quote(prompt)), &p))
+	return p, err
 }
 
 // turnSubmitted reports that the composer was cleared or generation started.

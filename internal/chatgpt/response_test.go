@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
@@ -36,6 +37,76 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	t.Run("composer settles complete logical document", func(t *testing.T) {
+		c := &Client{}
+		for _, size := range []int{300, 19000, 190000, 120} {
+			set(`<div class="ProseMirror" contenteditable="true" role="textbox"></div>`)
+			// Reproduce the observed race: DOM text is already long enough for
+			// the old 200-character check while the editor model is still empty.
+			// Real editors batch DOM reconciliation; only their logical document
+			// is authoritative for pre-submit verification.
+			js := `(() => {const e=document.querySelector('.ProseMirror'); let model=''; let timer;
+			 e.pmViewDesc={node:{type:{name:'doc'},content:{size:0},textBetween(){return model}}};
+			 e.addEventListener('input',()=>{clearTimeout(timer);const next=e.innerText;timer=setTimeout(()=>{model=next},1600)});
+			})()`
+			if err := chromedp.Run(tab, chromedp.Evaluate(js, nil)); err != nil {
+				t.Fatal(err)
+			}
+			prompt := strings.Repeat("x", size)
+			if err := c.typePrompt(tab, tab, prompt); err != nil {
+				t.Fatalf("size %d: %v", size, err)
+			}
+			var exact bool
+			if err := chromedp.Run(tab, chromedp.Evaluate(`document.querySelector('.ProseMirror').pmViewDesc.node.textBetween() === `+quoteJS(prompt), &exact)); err != nil || !exact {
+				t.Fatalf("returned before full model settlement: size=%d exact=%v err=%v", size, exact, err)
+			}
+		}
+		// A long visual prefix is never enough; persistent partial input must
+		// fail before submission. Keep this test bounded by caller cancellation.
+		set(`<div class="ProseMirror" contenteditable="true"></div>`)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`document.querySelector('.ProseMirror').pmViewDesc={node:{type:{name:'doc'},content:{size:250},textBetween(){return 'x'.repeat(250)}}}`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(tab, 1800*time.Millisecond)
+		defer cancel()
+		if err := c.typePrompt(ctx, tab, strings.Repeat("x", 500)); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("persistent partial model accepted or cancellation lost: %v", err)
+		}
+		ctx, cancel = context.WithCancel(tab)
+		cancel()
+		if err := c.typePrompt(ctx, tab, "must not type"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled insertion: %v", err)
+		}
+	})
+	t.Run("post-click DOM is never proof of non-submission", func(t *testing.T) {
+		p := sendProof{Readable: true, ComposerExact: true}
+		if !p.provenUnsubmitted() {
+			t.Fatal("no-action exact readable draft should be retryable")
+		}
+		for _, p := range []sendProof{
+			{ActionAttempted: true, Readable: true, ComposerExact: true},
+			{ComposerExact: true}, {Readable: true},
+			{Readable: true, ComposerExact: true, UserBubble: true},
+			{Readable: true, ComposerExact: true, Generating: true},
+		} {
+			if p.provenUnsubmitted() {
+				t.Fatalf("ambiguous send permitted retry: %+v", p)
+			}
+		}
+		set(`<div class="ProseMirror" contenteditable="true">draft</div><button data-testid="send-button">Send</button>`)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.sendClicks=0;document.querySelector('button').onclick=()=>window.sendClicks++`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(tab, 2200*time.Millisecond)
+		defer cancel()
+		if err := (&Client{}).submit(ctx, tab, "draft"); err == nil || errors.Is(err, ErrNotSubmitted) {
+			t.Fatalf("in-flight/cancelled Send lost uncertainty: %v", err)
+		}
+		var clicks int
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.sendClicks`, &clicks)); err != nil || clicks != 1 {
+			t.Fatalf("possibly submitted turn repeated: clicks=%d err=%v", clicks, err)
+		}
+	})
 	old := `<div data-chatgpt-search-message-ids="old"><h4>ChatGPT said:</h4><div>OLD TOOL CALL</div></div>`
 	set(old + `<div data-chatgpt-search-message-ids="analysis"><h4>ChatGPT said:</h4><div>Thought for 4 seconds</div></div>`)
 	before, err := responseProbe(tab, nil)
