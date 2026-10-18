@@ -1,5 +1,51 @@
 # Backlog
 
+## 2026-10-18: loopd patch naming and native-input executor
+
+The reported loopd scope-test failures are separate from browser uncertainty:
+current OpenCode's structured tool is named patch (patchText input), while
+loopd structuredWritePaths recognized only apply_patch. The loopd repository
+now recognizes both names using the SAME patch grammar/path extraction and
+claim enforcement; allowed-path, outside-path and malformed-patch cases in
+the existing suite pass (11tests), plus typecheck/build. It requires a host
+plugin reload and resuming blocked goals; no user goal files were created
+manually and no scope restrictions were disabled. Loopd changes uncommitted.
+
+The bridge logs also proved native Input.insertText was called directly on a
+context lacking a CDP executor, always logging invalid context and taking the
+legacy fallback. It now uses chromedp.Run for small inputs and checks focus
+errors. Large catalogs retain the existing path to avoid activating a slow
+native paste. Bridge vet/tests/build pass; idle locked deployment preserved
+the journal hash and readiness. A real isolated no-tool marker request returned
+INPUT-OK HTTP200 in43.02s, native input error=nil, and no tool calls. This proves
+one live Send path, not recovery of earlier pending sessions or all Send failures.
+The initial project-creation path still fell back in that probe; do not claim
+project setup or the full loopd integration has been proved working by the marker.
+
+## 2026-10-17: ACK hydration race after the acknowledgement fallback
+
+**Fixed and deployed locally; uncommitted.** The subsequent ses_ebbd828b
+failure19:17:05 reproduced despite the previous ACK fix. An independent owned
+target opened the exact stored thread6ad36716… without any feedback card and
+observed final assistant161904a6…: empty body initially, complete source exactly
+ACK, then visible ACK by the readback recheck. Guard1 rejected nonempty ordinary
+text and guard3 rejected the now-nonempty DIL root. Both gates retained an obsolete
+empty-render assumption while hydration changed representation, not identity.
+
+Readback now permits this exact ACK transition; source must still be finished
+final/all, end_turn/is_complete, exact selected assistant ID and linked to the
+latest user. Hidden protocol keeps its stricter diagnostic gates and arbitrary
+hidden prose remains refused. Tests in the existing DOM case cover non-DIL and
+DIL hydration and wrong-user ancestry. Production guard tracing on the original
+thread returned ACK_RECOVERED/3bytes with the exact same source ID. Feedback
+controls were neither clicked nor submitted; their presence alone is not the
+cause proved by this reproduction. No automatic regeneration or journal reset.
+
+Full vet/tests/race/build passed. Exclusive profile/journal-guarded idle
+installation preserved the journal SHA and reports ready=true active0/available2;
+installed hashes bc859865… (adapter),949471c6… (MCP). This validates original
+answer readback, not completion of all pending import chunks or client delivery.
+
 ## 2026-10-17: empty-rendered history ACK and repeated source-fetch latency
 
 **Fixed and deployed locally; uncommitted.** In ses_ebbd828b, a187950-byte

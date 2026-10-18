@@ -1113,10 +1113,22 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	//    instead of async-flushing an execCommand/paste around it.
 	focusJS := `(() => { const el = ` + compSel + `; if (!el) return false; el.focus(); try { document.getSelection().collapseToEnd(); } catch (e) {} return true; })()`
 	var focused bool
-	_ = chromedp.Run(typeCtx, chromedp.Evaluate(focusJS, &focused))
-	insCtx, insCancel := context.WithTimeout(tab, 20*time.Second)
-	insErr := input.InsertText(prompt).Do(insCtx)
-	insCancel()
+	if err := chromedp.Run(typeCtx, chromedp.Evaluate(focusJS, &focused)); err != nil {
+		return fmt.Errorf("type prompt focus: %w", err)
+	}
+	if !focused {
+		return ErrNoComposer
+	}
+	var insErr error
+	// Native input needs the target executor installed by chromedp.Run.
+	// Calling .Do directly on the context always failed with invalid context.
+	// Keep large catalog/history pastes on the existing bounded legacy path;
+	// activating native input for those would introduce a new slow paste path.
+	if len(prompt) <= 4096 {
+		insCtx, insCancel := context.WithTimeout(typeCtx, 20*time.Second)
+		insErr = chromedp.Run(insCtx, input.InsertText(prompt))
+		insCancel()
+	}
 	// 3. Settle: the editor may process input asynchronously; only stable
 	//    content may proceed. Trajectory is lengths-only by design.
 	var lens []int

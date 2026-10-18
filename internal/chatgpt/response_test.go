@@ -391,8 +391,29 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if waitErr != nil || text != "ACK" || reads != 1 {
 			t.Fatal("completed source was redundantly fetched for stability polls", waitErr, text, reads)
 		}
+		// Captured race: the outer probe saw zero bytes; by the source
+		// readback's recheck the SAME final ACK had hydrated. The former
+		// nonempty-prose guard returned empty again, preserving stale state.
+		hydratedHTML := strings.Replace(emptyPlain, `<div class="DilResponseRoot-HfQrEh"></div>`, `<div class="DilResponseRoot-HfQrEh">ACK</div>`, 1)
+		set(hydratedHTML)
+		var hydratedACK string
+		baselineJSON, _ := json.Marshal(before.IDs)
+		readACK := fmt.Sprintf(`(async()=>{const recheck=()=>%s(%s);const st=recheck();%s})()`, responseProbeJS, string(baselineJSON), nullDILWireJS)
+		if err := chromedp.Run(tab, chromedp.Evaluate(readACK, &hydratedACK, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil || hydratedACK != "ACK" {
+			t.Fatal("empty-to-visible ACK readback race lost exact final", err, hydratedACK)
+		}
+		// The real hydration also mounts a nonempty DIL root whose fallback
+		// is ACK, not the narrowly handled null-code protocol failure.
+		set(strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh"></div>`, `<div class="DilResponseRoot-HfQrEh">ACK</div>`, 1))
+		if err := chromedp.Run(tab, chromedp.Evaluate(readACK, &hydratedACK, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil || hydratedACK != "ACK" {
+			t.Fatal("hydrated DIL ACK incorrectly required null-render diagnostics", err, hydratedACK)
+		}
 		node["parent"] = "different-user"
 		publish()
+		if err := chromedp.Run(tab, chromedp.Evaluate(readACK, &hydratedACK, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil || hydratedACK != "" {
+			t.Fatal("hydrated ACK bypassed source ancestry", err)
+		}
+		set(emptyPlain)
 		if got, _ := responseProbe(tab, before.IDs); got.Last != "" {
 			t.Fatal("unrelated acknowledgement adopted")
 		}
