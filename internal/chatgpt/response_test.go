@@ -726,3 +726,187 @@ func TestSanitizeRasterAlt(t *testing.T) {
 		t.Fatalf("alt not capped: %d runes", len([]rune(got)))
 	}
 }
+
+// Draft ownership decides whether the bridge clears leftover composer text or
+// refuses. Only empty text, this exact prompt, or a character prefix of it is
+// ours. A composer holding our own stale first line was reported as foreign
+// text, which left every later attempt on that thread permanently refused.
+func TestComposerDraftOwnership(t *testing.T) {
+	prompt := "line one\nline two\nline three"
+	for _, tc := range []struct {
+		name  string
+		draft string
+		want  draftKind
+		rest  string
+	}{
+		{"empty composer", "", draftEmpty, prompt},
+		{"our exact prompt", prompt, draftOwnExact, ""},
+		{"our own first line", "line one", draftOwnPrefix, "\nline two\nline three"},
+		{"our own partial line", "line on", draftOwnPrefix, "e\nline two\nline three"},
+		{"crlf and edge whitespace folded", "line one\r\n", draftOwnPrefix, "\nline two\nline three"},
+		{"unrelated user draft", "notes the user typed earlier", draftForeign, ""},
+		{"our prompt with user text appended", prompt + " and more", draftForeign, ""},
+	} {
+		got, rest := classifyDraft(tc.draft, prompt)
+		if got != tc.want || rest != tc.rest {
+			t.Errorf("%s: got (%v,%q) want (%v,%q)", tc.name, got, rest, tc.want, tc.rest)
+		}
+	}
+}
+
+// The insertion mechanism follows prompt content, not only size: one native
+// insert lands only the text before the first newline, so a multi-line prompt
+// must never ride it. Size still decides when to keep the legacy paste path.
+func TestComposerInsertModeFollowsContent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want insertMode
+	}{
+		{"single line", "one line", insertNative},
+		{"two lines", "one\ntwo", insertLinewise},
+		{"trailing newline only", "one\n", insertLinewise},
+		{"blank first line", "\none", insertLinewise},
+		{"oversized single line", strings.Repeat("x", composerInlineLimit+1), insertLegacy},
+		{"oversized multi line", strings.Repeat("x", composerInlineLimit) + "\n" + strings.Repeat("y", composerInlineLimit), insertLegacy},
+	} {
+		if got := insertModeFor(tc.text); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
+// composer on a dedicated bridge tab: the deprecated execCommand wipe pair does
+// not clear it, a trusted deletion key event does (when deletesHonoured), one
+// native insert lands only the text up to the FIRST newline, a trusted
+// Shift+Enter breaks the line, and the logical document — not innerText — is
+// authoritative.
+func composerFixtureJS(initial string, deletesHonoured bool) string {
+	return `(() => {
+  const e = document.querySelector('.ProseMirror');
+  let model = ` + quoteJS(initial) + `;
+  const sync = () => { e.pmViewDesc.node.content.size = model.length; };
+  e.pmViewDesc = { node: { type: { name: 'doc' }, content: { size: 0 }, textBetween() { return model } } };
+  e.textContent = model;
+  sync();
+  window.__composerModel = () => model;
+  window.__composerDeletes = 0;
+  e.addEventListener('input', ev => {
+    const t = ev.data == null ? '' : String(ev.data);
+    if (ev.inputType === 'insertText') {
+      const nl = t.indexOf('\n');
+      model += nl < 0 ? t : t.slice(0, nl);
+    } else if (ev.inputType === 'insertLineBreak' || ev.inputType === 'insertParagraph') {
+      model += '\n';
+    } else if (ev.inputType.indexOf('delete') === 0) {
+      window.__composerDeletes++;
+      if (` + fmt.Sprintf("%v", deletesHonoured) + `) model = '';
+    }
+    sync();
+  });
+  const exec = document.execCommand.bind(document);
+  document.execCommand = (cmd, ...rest) => (cmd === 'selectAll' || cmd === 'delete') ? false : exec(cmd, ...rest);
+})()`
+}
+
+// The composer must receive multi-line prompts complete, must treat its own
+// leftover first line as ours instead of foreign, must still refuse text it
+// cannot account for, and must clear a draft the deprecated commands cannot.
+func TestComposerInsertionAndDraftOwnership(t *testing.T) {
+	chrome := findChrome()
+	if chrome == "" {
+		t.Skip("Chrome unavailable for composer fixtures")
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
+	alloc, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+	tab, cancelTab := chromedp.NewContext(alloc)
+	defer cancelTab()
+	tab, timeout := context.WithTimeout(tab, 120*time.Second)
+	defer timeout()
+	set := func(initial string, deletesHonoured bool) {
+		t.Helper()
+		if err := chromedp.Run(tab, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(composerFixtureJS(initial, deletesHonoured), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := func(when string) string {
+		t.Helper()
+		var got string
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
+			t.Fatalf("%s: %v", when, err)
+		}
+		return got
+	}
+	deletes := func() int {
+		t.Helper()
+		var got int
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	c := &Client{}
+	multi := "line one\nline two\n\nline four"
+
+	t.Run("multi-line prompt lands complete", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("multi-line prompt not delivered: %v", err)
+		}
+		if got := model(t.Name()); got != multi {
+			t.Fatalf("composer holds %q, want %q", got, multi)
+		}
+	})
+	t.Run("single line prompt still lands", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, "one line only"); err != nil {
+			t.Fatalf("single line prompt not delivered: %v", err)
+		}
+		if got := model(t.Name()); got != "one line only" {
+			t.Fatalf("composer holds %q", got)
+		}
+	})
+	t.Run("own leftover first line is wiped by a trusted key", func(t *testing.T) {
+		set("line one", true)
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("own leftover treated as foreign: %v", err)
+		}
+		if got := model(t.Name()); got != multi {
+			t.Fatalf("composer holds %q, want %q", got, multi)
+		}
+		if got := deletes(); got == 0 {
+			t.Fatal("own leftover was not cleared through a trusted key event")
+		}
+	})
+	t.Run("own leftover that survives deletion is adopted once", func(t *testing.T) {
+		set("line one", false)
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("surviving own leftover treated as foreign: %v", err)
+		}
+		if got := model(t.Name()); got != multi {
+			t.Fatalf("composer holds %q, want %q", got, multi)
+		}
+	})
+	t.Run("unrelated draft is refused and preserved", func(t *testing.T) {
+		foreign := "notes the user typed earlier"
+		set(foreign, true)
+		err := c.typePrompt(tab, tab, multi)
+		if err == nil {
+			t.Fatal("unrecognised draft was typed over")
+		}
+		if !strings.Contains(err.Error(), "unrecognised") {
+			t.Fatalf("refusal does not describe what was found: %v", err)
+		}
+		if got := model(t.Name()); got != foreign {
+			t.Fatalf("refused draft was modified: %q", got)
+		}
+		if got := deletes(); got != 0 {
+			t.Fatalf("refusal touched the draft: %d deletions", got)
+		}
+	})
+}

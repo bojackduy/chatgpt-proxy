@@ -1112,6 +1112,108 @@ func (c *Client) startNewChat(ctx context.Context, tab context.Context) error {
 	return c.waitPageReady(ctx, tab, 20*time.Second)
 }
 
+// composerSelector finds the composer in every renderer we have seen: the
+// textarea renderer, the project/form renderer, and ProseMirror.
+const composerSelector = `document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]')`
+
+// composerURLSpace mirrors the normalization of the pre-submit check: the
+// composer inserts a space before a bare URL, and draft ownership has to be
+// judged on that same normal form or our own draft looks unfamiliar.
+var composerURLSpace = regexp.MustCompile(`([<("]) ?(https?://)`)
+
+func canonicalComposerText(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return composerURLSpace.ReplaceAllString(strings.TrimSpace(s), "$1$2")
+}
+
+// draftKind says how leftover composer text relates to the prompt about to be
+// typed. Only empty text, this exact prompt, or a character prefix of this
+// prompt count as our own leftover; anything else is text we cannot account for
+// and must keep the hard refusal.
+type draftKind int
+
+const (
+	draftForeign draftKind = iota
+	draftEmpty
+	draftOwnExact
+	draftOwnPrefix
+)
+
+// classifyDraft relates leftover composer text to the prompt being typed and,
+// for our own prefix, reports the text still missing.
+func classifyDraft(draft, prompt string) (draftKind, string) {
+	d, p := canonicalComposerText(draft), canonicalComposerText(prompt)
+	switch {
+	case d == "":
+		return draftEmpty, p
+	case d == p:
+		return draftOwnExact, ""
+	case strings.HasPrefix(p, d):
+		return draftOwnPrefix, p[len(d):]
+	default:
+		return draftForeign, ""
+	}
+}
+
+// insertMode picks how prompt text reaches the composer. Text holding a newline
+// must not go through the single-line native insert: measured on the Project
+// composer, one native insert lands only the text up to the FIRST newline and
+// silently drops the rest, which is what poisoned bridge threads.
+type insertMode int
+
+const (
+	insertNative   insertMode = iota // trusted single insert, no newline
+	insertLinewise                   // trusted insert per line, trusted line breaks
+	insertLegacy                     // oversized: existing execCommand/paste path
+)
+
+// composerInlineLimit is the largest prompt the trusted input path handles;
+// larger catalog and history pastes keep the bounded legacy path.
+const composerInlineLimit = 4096
+
+func insertModeFor(text string) insertMode {
+	if len(text) > composerInlineLimit {
+		return insertLegacy
+	}
+	if strings.Contains(text, "\n") {
+		return insertLinewise
+	}
+	return insertNative
+}
+
+// composerKeyActions is one trusted key press as keydown plus keyup. Trusted
+// key events are what the editor honours; the deprecated command pair does not
+// clear its composer. A key that generates text carries it, exactly as a real
+// keyboard event does.
+func composerKeyActions(typ input.KeyType, key, code, text string, vk int64, mod input.Modifier) []chromedp.Action {
+	press := func(t input.KeyType) *input.DispatchKeyEventParams {
+		return input.DispatchKeyEvent(t).WithKey(key).WithCode(code).WithText(text).
+			WithWindowsVirtualKeyCode(vk).WithNativeVirtualKeyCode(vk).WithModifiers(mod)
+	}
+	return []chromedp.Action{press(typ), press(input.KeyUp)}
+}
+
+// composerInsertActions types text with the mechanism its content requires:
+// one native insert for a single line, otherwise trusted line breaks between
+// trusted per-line inserts so every line lands.
+func composerInsertActions(text string) []chromedp.Action {
+	if insertModeFor(text) != insertLinewise {
+		return []chromedp.Action{input.InsertText(text)}
+	}
+	lines := strings.Split(text, "\n")
+	actions := make([]chromedp.Action, 0, 2*len(lines))
+	for i, line := range lines {
+		if i > 0 {
+			actions = append(actions, composerKeyActions(input.KeyDown, "Enter", "Enter", "\r", 13, input.ModifierShift)...)
+		}
+		if line != "" {
+			actions = append(actions, input.InsertText(line))
+		}
+	}
+	return actions
+}
+
 func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt string) error {
 	tab, cancelRequest := requestContext(ctx, tab)
 	defer cancelRequest()
@@ -1147,36 +1249,96 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// text. The paste path stays as a fallback for renderers that ignore it.
 	typeCtx, cancel := context.WithTimeout(tab, 30*time.Second)
 	defer cancel()
-	compSel := `document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]')`
-	// 1. Wipe through the editor pipeline so no stale model state survives
-	//    to resurrect foreign text. No manual input-event dispatch: the
-	//    execCommand calls already fire real input events, and an extra
-	//    synthetic one can queue a stale flush that later replays over our
-	//    insert.
-	wipeJS := `(() => {
+	compSel := composerSelector
+	// 1. Read the composer's LOGICAL document before touching anything. innerText
+	//    only mirrors the DOM, so it can hold a stale visual prefix or read empty
+	//    while the editor model still holds text. Draft ownership is decided on
+	//    the model, and unfamiliar text is refused WITHOUT being cleared: the
+	//    user's own draft must survive a refusal intact.
+	readJS := `(() => {
 	  const el = ` + compSel + `;
-	  if (!el) return -1;
+	  if (!el) return { found: false, text: '' };
 	  el.focus();
-	  try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
-	  catch (e) { if (el.tagName === 'TEXTAREA') { el.value = ''; } else { el.innerHTML = ''; } }
-	  return (el.innerText || el.value || '').trim().length;
+	  const node = el.pmViewDesc && el.pmViewDesc.node;
+	  const text = node && node.type && node.type.name === 'doc' && typeof node.textBetween === 'function'
+	    ? node.textBetween(0, node.content.size, '\n', '\n')
+	    : el.tagName === 'TEXTAREA' ? el.value : el.innerText;
+	  return { found: true, text: text || '' };
 	})()`
-	var wipedLen int
-	if err := chromedp.Run(typeCtx, chromedp.Evaluate(wipeJS, &wipedLen)); err != nil {
+	var draft struct {
+		Found bool   `json:"found"`
+		Text  string `json:"text"`
+	}
+	if err := chromedp.Run(typeCtx, chromedp.Evaluate(readJS, &draft)); err != nil {
 		return fmt.Errorf("type prompt: %w", err)
 	}
-	if wipedLen != 0 {
-		// Stale foreign draft the pipeline wipe could not clear: refuse to
-		// type over it rather than risk submitting mixed text.
-		return errors.New("type prompt: composer draft stuck, refusing to type over foreign text")
-	}
-	if wipedLen < 0 {
+	if !draft.Found {
 		return ErrNoComposer
+	}
+	kind, _ := classifyDraft(draft.Text, prompt)
+	if kind == draftForeign {
+		return fmt.Errorf("type prompt: composer holds unrecognised text (draft_chars=%d draft_newline=%v prompt_bytes=%d draft_matches_prompt=false); refusing to type over it",
+			len(draft.Text), strings.Contains(draft.Text, "\n"), len(prompt))
+	}
+	target := prompt
+	// A composer already holding exactly this prompt needs nothing typed. Our
+	// own partial leftover is cleared through a TRUSTED deletion key, which is
+	// what this editor honours; whatever survives is adopted as the exact
+	// missing suffix instead of being retyped, so text can never double up.
+	if kind == draftOwnExact {
+		target = ""
+	}
+	if kind == draftOwnPrefix {
+		selectJS := `(() => {
+		  const el = ` + compSel + `;
+		  if (!el) return false;
+		  el.focus();
+		  const sel = document.getSelection();
+		  if (!sel) return false;
+		  const range = document.createRange();
+		  range.selectNodeContents(el);
+		  sel.removeAllRanges();
+		  sel.addRange(range);
+		  return true;
+		})()`
+		var selected bool
+		if err := chromedp.Run(typeCtx, chromedp.Evaluate(selectJS, &selected)); err != nil {
+			return fmt.Errorf("type prompt: %w", err)
+		}
+		if !selected {
+			return ErrNoComposer
+		}
+		if err := chromedp.Run(typeCtx, composerKeyActions(input.KeyRawDown, "Backspace", "Backspace", "", 8, input.ModifierNone)...); err != nil {
+			return fmt.Errorf("type prompt wipe: %w", err)
+		}
+		var after struct {
+			Found bool   `json:"found"`
+			Text  string `json:"text"`
+		}
+		if err := chromedp.Run(typeCtx, chromedp.Evaluate(readJS, &after)); err != nil {
+			return fmt.Errorf("type prompt wipe: %w", err)
+		}
+		afterKind, afterMissing := classifyDraft(after.Text, prompt)
+		switch afterKind {
+		case draftEmpty:
+			target = prompt
+		case draftOwnExact:
+			target = ""
+		case draftOwnPrefix:
+			target = afterMissing
+		default:
+			// Deletion cannot turn our own text into unfamiliar text; refuse
+			// rather than type over anything we cannot account for.
+			return fmt.Errorf("type prompt: composer holds unrecognised text after wipe (draft_chars=%d draft_newline=%v prompt_bytes=%d draft_matches_prompt=false); refusing to type over it",
+				len(after.Text), strings.Contains(after.Text, "\n"), len(prompt))
+		}
 	}
 	// 2. Primary insertion: trusted CDP input travels the editor's
 	//    beforeinput pipeline, so the editor absorbs it into model state
-	//    instead of async-flushing an execCommand/paste around it.
-	focusJS := `(() => { const el = ` + compSel + `; if (!el) return false; el.focus(); try { document.getSelection().collapseToEnd(); } catch (e) {} return true; })()`
+	//    instead of async-flushing an execCommand/paste around it. A prompt
+	//    holding a newline cannot ride one native insert, so it is typed line by
+	//    line with trusted line breaks.
+	focusJS := `(() => { const el = ` + compSel + `; if (!el) return false; el.focus(); const sel = document.getSelection(); if (sel) { const range = document.createRange(); range.selectNodeContents(el); range.collapse(false); sel.removeAllRanges(); sel.addRange(range); } return true; })()`
 	var focused bool
 	if err := chromedp.Run(typeCtx, chromedp.Evaluate(focusJS, &focused)); err != nil {
 		return fmt.Errorf("type prompt focus: %w", err)
@@ -1189,9 +1351,9 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// Calling .Do directly on the context always failed with invalid context.
 	// Keep large catalog/history pastes on the existing bounded legacy path;
 	// activating native input for those would introduce a new slow paste path.
-	if len(prompt) <= 4096 {
+	if target != "" && insertModeFor(target) != insertLegacy {
 		insCtx, insCancel := context.WithTimeout(typeCtx, 20*time.Second)
-		insErr = chromedp.Run(insCtx, input.InsertText(prompt))
+		insErr = chromedp.Run(insCtx, composerInsertActions(target)...)
 		insCancel()
 	}
 	// 3. Settle: the editor may process input asynchronously; only stable
@@ -1221,11 +1383,12 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			break
 		}
 	}
-	log.Printf("[chatgpt] type settle prompt=%d trajectory=%v inserr=%v", len(prompt), lens, insErr)
-	if settledLen <= 0 {
+	log.Printf("[chatgpt] type settle prompt=%d typed=%d trajectory=%v inserr=%v", len(prompt), len(target), lens, insErr)
+	if settledLen <= 0 && target != "" {
 		// 4. Fallback: legacy execCommand/paste for renderers where trusted
-		//    input cannot land. Composer is verified empty above, so nothing
-		//    can mix. Partial content skips this and fails loud below.
+		//    input cannot land. The composer above holds either nothing or only
+		//    our own prefix of this prompt, so nothing foreign can mix. Partial
+		//    content skips this and fails loud below.
 		// Large multiline editor commands can take tens of seconds even though
 		// no turn is being submitted. Preserve request cancellation and allow the
 		// bounded insertion to finish rather than abandoning a live DOM mutation.
@@ -1244,7 +1407,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		    if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
 		  } catch (e) {}
 		  return 'empty';
-		})()`, strconv.Quote(prompt), compSel)
+		})()`, strconv.Quote(target), compSel)
 		var legacy string
 		if err := chromedp.Run(fbCtx, chromedp.Evaluate(legacyJS, &legacy)); err != nil {
 			return fmt.Errorf("type prompt: %w", err)
