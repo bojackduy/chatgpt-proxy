@@ -30,7 +30,14 @@ func (s *session) incompleteJournal() bool {
 func incompleteJournalError(w http.ResponseWriter) {
 	writeJSON(w, 422, map[string]any{"error": map[string]any{
 		"type": "incomplete_journal", "code": "incomplete_journal",
-		"message": "session uncertainty journal lacks a complete original request/prompt binding; submission outcome is unknown. Read-only /v1/sessions/recover cannot reconstruct it safely. Explicitly POST /v1/sessions/resync with the authoritative completed transcript and recorded tool results, then send a NEW ordinary user message; historical tools will be imported inertly, never rerun",
+		"message": failureText("The saved record of this chat is incomplete: the original request is missing, so its outcome cannot be checked.", sayRecoverReset),
+		"details": map[string]any{
+			"state":       statePendingUnverifiable,
+			"can_recover": false,
+			"can_resync":  false,
+			"actions":     []string{actionAbandon},
+			"runbook":     "explicit continuation boundary: POST /v1/sessions/resync with the authoritative completed transcript and recorded tool results, then send a NEW ordinary user message; historical tools are imported inertly and never rerun; explicit clear: POST /v1/sessions/abandon naming this session",
+		},
 	}})
 }
 
@@ -187,9 +194,9 @@ const (
 // reported as a refusal rather than as empty output.
 func rejectionAdvice(reason string) string {
 	if reason == rejectEmptyFinal {
-		return "completed model output was empty; no new tool calls were delivered; send a distinct new ordinary user message to continue"
+		return failureText(rejectionUnknown(reason), nextNewMessage)
 	}
-	return "completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message to continue in a fresh thread"
+	return failureText(rejectionUnknown(reason), nextFreshThread)
 }
 
 // A finished, bound response that failed strict validation cannot have delivered
@@ -269,6 +276,13 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 409, errors.New("only inert history import was interrupted; resume the completion request to continue replay; there is no submitted final response to recover"))
 		return
 	}
+	// adoptable() is the single predicate behind this endpoint's acceptance —
+	// the same one /v1/sessions/state reports as can_recover. Reaching here
+	// means the exact original request binding is intact.
+	if !s.adoptable() {
+		apiError(w, 409, fmt.Errorf("pending turn has no retained exact request for read-only adoption; %s", h.sentDiagnosis(id, s)))
+		return
+	}
 	req := s.PendingRequest
 	if supplied != nil && requestFingerprint(supplied.completionsRequest) != requestFingerprint(*req) {
 		apiError(w, 409, fmt.Errorf("supplied request does not match the exact original pending request; %s", h.sentDiagnosis(id, s)))
@@ -329,7 +343,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 500, serr)
 			return
 		}
-		apiError(w, 422, errors.New("completed stored output failed strict protocol validation; no tool calls were delivered; continue with a new ordinary user message"))
+		apiError(w, 422, errors.New(failureText(rejectionUnknown(rejectToolProtocol), nextNewMessage)))
 		return
 	}
 	if out.Text == "" && len(out.Calls) == 0 {

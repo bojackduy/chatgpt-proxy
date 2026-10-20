@@ -789,6 +789,38 @@ inertly into a fresh Project thread as described above and no historical
 tool is rerun. Until then the session stays dirty and any new request is
 rejected — that rejection is the safeguard working, not a bug.
 
+### Recovery state and explicit abandonment
+
+`GET /v1/sessions/state` with the same session header answers "what is this chat's
+recovery state, and what can I actually do" without reading a runbook. It is
+read-only — no submission, no browser work, no journal write — and returns enums,
+booleans, counts and sizes only: `state`, `can_recover`, `can_resync`,
+`thread_url_present`, `completed_messages`, `pending_prompt_bytes`,
+`outstanding_tool_calls`, a plain-English `summary`, and the `actions` that are
+really available. The classes are derived from the resolvers' own predicates, so
+`can_recover` is exactly the `recoverSession` acceptance test and `can_resync` is
+exactly the `resyncSession` one. No prompt text, tool arguments, call IDs or
+message bodies are ever returned.
+
+`POST /v1/sessions/abandon` with `{"sessions":["ses_…"],"reason":"…"}` clears the
+pending-turn binding of sessions named **explicitly**. It refuses the whole
+request for an empty id, a wildcard, `all`/`any`, more than 64 ids, a
+non-POST method, or any `Origin` header (it is an operator mutation, not a
+browser API), and returns 503 while a turn is in flight rather than queueing.
+Only `Dirty`, `Phase`, the pending request/prompt/repair prompt and the armed
+resync are cleared: the completed transcript, thread URL, cache identity,
+result, tool fingerprint and every evidence field are retained, and the response
+accounts for delivered calls, recorded results and outstanding calls before the
+clear. Persistence happens before the response; a failed write rolls back and
+returns 500. Per-session outcomes are `abandoned`, `not_pending` (including a
+known-rejected output, which already has a safe continuation) or `unknown`.
+Abandonment is a deliberate boundary, never proof the old turn succeeded.
+
+Terminal failures shown in chat are actionable: one plain-English sentence about
+what is unknown, an explicit statement that nothing was resent and no tools were
+re-run, and the single thing the user can say next. HTTP runbooks live in
+`error.details` and the logs, never in the sentence.
+
 Live continuity proof (isolated session, codeword recall): fresh +
 `decision=delta` + `decision=delta` on one Project thread, service
 restart with journal reload, then a fourth resumed turn `decision=delta`

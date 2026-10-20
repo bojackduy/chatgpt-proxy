@@ -430,7 +430,10 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	if err != nil {
 		repaired, state := h.requestFormatRepair(r, id, lane, res.URL, req, res.Answer, thinking)
 		if state == repairUncertain || state == repairStoreFailed {
-			apiError(w, 422, errors.New("format repair outcome is uncertain or not durably stored; pending binding retained; recover read-only, do not resubmit"))
+			// Same class and status as the direct-path repair refusal: the bounded
+			// repair turn is unverifiable, so the binding is retained and the
+			// chat sentence stays actionable instead of naming an endpoint.
+			apiError(w, 422, errors.New(failureText("An automatic second attempt at a usable reply could not be confirmed, so this chat still holds an unknown turn.", sayRecoverReset)))
 			return true
 		}
 		if state == repairCompleted {
@@ -452,7 +455,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 			return true
 		}
 		log.Printf("[openai] invalid tool protocol session=%s lane=%s decision=rotation thread=%s", id, lane, res.URL)
-		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message"))
+		apiError(w, 422, errors.New(failureText(rejectionUnknown(rejectToolProtocol), nextNewMessage)))
 		return true
 	}
 	out.Reasoning = res.Reasoning

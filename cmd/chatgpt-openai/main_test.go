@@ -2149,3 +2149,139 @@ func TestRasterImagesStreamedAsDelta(t *testing.T) {
 		t.Fatalf("stream missing png delta: %d %q", w.Code, w.Body.String())
 	}
 }
+
+// A terminal failure must be actionable by a person: what is unknown, the
+// explicit no-resend/no-rerun promise, and one thing they can SAY next. The
+// HTTP runbook belongs in structured detail and logs, never in the sentence.
+// The four classes must stay distinct and the pre-submit path must stay
+// immediately retryable instead of being handed recovery advice.
+func TestTerminalFailuresAreActionableAndKeepClassification(t *testing.T) {
+	type detail struct {
+		State      string   `json:"state"`
+		Actions    []string `json:"actions"`
+		CanRecover bool     `json:"can_recover"`
+		CanResync  bool     `json:"can_resync"`
+		Runbook    string   `json:"runbook"`
+	}
+	envelope := func(t *testing.T, w *httptest.ResponseRecorder) (string, detail) {
+		t.Helper()
+		var v struct {
+			Error struct {
+				Message string `json:"message"`
+				Details detail `json:"details"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+			t.Fatalf("not structured JSON: %d %s", w.Code, w.Body.String())
+		}
+		return v.Error.Message, v.Error.Details
+	}
+
+	t.Run("genuinely unverifiable gives one actionable sentence", func(t *testing.T) {
+		f := &fakeBackend{}
+		h := testHandler(f)
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		h.sessions["stuck"] = &session{Dirty: true}
+		w := request(h, "stuck", weatherReq())
+		if w.Code != 422 {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		msg, det := envelope(t, w)
+		for _, want := range []string{"saved record of this chat is incomplete", "Nothing from your previous message was resent", `say "run chatgpt-recover and reset this chat"`} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("message missing %q: %s", want, msg)
+			}
+		}
+		if strings.Contains(msg, "POST /v1/sessions") || strings.Contains(msg, "http") {
+			t.Fatalf("runbook leaked into the chat sentence: %s", msg)
+		}
+		if det.State != statePendingUnverifiable || len(det.Actions) != 1 || det.Actions[0] != actionAbandon || !strings.Contains(det.Runbook, "POST /v1/sessions/abandon") {
+			t.Fatalf("machine-actionable detail missing: %+v", det)
+		}
+		if len(f.prompts) != 0 || h.sessions["stuck"].Dirty != true {
+			t.Fatal("refusal submitted a turn or cleared uncertainty")
+		}
+	})
+
+	t.Run("verifiable pending offers recovery instead of a reset", func(t *testing.T) {
+		f := &fakeBackend{}
+		h := testHandler(f)
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		req := weatherReq()
+		h.sessions["waiting"] = &session{Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "p"}
+		w := request(h, "waiting", req)
+		if w.Code != 422 {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		msg, det := envelope(t, w)
+		if !strings.Contains(msg, "can still be read back") || !strings.Contains(msg, `say "run chatgpt-recover"`) || strings.Contains(msg, "reset this chat") {
+			t.Fatalf("verifiable pending misreported: %s", msg)
+		}
+		if det.State != statePendingVerifiable || !det.CanRecover {
+			t.Fatalf("detail lost the recovery capability: %+v", det)
+		}
+		if len(f.prompts) != 0 {
+			t.Fatal("uncertain turn was resubmitted")
+		}
+	})
+
+	t.Run("rejected-but-produced output is not reported as empty", func(t *testing.T) {
+		f := &fakeBackend{}
+		h := testHandler(f)
+		req := weatherReq()
+		h.sessions["rej"] = &session{URL: "https://chatgpt.com/c/t", Phase: "invalid", RejectedFingerprint: requestFingerprint(req), RejectReason: rejectToolProtocol}
+		w := request(h, "rej", req)
+		if w.Code != 422 {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		msg, _ := envelope(t, w)
+		if !strings.Contains(msg, "replied in a form that could not be used") || strings.Contains(msg, "without producing an answer") {
+			t.Fatalf("protocol refusal misreported: %s", msg)
+		}
+		if !strings.Contains(msg, noResend) || !strings.Contains(msg, nextFreshThread) {
+			t.Fatalf("refusal is not actionable: %s", msg)
+		}
+		if len(f.prompts) != 0 {
+			t.Fatal("rejected output was resubmitted")
+		}
+	})
+
+	t.Run("genuinely empty final is not reported as a refusal", func(t *testing.T) {
+		f := &fakeBackend{}
+		h := testHandler(f)
+		req := weatherReq()
+		h.sessions["empty"] = &session{URL: "https://chatgpt.com/c/t", Phase: "invalid", RejectedFingerprint: requestFingerprint(req), RejectReason: rejectEmptyFinal}
+		w := request(h, "empty", req)
+		if w.Code != 422 {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		msg, _ := envelope(t, w)
+		if !strings.Contains(msg, "finished without producing an answer") || strings.Contains(msg, "could not be used") {
+			t.Fatalf("empty final misreported: %s", msg)
+		}
+		if len(f.prompts) != 0 {
+			t.Fatal("completed-empty turn was resubmitted")
+		}
+	})
+
+	t.Run("proven pre-submit failure stays immediately retryable", func(t *testing.T) {
+		f := &fakeBackend{err: chatgpt.ErrNotSubmitted}
+		h := testHandler(f)
+		h.statePath = filepath.Join(t.TempDir(), "state.json")
+		req := weatherReq()
+		w := request(h, "pre", req)
+		if w.Code == 422 || strings.Contains(w.Body.String(), "chatgpt-recover") {
+			t.Fatalf("pre-submit failure handed recovery advice: %d %s", w.Code, w.Body.String())
+		}
+		if s := h.sessions["pre"]; s == nil || s.Dirty || s.PendingRequest != nil {
+			t.Fatalf("pre-submit failure kept uncertainty: %+v", s)
+		}
+		if v := stateBody(t, h, "pre"); fmt.Sprint(v["state"]) != stateClean {
+			t.Fatalf("pre-submit failure not reported clean: %v", v["state"])
+		}
+		f.err, f.answers = nil, []string{"", weatherAnswer} // index by prompt count: the failed attempt was prompt 1
+		if a := assistant(t, request(h, "pre", req)); len(a.ToolCalls) != 1 {
+			t.Fatalf("retry after a proven pre-submit failure did not run: %+v", a)
+		}
+	})
+}

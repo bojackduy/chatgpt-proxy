@@ -68,12 +68,14 @@ func (h *handler) resyncSession(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 	s := h.sessions[id]
-	if s == nil || !s.Dirty || s.URL == "" || !prefix(input.Messages, s.Messages) {
-		apiError(w, 409, errors.New("resync must extend the recorded uncertain session transcript"))
+	// resyncable() is the single predicate behind this endpoint's acceptance —
+	// the same one /v1/sessions/state reports as can_resync.
+	if !s.resyncable() {
+		apiError(w, 409, errors.New("resync requires an uncertain session with a recorded transcript and thread; nothing to reconcile"))
 		return
 	}
-	if len(s.Messages) == 0 {
-		apiError(w, 409, errors.New("no recorded transcript in journal"))
+	if !prefix(input.Messages, s.Messages) {
+		apiError(w, 409, errors.New("resync must extend the recorded uncertain session transcript"))
 		return
 	}
 	last := s.Messages[len(s.Messages)-1]

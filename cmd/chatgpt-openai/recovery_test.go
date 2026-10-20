@@ -787,10 +787,10 @@ func TestCompletedEmptyFinalIsReportedAsEmptyNotRefused(t *testing.T) {
 		t.Fatalf("completed empty final not durably rejected: %d %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "completed model output was empty; no new tool calls were delivered") {
+	if !strings.Contains(body, "finished without producing an answer") {
 		t.Fatalf("empty final misreported: %s", body)
 	}
-	if strings.Contains(body, "strict tool protocol validation") {
+	if strings.Contains(body, "could not be used") {
 		t.Fatalf("empty final reported as a protocol refusal: %s", body)
 	}
 	if got := rejectionClass(t, h.statePath, "recover"); got != "empty_final" {
@@ -824,7 +824,7 @@ func TestProtocolRefusalIsReportedAsRefusedNotEmpty(t *testing.T) {
 	if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
 		t.Fatalf("schema-invalid stored answer not refused: %d %s", w.Code, w.Body.String())
 	}
-	if body := w.Body.String(); !strings.Contains(body, "strict protocol validation") || strings.Contains(body, "was empty") {
+	if body := w.Body.String(); !strings.Contains(body, "replied in a form that could not be used") || strings.Contains(body, "without producing an answer") {
 		t.Fatalf("protocol refusal misreported: %s", body)
 	}
 	if got := rejectionClass(t, h.statePath, "recover"); got != "tool_protocol" {
@@ -832,7 +832,287 @@ func TestProtocolRefusalIsReportedAsRefusedNotEmpty(t *testing.T) {
 	}
 	// The recover gate must name the refusal, never emptiness.
 	gate := recoveryRequest(h, nil)
-	if gate.Code != 422 || !strings.Contains(gate.Body.String(), "strict tool protocol validation") || strings.Contains(gate.Body.String(), "was empty") {
+	if gate.Code != 422 || !strings.Contains(gate.Body.String(), "replied in a form that could not be used") || strings.Contains(gate.Body.String(), "without producing an answer") {
 		t.Fatalf("recover gate misreported the refusal: %d %s", gate.Code, gate.Body.String())
+	}
+}
+
+// --- user-facing recovery contract ---------------------------------------
+
+func stateGet(h *handler, id, method string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, "/v1/sessions/state", nil)
+	if id != "" {
+		r.Header.Set("X-Session-Id", id)
+	}
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, r)
+	return w
+}
+
+func stateBody(t *testing.T, h *handler, id string) map[string]any {
+	t.Helper()
+	w := stateGet(h, id, "GET")
+	if w.Code != 200 {
+		t.Fatalf("state %d: %s", w.Code, w.Body.String())
+	}
+	var v map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func abandonPost(h *handler, body string, origin string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest("POST", "/v1/sessions/abandon", strings.NewReader(body))
+	if origin != "" {
+		r.Header.Set("Origin", origin)
+	}
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, r)
+	return w
+}
+
+func stateActionsOf(v map[string]any) []string {
+	raw, _ := v["actions"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, a := range raw {
+		out = append(out, fmt.Sprint(a))
+	}
+	return out
+}
+
+// The inspector must name all four failure classes distinctly, and each action
+// list must contain only what is really available.
+func TestSessionStateDistinguishesRecoveryClasses(t *testing.T) {
+	req := weatherReq()
+	cases := []struct {
+		name       string
+		session    *session
+		absent     bool
+		state      string
+		canRecover bool
+		canResync  bool
+		actions    []string
+	}{
+		{"absent", nil, true, stateUnknownSession, false, false, []string{}},
+		{"clean", &session{URL: "https://chatgpt.com/c/t", Messages: []message{{Role: "user", Content: "hi"}}}, false, stateClean, false, false, []string{actionContinue}},
+		{"proven pre-submit keeps no uncertainty", &session{URL: "https://chatgpt.com/c/t", Messages: []message{{Role: "user", Content: "hi"}}}, false, stateClean, false, false, []string{actionContinue}},
+		{"adoptable pending", &session{URL: "https://chatgpt.com/c/t", Messages: []message{{Role: "user", Content: "hi"}}, Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "p"}, false, statePendingVerifiable, true, true, []string{actionRecover, actionResync, actionAbandon}},
+		{"inert replay only", &session{Dirty: true, Phase: "replay"}, false, statePendingVerifiable, false, false, []string{actionContinue, actionAbandon}},
+		{"resync only", &session{URL: "https://chatgpt.com/c/t", Dirty: true, Messages: []message{{Role: "user", Content: "hi"}}}, false, statePendingVerifiable, false, true, []string{actionResync, actionAbandon}},
+		{"genuinely unverifiable", &session{Dirty: true}, false, statePendingUnverifiable, false, false, []string{actionAbandon}},
+		{"rejected output", &session{Phase: "invalid", RejectedFingerprint: "fp", RejectReason: rejectToolProtocol}, false, stateRejectedOutput, false, false, []string{actionContinue}},
+		{"empty final", &session{Phase: "invalid", RejectedFingerprint: "fp", RejectReason: rejectEmptyFinal}, false, stateEmptyFinal, false, false, []string{actionContinue}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := testHandler(&fakeBackend{})
+			if !c.absent {
+				h.sessions["state"] = c.session
+			}
+			v := stateBody(t, h, "state")
+			if got := fmt.Sprint(v["state"]); got != c.state {
+				t.Fatalf("state %q want %q (%v)", got, c.state, v)
+			}
+			if v["can_recover"] != c.canRecover || v["can_resync"] != c.canResync {
+				t.Fatalf("can_recover/can_resync = %v/%v want %v/%v", v["can_recover"], v["can_resync"], c.canRecover, c.canResync)
+			}
+			if got := stateActionsOf(v); strings.Join(got, ",") != strings.Join(c.actions, ",") {
+				t.Fatalf("actions %v want %v", got, c.actions)
+			}
+			if s, _ := v["summary"].(string); s == "" {
+				t.Fatal("missing plain-English summary")
+			}
+		})
+	}
+}
+
+// The inspector is read-only and content-free: no prompt text, tool arguments,
+// message bodies or call ids, and no journal mutation or browser work.
+func TestSessionStateLeaksNoContentAndDoesNotMutate(t *testing.T) {
+	const secret = "SECRETPROMPTTEXT-should-never-appear"
+	const argSecret = "ARGSECRET-should-never-appear"
+	req := completionsRequest{Messages: []message{{Role: "user", Content: secret}}, Tools: []toolDef{{Type: "function", Function: toolFunction{Name: "get_weather", Parameters: map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string", "description": argSecret}}}}}}}
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.sessions["leak"] = &session{
+		URL: "https://chatgpt.com/c/leak", Fingerprint: "fp",
+		Messages: []message{
+			{Role: "user", Content: secret},
+			{Role: "assistant", ToolCalls: []toolCall{{ID: "call_secret_id", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"` + argSecret + `"}`}}}},
+			{Role: "tool", ToolCallID: "call_secret_id", Content: "29 C"},
+		},
+		Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: secret + " pending",
+	}
+	before, _ := json.Marshal(h.sessions["leak"])
+
+	w := stateGet(h, "leak", "GET")
+	if w.Code != 200 {
+		t.Fatalf("state %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, leak := range []string{secret, argSecret, "call_secret_id", "Now produce the next assistant reply", "/v1/sessions/recover"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("state inspector leaked %q: %s", leak, body)
+		}
+	}
+	var v map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{"session": true, "state": true, "can_recover": true, "can_resync": true, "thread_url_present": true, "completed_messages": true, "pending_prompt_bytes": true, "outstanding_tool_calls": true, "summary": true, "actions": true}
+	for k := range v {
+		if !allowed[k] {
+			t.Fatalf("unexpected field %q in state body", k)
+		}
+	}
+	if v["completed_messages"] != float64(3) || v["pending_prompt_bytes"] != float64(len(secret+" pending")) || v["outstanding_tool_calls"] != float64(0) {
+		t.Fatalf("counts/sizes wrong: %v", v)
+	}
+	if len(f.prompts) != 0 || len(f.urls) != 0 {
+		t.Fatal("state inspection touched the browser")
+	}
+	after, _ := json.Marshal(h.sessions["leak"])
+	if !bytes.Equal(before, after) {
+		t.Fatal("state inspection mutated the journal")
+	}
+	if w := stateGet(h, "leak", "POST"); w.Code != 405 {
+		t.Fatalf("state accepted POST: %d", w.Code)
+	}
+	if w := stateGet(h, "", "GET"); w.Code != 400 {
+		t.Fatalf("state accepted a missing identity: %d", w.Code)
+	}
+}
+
+// Abandon is an explicit, named, non-wildcard operation. Anything else is
+// refused WHOLE and changes nothing.
+func TestAbandonRefusesImplicitOrBrowserRequests(t *testing.T) {
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["keep"] = &session{URL: "https://chatgpt.com/c/t", Dirty: true, Phase: "final", PendingPrompt: "p"}
+
+	for _, body := range []string{`{"sessions":[]}`, `{"sessions":["*"]}`, `{"sessions":["keep","all"]}`, `{"sessions":["any"]}`, `{"sessions":[""]}`, `{`} {
+		w := abandonPost(h, body, "")
+		if w.Code != 400 {
+			t.Fatalf("body %s not refused whole: %d %s", body, w.Code, w.Body.String())
+		}
+		if !h.sessions["keep"].Dirty {
+			t.Fatalf("refused body %s still cleared the journal", body)
+		}
+	}
+	var many []string
+	for i := 0; i < maxAbandonSessions+1; i++ {
+		many = append(many, fmt.Sprintf("ses_%d", i))
+	}
+	over, _ := json.Marshal(map[string]any{"sessions": many})
+	if w := abandonPost(h, string(over), ""); w.Code != 400 {
+		t.Fatalf("over-cap list accepted: %d", w.Code)
+	}
+	// A browser-originated POST (cross-site fetch to loopback) is refused.
+	if w := abandonPost(h, `{"sessions":["keep"]}`, "https://attacker.example"); w.Code != 403 || !h.sessions["keep"].Dirty {
+		t.Fatalf("browser-originated abandon not refused: %d %s", w.Code, w.Body.String())
+	}
+	if w := abandonPost(h, `{"sessions":["keep"]}`, ""); w.Code != 200 {
+		t.Fatalf("explicit abandon failed: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// Abandon clears ONLY the pending binding: transcript, thread, cache identity
+// and executed results survive, and it survives a restart.
+func TestAbandonClearsOnlyNamedSessionsAndRetainsHistory(t *testing.T) {
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	delivered := message{Role: "assistant", ToolCalls: []toolCall{
+		{ID: "call_done", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Hanoi"}`}},
+		{ID: "call_open", Type: "function", Function: callFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`}},
+	}}
+	h.sessions["go"] = &session{
+		URL: "https://chatgpt.com/c/go", Fingerprint: "cache-fp", ToolsFP: "tools-fp",
+		Messages:            []message{{Role: "user", Content: "hi"}, delivered, {Role: "tool", ToolCallID: "call_done", Content: "25 C"}},
+		Result:              result{ID: "chatcmpl-cached", Text: "cached answer"},
+		Project:             "https://chatgpt.com/g/g-p-project",
+		RejectedFingerprint: "rejected-fp", RejectReason: rejectToolProtocol,
+		RepairFingerprint: "repair-fp", RepairPendingPrompt: "repair prompt",
+		Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "stuck pending prompt",
+		ResyncMessages: []message{{Role: "user", Content: "reviewed"}}, ResyncFrom: "https://chatgpt.com/c/old",
+	}
+	h.sessions["other"] = &session{URL: "https://chatgpt.com/c/other", Dirty: true, Phase: "final", PendingPrompt: "other pending"}
+
+	w := abandonPost(h, `{"sessions":["go"],"reason":"operator reviewed the thread"}`, "")
+	if w.Code != 200 {
+		t.Fatalf("abandon %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Requested int `json:"requested"`
+		Abandoned int `json:"abandoned"`
+		Results   []abandonOutcome
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Requested != 1 || body.Abandoned != 1 || len(body.Results) != 1 || body.Results[0].Outcome != "abandoned" {
+		t.Fatalf("unexpected abandon response: %s", w.Body.String())
+	}
+	if r := body.Results[0]; r.DeliveredCalls != 2 || r.RecordedResults != 1 || r.OutstandingCalls != 1 || r.AbandonedBytes != len("stuck pending prompt") || r.StateBefore != statePendingVerifiable {
+		t.Fatalf("abandon did not account for delivered/executed work: %+v", r)
+	}
+	s := h.sessions["go"]
+	if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" || s.RepairPendingPrompt != "" || s.ResyncMessages != nil || s.ResyncFrom != "" {
+		t.Fatalf("pending binding not fully cleared: %+v", s)
+	}
+	if s.URL != "https://chatgpt.com/c/go" || s.Fingerprint != "cache-fp" || s.ToolsFP != "tools-fp" || s.Result.ID != "chatcmpl-cached" || len(s.Messages) != 3 || s.Project == "" || s.RejectedFingerprint != "rejected-fp" || s.RejectReason != rejectToolProtocol || s.RepairFingerprint != "repair-fp" {
+		t.Fatalf("abandon discarded retained history/identity: %+v", s)
+	}
+	if other := h.sessions["other"]; !other.Dirty || other.PendingPrompt != "other pending" {
+		t.Fatal("abandon touched a session it was not given")
+	}
+	// A named session that is not pending is reported, never silently cleared.
+	if w := abandonPost(h, `{"sessions":["go","missing"]}`, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"not_pending"`) || !strings.Contains(w.Body.String(), `"unknown"`) {
+		t.Fatalf("per-session outcome not explicit: %d %s", w.Code, w.Body.String())
+	}
+	// Durable: a restart sees the cleared binding and the retained transcript.
+	h2 := testHandler(f)
+	h2.statePath = h.statePath
+	if err := h2.load(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded := h2.sessions["go"]; reloaded == nil || reloaded.Dirty || len(reloaded.Messages) != 3 || reloaded.URL == "" {
+		t.Fatalf("abandonment not durable: %+v", reloaded)
+	}
+}
+
+func TestAbandonNeverReportsSuccessWithoutDurability(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.statePath = t.TempDir() // a directory: the atomic rename cannot succeed
+	req := weatherReq()
+	h.sessions["go"] = &session{URL: "https://chatgpt.com/c/go", Messages: []message{{Role: "user", Content: "hi"}}, Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "p"}
+	w := abandonPost(h, `{"sessions":["go"]}`, "")
+	if w.Code != 500 {
+		t.Fatalf("non-durable clear reported %d: %s", w.Code, w.Body.String())
+	}
+	if s := h.sessions["go"]; !s.Dirty || s.Phase != "final" || s.PendingPrompt != "p" {
+		t.Fatalf("failed persistence was not rolled back: %+v", s)
+	}
+	if v := stateBody(t, h, "go"); fmt.Sprint(v["state"]) != statePendingVerifiable {
+		t.Fatalf("rollback left the inspector claiming %v", v["state"])
+	}
+}
+
+func TestAbandonRefusedWhileTurnInFlight(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.sessions["go"] = &session{URL: "https://chatgpt.com/c/go", Dirty: true, Phase: "final", PendingPrompt: "p"}
+	h.gate <- struct{}{} // a live turn holds the whole-turn gate
+	defer func() { <-h.gate }()
+	if w := abandonPost(h, `{"sessions":["go"]}`, ""); w.Code != 503 {
+		t.Fatalf("abandon ran next to a live turn: %d %s", w.Code, w.Body.String())
+	}
+	if s := h.sessions["go"]; !s.Dirty || s.PendingPrompt != "p" {
+		t.Fatal("busy refusal changed the journal")
+	}
+	if w := abandonPost(h, `{"sessions":["go"]}`, ""); w.Code == 200 {
+		t.Fatal("abandon succeeded while a turn was in flight")
 	}
 }

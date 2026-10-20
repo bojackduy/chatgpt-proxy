@@ -228,6 +228,10 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", h.transactionRoute((*handler).completions))
 	mux.HandleFunc("/v1/sessions/recover", h.transactionRoute((*handler).recoverSession))
 	mux.HandleFunc("/v1/sessions/resync", h.transactionRoute((*handler).resyncSession))
+	// Read-only state inspection and explicit operator abandonment are plain
+	// JSON endpoints: neither takes a browser transaction nor submits a turn.
+	mux.HandleFunc("/v1/sessions/state", h.sessionState)
+	mux.HandleFunc("/v1/sessions/abandon", h.abandonSessions)
 	return mux
 }
 func (h *handler) acquire(ctx context.Context) bool {
@@ -1299,7 +1303,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256(b))
 	resync := len(s.ResyncMessages) > 0
 	if resync && !freshResyncUser(s, req) {
-		apiError(w, 409, errors.New("resync requires a distinct new ordinary user message after the reviewed completed history; old requests, tool results and system-update metadata are not a new continuation boundary"))
+		apiError(w, 409, errors.New(failureText("This chat is waiting for a new message before it can continue from the reviewed history.", nextNewMessage)))
 		return
 	}
 	if resync && (!prefix(req.Messages, s.ResyncMessages) || len(req.Messages) <= len(s.ResyncMessages) || req.Messages[len(s.ResyncMessages)].Role != "user") {
@@ -1323,7 +1327,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		if h.rearmResyncFromLive(id, s, req) {
 			log.Printf("[openai] session=%s resync_rearmed history=%d; proceeding", id, len(s.ResyncMessages))
 		} else {
-			apiError(w, 409, errors.New("resync requires the authoritative completed transcript followed by a new user message; do not retry the uncertain original request"))
+			apiError(w, 409, errors.New(failureText("This chat is waiting for a new message before it can continue from the reviewed history: the recorded review no longer matches what was sent.", nextNewMessage)))
 			return
 		}
 	}
@@ -1362,7 +1366,9 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// Installed v2 retries HTTP409 as provider.internal. This request
 			// cannot safely progress without recovery, so return terminal422
 			// while retaining the exact same uncertainty/adoption protections.
-			apiError(w, 422, fmt.Errorf("session has an uncertain submitted turn; switching models does not resolve it. POST /v1/sessions/recover with the same session header and exact original request for read-only validation/cache; do not resubmit the original turn. If the original browser response cannot be verified, explicitly POST /v1/sessions/resync with the recorded completed transcript and tool results, then send a new user message; historical tools will not be rerun; %s", h.sentDiagnosis(id, s)))
+			// The chat-visible sentence stays actionable; the operator runbook
+			// lives in error.details and the log, never in the message.
+			h.uncertainFailure(w, id, s)
 			return
 		}
 	}
@@ -1409,7 +1415,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !freshUser {
-			apiError(w, 422, errors.New("rejected model output requires a distinct new ordinary user message at the end of the authoritative transcript; no tool calls were delivered"))
+			apiError(w, 422, errors.New(failureText(rejectionUnknown(s.RejectReason), nextNewMessage)))
 			return
 		}
 		// Do not consume the durable rejection gate until the new request has
@@ -1634,7 +1640,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if err != nil && finalTurn && id != "" && !resync {
 		repaired, state := h.requestFormatRepair(r, id, lane, url, req, answer, thinking)
 		if state == repairUncertain || state == repairStoreFailed {
-			apiError(w, 422, errors.New("format repair outcome is uncertain or not durably stored; pending binding retained; recover read-only, do not resubmit"))
+			apiError(w, 422, errors.New(failureText("An automatic second attempt at a usable reply could not be confirmed, so this chat still holds an unknown turn.", sayRecoverReset)))
 			return
 		}
 		if state == repairCompleted {
@@ -1654,7 +1660,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		log.Printf("[openai] invalid tool protocol session=%s thread=%s", id, url)
-		apiError(w, 422, errors.New("completed model output failed strict tool protocol validation; no tool calls were delivered; send a new ordinary user message"))
+		apiError(w, 422, errors.New(failureText(rejectionUnknown(rejectToolProtocol), nextNewMessage)))
 		return
 	}
 	out.Reasoning = reasoning
@@ -1700,7 +1706,10 @@ func (h *handler) backendError(w http.ResponseWriter, err error) {
 		// Generation was observed but no answer can be delivered. A 5xx makes
 		// installed hosts retry an already-submitted turn. Keep its journal;
 		// lack of rendered text is not proof that the model generated nothing.
-		apiError(w, 422, err)
+		// The raw browser error stays in the log: a person gets the outcome and
+		// the one thing they can say, not a selector diagnostic.
+		log.Printf("[openai] missing answer: %v", err)
+		apiError(w, 422, errors.New(failureText("The browser finished without a confirmable answer, so this reply is unknown.", sayRecover)))
 		return
 	}
 	apiError(w, 502, err)

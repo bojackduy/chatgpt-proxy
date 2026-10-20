@@ -31,6 +31,17 @@ func (h *handler) enableParallel(clients []backend) {
 	h.parallel = p
 }
 
+// releaseSession drops one reference to a session lock and removes it when
+// no transaction holds or awaits it.
+func (p *parallelState) releaseSession(id string, l *sessionLock) {
+	p.mu.Lock()
+	l.refs--
+	if l.refs == 0 {
+		delete(p.locks, id)
+	}
+	p.mu.Unlock()
+}
+
 func (p *parallelState) lockSession(ctx context.Context, id string) (func(), bool) {
 	if ctx.Err() != nil {
 		return nil, false
@@ -43,19 +54,33 @@ func (p *parallelState) lockSession(ctx context.Context, id string) (func(), boo
 	}
 	l.refs++
 	p.mu.Unlock()
-	drop := func() {
-		p.mu.Lock()
-		l.refs--
-		if l.refs == 0 {
-			delete(p.locks, id)
-		}
-		p.mu.Unlock()
-	}
 	select {
 	case l.gate <- struct{}{}:
-		return func() { <-l.gate; drop() }, true
+		return func() { <-l.gate; p.releaseSession(id, l) }, true
 	case <-ctx.Done():
-		drop()
+		p.releaseSession(id, l)
+		return nil, false
+	}
+}
+
+// tryLockSession takes this session's turn lock WITHOUT waiting. The operator
+// abandonment path uses it so it can never queue behind, or interleave with, a
+// live turn on the same session: a queued clear that lands after the turn
+// commits would silently undo the abandonment.
+func (p *parallelState) tryLockSession(id string) (func(), bool) {
+	p.mu.Lock()
+	l := p.locks[id]
+	if l == nil {
+		l = &sessionLock{gate: make(chan struct{}, 1)}
+		p.locks[id] = l
+	}
+	l.refs++
+	p.mu.Unlock()
+	select {
+	case l.gate <- struct{}{}:
+		return func() { <-l.gate; p.releaseSession(id, l) }, true
+	default:
+		p.releaseSession(id, l)
 		return nil, false
 	}
 }
