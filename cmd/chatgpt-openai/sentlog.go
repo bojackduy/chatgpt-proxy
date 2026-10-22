@@ -3,7 +3,6 @@ package main
 import (
 	"chatgpt-proxy/internal/chatgpt"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -123,7 +122,7 @@ func (h *handler) recordTurnOutcome(id, prompt, previousURL string, res chatgpt.
 	disposition, answer := "completed", ""
 	if err != nil {
 		disposition = "interrupted"
-		if errors.Is(err, chatgpt.ErrNotSubmitted) {
+		if chatgpt.IsPreSubmit(err) {
 			disposition = "failed"
 		}
 	} else {

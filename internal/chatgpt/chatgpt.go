@@ -9,6 +9,7 @@ package chatgpt
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/target"
@@ -51,7 +53,21 @@ var (
 	ErrMissingAnswer  = errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread/rendering and recover the pending turn; no automatic resubmission")
 	ErrProjectSetup   = errors.New("project setup failed before turn submission")
 	ErrNotSubmitted   = errors.New("turn failed before any submission action")
+	// ErrForeignDraft marks a refusal that RETRYING CANNOT FIX: the composer
+	// holds text this bridge cannot prove it wrote, or proves it wrote a turn
+	// that may already have been dispatched. It deliberately does NOT wrap
+	// ErrNotSubmitted so callers cannot classify it as a safe retry.
+	ErrForeignDraft = errors.New("composer holds a draft this bridge cannot verify; refusing to overwrite it")
+	ErrDraftOwned   = errors.New("composer holds this bridge's own draft from a turn whose submission may have been dispatched; refusing to touch it")
 )
+
+// IsPreSubmit reports a failure proven to have happened before any submission
+// action, so the session stays clean instead of becoming uncertain. It does NOT
+// imply that retrying helps: a foreign draft is pre-submit yet needs a person,
+// which is why retryability is decided separately.
+func IsPreSubmit(err error) bool {
+	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned)
+}
 
 // IsNavigateError reports a page-navigation or explicit project-setup failure. All
 // navigate steps run before anything is typed or submitted, so a caller that
@@ -97,6 +113,13 @@ type Client struct {
 	actualPort      int
 	pool            *Pool
 	ownedTarget     target.ID
+
+	// draftMu guards draftOwn: the record of what this bridge last typed into a
+	// composer. Separate from mu on purpose — a later request must be able to
+	// reason about the leftover draft without contending for browser lifecycle
+	// state, and typing already runs under the caller's turn lock.
+	draftMu  sync.Mutex
+	draftOwn *draftRecord
 }
 
 // New builds a client with defaults for anything zero-valued.
@@ -803,13 +826,30 @@ func sameURL(a, b string) bool {
 	return trim(a) == trim(b)
 }
 
+// nonRetryablePreSubmit reports pre-send outcomes that describe a state only a
+// person can resolve. Retrying them cannot help and can look like a resubmission,
+// so they keep their own identity instead of being folded into ErrNotSubmitted.
+func nonRetryablePreSubmit(err error) bool {
+	return errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned) ||
+		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn)
+}
+
+// classifyPreSendFailure is askLocked's defer, as a pure function so the
+// classification can be asserted without a browser.
+func classifyPreSendFailure(err error, submissionAttempted bool) error {
+	if err != nil && !submissionAttempted && !nonRetryablePreSubmit(err) {
+		return errors.Join(ErrNotSubmitted, err)
+	}
+	return err
+}
+
 // askLocked owns navigation through URL capture under one browser transaction.
 func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, timeout, pollInterval time.Duration, onProgress func(string)) (out TurnResult, err error) {
 	submissionAttempted := false
 	defer func() {
-		if err != nil && !submissionAttempted {
-			err = errors.Join(ErrNotSubmitted, err)
-		}
+		// A typed draft refusal is documented as NOT wrapping ErrNotSubmitted:
+		// re-adding it here would hand callers a "safe retry" that cannot work.
+		err = classifyPreSendFailure(err, submissionAttempted)
 		if err != nil && submissionAttempted && out.URL == "" && c.tab != nil {
 			// A failed click or cancelled poll can return before the normal
 			// URL capture. Preserve an already-minted thread for read-only
@@ -892,56 +932,11 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 		}()
 	}
 
-	// 4. Submit.
-	var cprobe struct {
-		Found   bool `json:"found"`
-		Exact   bool `json:"exact"`
-		CompLen int  `json:"compLen"`
-		WantLen int  `json:"wantLen"`
-		Off     int  `json:"off"`
-	}
-	if err := chromedp.Run(tab, chromedp.Evaluate(fmt.Sprintf(`(() => {
-	  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-	  const norm = s => (s || '').replace(/\r\n?/g, '\n').trim();
-	  // Only the observed URL defusing space is equivalent, in either direction.
-	  const canonical = s => norm(s).replace(/([<(\"]) ?(https?:\/\/)/g, '$1$2');
-	  const want = canonical(%s);
-	  if (!e) return {found:false, exact:false, compLen:0, wantLen:want.length, off:0};
-	  // innerText includes visual line breaks around rendered link widgets,
-	  // not editor content. Read the current ProseMirror document instead.
-	  const node = e.pmViewDesc?.node;
-	  const text = node?.type?.name === 'doc' && typeof node.textBetween === 'function'
-	    ? node.textBetween(0, node.content.size, '\n', '\n')
-	    : e.tagName === 'TEXTAREA' ? e.value : null;
-	  if (text === null) return {found:true, exact:false, compLen:0, wantLen:want.length, off:0};
-	  const comp = canonical(text);
-	  if (comp === want) return {found:true, exact:true, compLen:comp.length, wantLen:want.length, off:0};
-	  let off = 0;
-	  const n = Math.min(comp.length, want.length);
-	  while (off < n && comp[off] === want[off]) off++;
-	  return {found:true, exact:false, compLen:comp.length, wantLen:want.length, off};
-	})()`, strconv.Quote(opt.Prompt)), &cprobe)); err != nil {
+	// 4. Submit gate. One logical read of the REAL composer document, then a
+	// provenance decision. A mismatch is never wiped blind here: text the bridge
+	// cannot prove it wrote is preserved and nothing is submitted.
+	if err := c.preSubmitGate(tab, opt.Prompt); err != nil {
 		return out, err
-	}
-	if !cprobe.Exact {
-		// Evidence for the systematic chunk-2-style mismatch: log WHERE the
-		// composer diverges so the transform can be identified, not guessed.
-		// Still fails closed — nothing submits on mismatch. Best-effort wipe
-		// first: a partial insert must not persist as a draft that poisons
-		// retries or another session's pooled tab.
-		log.Printf("[chatgpt] composer mismatch found=%v compLen=%d wantLen=%d diffoff=%d", cprobe.Found, cprobe.CompLen, cprobe.WantLen, cprobe.Off)
-		wipeCtx, wipeCancel := context.WithTimeout(tab, 5*time.Second)
-		_ = chromedp.Run(wipeCtx, chromedp.Evaluate(`(() => {
-		  const e = document.querySelector('#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-		  if (!e) return;
-		  try {
-		    if (e.tagName === 'TEXTAREA') { e.value = ''; }
-		    else { e.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
-		    e.dispatchEvent(new Event('input', { bubbles: true }));
-		  } catch (_) {}
-		})()`, nil))
-		wipeCancel()
-		return out, errors.New("composer does not exactly match this turn; nothing submitted")
 	}
 	before, err := responseProbe(tab, nil)
 	if err != nil {
@@ -1127,33 +1122,356 @@ func canonicalComposerText(s string) string {
 	return composerURLSpace.ReplaceAllString(strings.TrimSpace(s), "$1$2")
 }
 
-// draftKind says how leftover composer text relates to the prompt about to be
-// typed. Only empty text, this exact prompt, or a character prefix of this
-// prompt count as our own leftover; anything else is text we cannot account for
-// and must keep the hard refusal.
-type draftKind int
+// ---------------------------------------------------------------------------
+// Composer draft provenance.
+//
+// A refusal that compares the leftover draft only with the prompt about to be
+// typed can never recognise the bridge's own unsent draft from an EARLIER
+// request: a different prompt makes it look foreign forever. This layer records
+// what the bridge wrote, in one logical-document form, so a superseded draft
+// can be replaced after proving it is still exactly ours and that no submission
+// action was ever dispatched for it.
+// ---------------------------------------------------------------------------
+
+// composerDoc is one read of the composer's LOGICAL document. `logical` is
+// false whenever the editor model could not be read, in which case nothing may
+// be concluded about ownership: the visual DOM is not a substitute.
+type composerDoc struct {
+	Found      bool   `json:"found"`
+	Logical    bool   `json:"logical"`
+	Text       string `json:"text"`
+	Paragraphs int    `json:"paragraphs"`
+	// Rendered is a NON-authoritative hint: how much text the visual DOM shows.
+	// It is used only to decide whether ANYTHING landed (so the legacy paste
+	// fallback never runs over text that already arrived). It must never decide
+	// ownership or exactness — the model does that.
+	Rendered int    `json:"rendered"`
+	URL      string `json:"url"`
+}
+
+// composerDocJS is the ONLY reader used for draft classification, post-wipe
+// verification, settlement and the pre-submit gate. Reading the ProseMirror
+// model everywhere is what keeps those four decisions consistent: the visual
+// DOM carries extra hard breaks (measured live: model 7 newlines vs DOM 17 for
+// the same document), so mixing the two silently changes the verdict.
+func composerDocJS(sel string) string {
+	return `(() => {
+	  const el = ` + sel + `;
+	  if (!el) return { found: false, logical: false, text: '', paragraphs: 0, rendered: 0, url: '' };
+	  // Reading must not steal focus or mutate the editor: focus belongs to the
+	  // explicit insertion and wipe paths only.
+	  const node = el.pmViewDesc && el.pmViewDesc.node;
+	  let text = null, paragraphs = 0;
+	  if (node && node.type && node.type.name === 'doc' && typeof node.textBetween === 'function') {
+	    text = node.textBetween(0, node.content.size, '\n', '\n');
+	    if (typeof node.descendants === 'function') {
+	      node.descendants(n => { if (n && n.type && n.type.name === 'paragraph') paragraphs++; });
+	    }
+	  } else if (el.tagName === 'TEXTAREA') {
+	    text = el.value;
+	  }
+	  return { found: true, logical: text !== null, text: text === null ? '' : text, paragraphs: paragraphs, rendered: (el.innerText || el.value || '').trim().length, url: location.href };
+	})()`
+}
+
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
 
 const (
-	draftForeign draftKind = iota
-	draftEmpty
-	draftOwnExact
-	draftOwnPrefix
+	verdictExact     = "exact"
+	verdictTruncated = "truncated" // the document is a strict prefix of the prompt
+	verdictExtra     = "extra"     // the prompt is a strict prefix of the document
+	verdictDiverged  = "diverged"  // neither is a prefix of the other
 )
 
-// classifyDraft relates leftover composer text to the prompt being typed and,
-// for our own prefix, reports the text still missing.
-func classifyDraft(draft, prompt string) (draftKind, string) {
-	d, p := canonicalComposerText(draft), canonicalComposerText(prompt)
-	switch {
-	case d == "":
-		return draftEmpty, p
-	case d == p:
-		return draftOwnExact, ""
-	case strings.HasPrefix(p, d):
-		return draftOwnPrefix, p[len(d):]
-	default:
-		return draftForeign, ""
+// composerAlignment relates a settled document to the prompt meant to be typed.
+// Every length is UTF-16 code units — the unit the editor reports — so a
+// diagnostic can never again compare JS units with Go bytes. It carries no text.
+type composerAlignment struct {
+	Document int    `json:"document_units"`
+	Prompt   int    `json:"prompt_units"`
+	Prefix   int    `json:"common_prefix_units"`
+	Suffix   int    `json:"common_suffix_units"`
+	Verdict  string `json:"verdict"`
+}
+
+func alignComposer(document, prompt string) composerAlignment {
+	d, p := canonicalComposerText(document), canonicalComposerText(prompt)
+	a := composerAlignment{Document: utf16Len(d), Prompt: utf16Len(p)}
+	dr, pr := []rune(d), []rune(p)
+	i := 0
+	for i < len(dr) && i < len(pr) && dr[i] == pr[i] {
+		i++
 	}
+	a.Prefix = utf16Len(string(dr[:i]))
+	j := 0
+	for j < len(dr)-i && j < len(pr)-i && dr[len(dr)-1-j] == pr[len(pr)-1-j] {
+		j++
+	}
+	a.Suffix = utf16Len(string(dr[len(dr)-j:]))
+	switch {
+	case d == p:
+		a.Verdict = verdictExact
+	case strings.HasPrefix(p, d):
+		a.Verdict = verdictTruncated
+	case strings.HasPrefix(d, p):
+		a.Verdict = verdictExtra
+	default:
+		a.Verdict = verdictDiverged
+	}
+	return a
+}
+
+// draftFingerprint is a content fingerprint used ONLY as a diagnostic and as an
+// integrity check on a recorded snapshot. Ownership is decided by exact logical
+// string equality, never by a hash prefix: a truncated digest would let a
+// collision authorize an overwrite. Only this and lengths ever leave the client
+// — never the draft text.
+func draftFingerprint(s string) string {
+	sum := sha256.Sum256([]byte(canonicalComposerText(s)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// draftFingerprintShort is the log-sized form. It is never used for a decision.
+func draftFingerprintShort(s string) string {
+	return draftFingerprint(s)[:8]
+}
+
+// draftRecord is what the bridge actually LEFT in the composer: the exact
+// logical document observed after its insertion attempt, where it was typed,
+// and whether any Send action was ever dispatched for it. The intended prompt is
+// kept only to recognise a same-turn reuse — it is never proof of what landed.
+type draftRecord struct {
+	Doc       string
+	Prompt    string
+	Hash      string
+	Units     int
+	Newlines  int
+	Target    string
+	Thread    string
+	Submitted bool
+	SetAt     time.Time
+}
+
+type draftAction int
+
+const (
+	draftTypeComposer draftAction = iota // empty composer: type the prompt
+	draftReuse                           // same turn, document already exact
+	draftReplace                         // verified own snapshot from an earlier attempt
+	draftRefuseForeign
+	draftRefuseOwned
+)
+
+// decideDraft is the whole ownership rule. It never mutates anything and never
+// inspects text beyond canonical comparison.
+//
+// The ONLY thing that can authorize a clear is an exact match against the
+// snapshot the bridge observed itself writing. There is deliberately no
+// length-only, prefix-only or hash-prefix path: a user who edits a draft —
+// including deleting it down to a prefix — no longer matches that snapshot and
+// keeps their text.
+func decideDraft(doc composerDoc, rec *draftRecord, prompt, tid, thread string) draftAction {
+	if !doc.Found {
+		return draftRefuseForeign
+	}
+	if doc.Text == "" || canonicalComposerText(doc.Text) == "" {
+		return draftTypeComposer
+	}
+	// A non-empty document we cannot read from the editor model proves nothing.
+	if !doc.Logical {
+		return draftRefuseForeign
+	}
+	if rec == nil || rec.Doc == "" || rec.Hash == "" {
+		return draftRefuseForeign
+	}
+	// A record that does not describe its own snapshot is not evidence.
+	if draftFingerprint(rec.Doc) != rec.Hash {
+		return draftRefuseForeign
+	}
+	// Any dispatched Send makes the draft evidence, not scratch space.
+	if rec.Submitted {
+		return draftRefuseOwned
+	}
+	// A different tab or thread means the binding no longer holds; keep it.
+	if rec.Target != tid || rec.Thread != thread {
+		return draftRefuseForeign
+	}
+	if canonicalComposerText(doc.Text) != rec.Doc {
+		return draftRefuseForeign
+	}
+	if canonicalComposerText(prompt) == rec.Doc {
+		return draftReuse
+	}
+	return draftReplace
+}
+
+func (c *Client) draftOwnership() *draftRecord {
+	c.draftMu.Lock()
+	defer c.draftMu.Unlock()
+	if c.draftOwn == nil {
+		return nil
+	}
+	copied := *c.draftOwn
+	return &copied
+}
+
+func (c *Client) setDraftOwnership(rec *draftRecord) {
+	c.draftMu.Lock()
+	defer c.draftMu.Unlock()
+	if rec == nil {
+		c.draftOwn = nil
+		return
+	}
+	copied := *rec
+	c.draftOwn = &copied
+}
+
+func (c *Client) clearDraftOwnership() {
+	c.draftMu.Lock()
+	c.draftOwn = nil
+	c.draftMu.Unlock()
+}
+
+// recordOwnedDraft stores the exact logical document the editor was observed to
+// hold after an insertion attempt. That observation — never the prompt that was
+// meant to be typed — is what a later request may compare against. An empty
+// observation clears the record for this target/thread only, and re-observing
+// the same document never drops an existing Send fence.
+func (c *Client) recordOwnedDraft(tid, thread, prompt, observed string) {
+	doc := canonicalComposerText(observed)
+	c.draftMu.Lock()
+	defer c.draftMu.Unlock()
+	if doc == "" {
+		if c.draftOwn != nil && c.draftOwn.Target == tid && c.draftOwn.Thread == thread {
+			c.draftOwn = nil
+		}
+		return
+	}
+	submitted := false
+	if c.draftOwn != nil && c.draftOwn.Doc == doc && c.draftOwn.Target == tid && c.draftOwn.Thread == thread {
+		submitted = c.draftOwn.Submitted
+	}
+	c.draftOwn = &draftRecord{
+		Doc:       doc,
+		Prompt:    canonicalComposerText(prompt),
+		Hash:      draftFingerprint(doc),
+		Units:     utf16Len(doc),
+		Newlines:  strings.Count(doc, "\n"),
+		Target:    tid,
+		Thread:    thread,
+		Submitted: submitted,
+		SetAt:     time.Now(),
+	}
+}
+
+// markDraftSubmitted fences a draft permanently once a Send action is
+// dispatched, or its outcome is unknown. A fenced draft is never cleared,
+// reused or resent: the composer still holding it is not evidence that the
+// turn never left.
+func (c *Client) markDraftSubmitted(targetID, prompt string) {
+	c.draftMu.Lock()
+	defer c.draftMu.Unlock()
+	if c.draftOwn == nil {
+		return
+	}
+	if targetID != "" && c.draftOwn.Target != "" && c.draftOwn.Target != targetID {
+		return
+	}
+	if prompt != "" && c.draftOwn.Prompt != "" && canonicalComposerText(prompt) != c.draftOwn.Prompt {
+		return
+	}
+	c.draftOwn.Submitted = true
+}
+
+// wipeComposer clears the owned composer with a trusted deletion and PROVES the
+// logical document is empty before returning. Anything short of proven-empty is
+// a refusal: typing into a partly cleared editor is how text gets mixed, and a
+// merely visual empty state can still hold model content.
+// preSubmitGate is the last thing between a typed prompt and Send.
+//
+// It reads the composer's LOGICAL document with the same reader the draft
+// classifier uses — never innerText, never a visual guess — and requires it to
+// be exactly this turn's prompt. Anything else is a state a person must resolve:
+// the text is preserved, nothing is submitted, and no blind wipe runs. The ONE
+// safe clear is the bridge's own still-unedited residual for this same prompt,
+// and even that only after the wipe proves the editor is logically empty.
+func (c *Client) preSubmitGate(tab context.Context, prompt string) error {
+	sel := composerSelector
+	tid := ""
+	if tr := chromedp.FromContext(tab); tr != nil && tr.Target != nil {
+		tid = string(tr.Target.TargetID)
+	}
+	var doc composerDoc
+	if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(sel), &doc)); err != nil {
+		return fmt.Errorf("%w: read composer: %v", ErrNotSubmitted, err)
+	}
+	if !doc.Found {
+		return fmt.Errorf("%w: %w", ErrNotSubmitted, ErrNoComposer)
+	}
+	if canonicalComposerText(doc.Text) == canonicalComposerText(prompt) {
+		return nil
+	}
+	log.Printf("[chatgpt] pre-submit composer mismatch logical=%v target=%s document_units=%d document_hash=%s prompt_units=%d",
+		doc.Logical, tid, utf16Len(doc.Text), draftFingerprintShort(doc.Text), utf16Len(prompt))
+	rec := c.draftOwnership()
+	owned := rec != nil && !rec.Submitted && rec.Target == tid && rec.Thread == doc.URL &&
+		rec.Doc != "" && rec.Prompt == prompt && canonicalComposerText(doc.Text) == rec.Doc
+	if !owned {
+		// A user edit after typing lands here. Their text wins, and a retry
+		// cannot fix it, so it must not be classified as a safe resubmission.
+		return fmt.Errorf("%w (target=%s document_units=%d document_hash=%s prompt_units=%d retryable=false); the composer text is not this turn's prompt and this bridge cannot prove it wrote it, so nothing was submitted and it was left untouched",
+			ErrForeignDraft, tid, utf16Len(doc.Text), draftFingerprintShort(doc.Text), utf16Len(prompt))
+	}
+	if err := c.wipeComposer(tab, sel); err != nil {
+		return fmt.Errorf("%w: %v", ErrNotSubmitted, err)
+	}
+	var after composerDoc
+	if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(sel), &after)); err != nil {
+		return fmt.Errorf("%w: verify composer wipe: %v", ErrNotSubmitted, err)
+	}
+	if canonicalComposerText(after.Text) != "" {
+		return fmt.Errorf("%w: composer wipe could not be verified, so nothing was submitted", ErrNotSubmitted)
+	}
+	return fmt.Errorf("%w: the composer did not hold this turn's text, so it was cleared and nothing was submitted", ErrNotSubmitted)
+}
+
+func (c *Client) wipeComposer(ctx context.Context, sel string) error {
+	selectJS := `(() => {
+	  const el = ` + sel + `;
+	  if (!el) return false;
+	  el.focus();
+	  const range = document.createRange();
+	  range.selectNodeContents(el);
+	  const s = document.getSelection();
+	  if (!s) return false;
+	  s.removeAllRanges();
+	  s.addRange(range);
+	  return true;
+	})()`
+	var selected bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(selectJS, &selected)); err != nil {
+		return fmt.Errorf("type prompt wipe: %w", err)
+	}
+	if !selected {
+		return ErrNoComposer
+	}
+	if err := chromedp.Run(ctx, composerKeyActions(input.KeyRawDown, "Backspace", "Backspace", "", 8, input.ModifierNone)...); err != nil {
+		return fmt.Errorf("type prompt wipe: %w", err)
+	}
+	var after composerDoc
+	if err := chromedp.Run(ctx, chromedp.Evaluate(composerDocJS(sel), &after)); err != nil {
+		return fmt.Errorf("type prompt wipe: %w", err)
+	}
+	if !after.Found {
+		return ErrNoComposer
+	}
+	if canonicalComposerText(after.Text) != "" {
+		return fmt.Errorf("%w: wipe did not produce an empty document (document_units=%d document_paragraphs=%d document_hash=%s); nothing was typed, the existing text was left as found",
+			ErrForeignDraft, utf16Len(after.Text), after.Paragraphs, draftFingerprint(after.Text))
+	}
+	return nil
 }
 
 // insertMode picks how prompt text reaches the composer. Text holding a newline
@@ -1250,89 +1568,49 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	typeCtx, cancel := context.WithTimeout(tab, 30*time.Second)
 	defer cancel()
 	compSel := composerSelector
-	// 1. Read the composer's LOGICAL document before touching anything. innerText
-	//    only mirrors the DOM, so it can hold a stale visual prefix or read empty
-	//    while the editor model still holds text. Draft ownership is decided on
-	//    the model, and unfamiliar text is refused WITHOUT being cleared: the
-	//    user's own draft must survive a refusal intact.
-	readJS := `(() => {
-	  const el = ` + compSel + `;
-	  if (!el) return { found: false, text: '' };
-	  el.focus();
-	  const node = el.pmViewDesc && el.pmViewDesc.node;
-	  const text = node && node.type && node.type.name === 'doc' && typeof node.textBetween === 'function'
-	    ? node.textBetween(0, node.content.size, '\n', '\n')
-	    : el.tagName === 'TEXTAREA' ? el.value : el.innerText;
-	  return { found: true, text: text || '' };
-	})()`
-	var draft struct {
-		Found bool   `json:"found"`
-		Text  string `json:"text"`
-	}
-	if err := chromedp.Run(typeCtx, chromedp.Evaluate(readJS, &draft)); err != nil {
+	// 1. Read the composer's LOGICAL document before touching anything, and
+	//    decide ownership from what this bridge is RECORDED as having typed —
+	//    not from whether the text happens to equal the prompt about to be
+	//    typed. A leftover from an earlier request is ours even when the new
+	//    prompt differs; text we cannot prove we wrote is refused WITHOUT being
+	//    cleared, so the user's own draft survives a refusal intact.
+	var draft composerDoc
+	if err := chromedp.Run(typeCtx, chromedp.Evaluate(composerDocJS(compSel), &draft)); err != nil {
 		return fmt.Errorf("type prompt: %w", err)
 	}
 	if !draft.Found {
 		return ErrNoComposer
 	}
-	kind, _ := classifyDraft(draft.Text, prompt)
-	if kind == draftForeign {
-		return fmt.Errorf("type prompt: composer holds unrecognised text (draft_chars=%d draft_newline=%v prompt_bytes=%d draft_matches_prompt=false); refusing to type over it",
-			len(draft.Text), strings.Contains(draft.Text, "\n"), len(prompt))
-	}
+	tid := string(chromedp.FromContext(tab).Target.TargetID)
+	thread := draft.URL
+	rec := c.draftOwnership()
+	action := decideDraft(draft, rec, prompt, tid, thread)
 	target := prompt
-	// A composer already holding exactly this prompt needs nothing typed. Our
-	// own partial leftover is cleared through a TRUSTED deletion key, which is
-	// what this editor honours; whatever survives is adopted as the exact
-	// missing suffix instead of being retyped, so text can never double up.
-	if kind == draftOwnExact {
+	switch action {
+	case draftTypeComposer:
+		// Composer is empty; type the whole prompt.
+	case draftReuse:
 		target = ""
+		log.Printf("[chatgpt] draft reuse target=%s document_units=%d document_hash=%s", tid, utf16Len(draft.Text), draftFingerprintShort(draft.Text))
+	case draftReplace:
+		// Exactly the still-unedited snapshot this bridge observed writing, and
+		// no Send was ever dispatched. Clearing is allowed only after the wipe
+		// proves logical emptiness.
+		if err := c.wipeComposer(typeCtx, compSel); err != nil {
+			return err
+		}
+		log.Printf("[chatgpt] draft replace target=%s was_units=%d was_hash=%s prompt_units=%d", tid, utf16Len(draft.Text), draftFingerprintShort(draft.Text), utf16Len(prompt))
+	case draftRefuseOwned:
+		return fmt.Errorf("%w (target=%s document_units=%d document_hash=%s retryable=false); this chat's draft belongs to a turn that may already have been sent, so it is left untouched and must not be resent",
+			ErrDraftOwned, tid, utf16Len(draft.Text), draftFingerprintShort(draft.Text))
+	default:
+		al := alignComposer(draft.Text, prompt)
+		return fmt.Errorf("%w (target=%s document_units=%d document_paragraphs=%d document_hash=%s prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s retryable=false); cannot verify who wrote the text currently in this chat's composer, so it is left untouched",
+			ErrForeignDraft, tid, al.Document, draft.Paragraphs, draftFingerprintShort(draft.Text), al.Prompt, al.Prefix, al.Suffix, al.Verdict)
 	}
-	if kind == draftOwnPrefix {
-		selectJS := `(() => {
-		  const el = ` + compSel + `;
-		  if (!el) return false;
-		  el.focus();
-		  const sel = document.getSelection();
-		  if (!sel) return false;
-		  const range = document.createRange();
-		  range.selectNodeContents(el);
-		  sel.removeAllRanges();
-		  sel.addRange(range);
-		  return true;
-		})()`
-		var selected bool
-		if err := chromedp.Run(typeCtx, chromedp.Evaluate(selectJS, &selected)); err != nil {
-			return fmt.Errorf("type prompt: %w", err)
-		}
-		if !selected {
-			return ErrNoComposer
-		}
-		if err := chromedp.Run(typeCtx, composerKeyActions(input.KeyRawDown, "Backspace", "Backspace", "", 8, input.ModifierNone)...); err != nil {
-			return fmt.Errorf("type prompt wipe: %w", err)
-		}
-		var after struct {
-			Found bool   `json:"found"`
-			Text  string `json:"text"`
-		}
-		if err := chromedp.Run(typeCtx, chromedp.Evaluate(readJS, &after)); err != nil {
-			return fmt.Errorf("type prompt wipe: %w", err)
-		}
-		afterKind, afterMissing := classifyDraft(after.Text, prompt)
-		switch afterKind {
-		case draftEmpty:
-			target = prompt
-		case draftOwnExact:
-			target = ""
-		case draftOwnPrefix:
-			target = afterMissing
-		default:
-			// Deletion cannot turn our own text into unfamiliar text; refuse
-			// rather than type over anything we cannot account for.
-			return fmt.Errorf("type prompt: composer holds unrecognised text after wipe (draft_chars=%d draft_newline=%v prompt_bytes=%d draft_matches_prompt=false); refusing to type over it",
-				len(after.Text), strings.Contains(after.Text, "\n"), len(prompt))
-		}
-	}
+	// Ownership is recorded AFTER the attempt, from the document the editor
+	// actually holds (see recordOwnedDraft below). Recording the intended prompt
+	// here would claim text that a failed insertion never produced.
 	// 2. Primary insertion: trusted CDP input travels the editor's
 	//    beforeinput pipeline, so the editor absorbs it into model state
 	//    instead of async-flushing an execCommand/paste around it. A prompt
@@ -1360,31 +1638,37 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	//    content may proceed. Trajectory is lengths-only by design.
 	var lens []int
 	settleUntil := time.Now().Add(8 * time.Second)
-	stable, lastLen, settledLen := 0, -1, 0
+	stable, lastFp, settledDoc, settledRendered := 0, "", "", 0
 	for {
-		var l int
+		var cur composerDoc
 		sctx, scancel := context.WithTimeout(tab, 3*time.Second)
-		serr := chromedp.Run(sctx, chromedp.Evaluate(`(() => { const el = `+compSel+`; return el ? (el.innerText || el.value || '').trim().length : -1; })()`, &l))
+		serr := chromedp.Run(sctx, chromedp.Evaluate(composerDocJS(compSel), &cur))
 		scancel()
-		if serr != nil {
+		if serr != nil || !cur.Found {
 			break
 		}
-		lens = append(lens, l)
-		if l == lastLen {
+		lens = append(lens, utf16Len(cur.Text))
+		fp := draftFingerprint(cur.Text)
+		if fp == lastFp {
 			stable++
 		} else {
-			stable, lastLen = 0, l
+			stable, lastFp = 0, fp
 		}
+		settledDoc = cur.Text
+		settledRendered = cur.Rendered
 		if stable >= 2 || time.Now().After(settleUntil) {
-			settledLen = l
 			break
 		}
 		if err := pause(tab, 300*time.Millisecond); err != nil {
 			break
 		}
 	}
-	log.Printf("[chatgpt] type settle prompt=%d typed=%d trajectory=%v inserr=%v", len(prompt), len(target), lens, insErr)
-	if settledLen <= 0 && target != "" {
+	log.Printf("[chatgpt] type settle prompt_units=%d typed_units=%d trajectory=%v inserr=%v", utf16Len(prompt), utf16Len(target), lens, insErr)
+	// Record what the editor actually holds now, before any return path below.
+	// A failed or truncated insertion leaves a residual that a LATER, different
+	// request must still be able to recognise as this bridge's own.
+	c.recordOwnedDraft(tid, thread, prompt, settledDoc)
+	if canonicalComposerText(settledDoc) == "" && settledRendered == 0 && target != "" {
 		// 4. Fallback: legacy execCommand/paste for renderers where trusted
 		//    input cannot land. The composer above holds either nothing or only
 		//    our own prefix of this prompt, so nothing foreign can mix. Partial
@@ -1417,38 +1701,33 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		}
 	}
 	// DOM text can appear before ProseMirror absorbs an execCommand insertion.
-	// Settle the full logical document, not a 200-character visual prefix, before
-	// returning to the identical pre-submit check. Never submit partial input.
+	// Settle the full logical document through the SAME reader used for draft
+	// classification, so the verdict can never come from a different
+	// measurement (the visual DOM carries extra hard breaks). Never submit
+	// partial input.
 	exactReads := 0
 	deadline = time.Now().Add(15 * time.Second)
 	for {
-		var state struct {
-			Len      int  `json:"len"`
-			Exact    bool `json:"exact"`
+		var doc composerDoc
+		var extra struct {
 			Expand   bool `json:"expand"`
 			Attached bool `json:"attached"`
 		}
 		probe, probeCancel := context.WithTimeout(tab, 3*time.Second)
-		err := chromedp.Run(probe, chromedp.Evaluate(fmt.Sprintf(`(() => {
-		  const el = document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]');
-		  const btn = [...document.querySelectorAll('button')].find(e => (e.innerText || '').trim() === 'Show in text field');
-		  const node = el?.pmViewDesc?.node;
-		  const text = node?.type?.name === 'doc' && typeof node.textBetween === 'function'
-		    ? node.textBetween(0, node.content.size, '\n', '\n')
-		    : el?.tagName === 'TEXTAREA' ? el.value : null;
-		  const canonical = s => (s || '').replace(/\r\n?/g, '\n').trim().replace(/([<(\"]) ?(https?:\/\/)/g, '$1$2');
-		  return {
-		    len: text === null ? 0 : text.length,
-		    exact: text !== null && canonical(text) === canonical(%s),
-		    expand: !!btn,
-		    attached: !!document.querySelector('button[aria-label="Remove pasted text attachment"]')
-		  };
-		})()`, strconv.Quote(prompt)), &state))
+		err := chromedp.Run(probe,
+			chromedp.Evaluate(composerDocJS(compSel), &doc),
+			chromedp.Evaluate(`(() => ({
+			  expand: !![...document.querySelectorAll('button')].find(e => (e.innerText || '').trim() === 'Show in text field'),
+			  attached: !!document.querySelector('button[aria-label="Remove pasted text attachment"]')
+			}))()`, &extra))
 		probeCancel()
 		if err != nil {
 			return err
 		}
-		if state.Exact {
+		al := alignComposer(doc.Text, prompt)
+		if doc.Logical && al.Verdict == verdictExact {
+			// The last full read is authoritative for what we own.
+			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
 			exactReads++
 			if exactReads >= 3 {
 				return nil
@@ -1456,7 +1735,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		} else {
 			exactReads = 0
 		}
-		if state.Expand {
+		if extra.Expand {
 			clickCtx, clickCancel := context.WithTimeout(tab, 3*time.Second)
 			_ = chromedp.Run(clickCtx, chromedp.Evaluate(`(() => {
 			  const btn = [...document.querySelectorAll('button')].find(e => (e.innerText || '').trim() === 'Show in text field');
@@ -1465,7 +1744,13 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			clickCancel()
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("composer did not settle to the complete prompt (model_chars=%d prompt_bytes=%d attached=%v); nothing submitted", state.Len, len(prompt), state.Attached)
+			// Keep whatever actually landed as the owned snapshot: this is the
+			// failed-insertion residual the next request must be able to replace.
+			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
+			log.Printf("[chatgpt] composer settlement target=%s document_units=%d document_paragraphs=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s logical=%v attached=%v",
+				tid, al.Document, doc.Paragraphs, al.Prompt, al.Prefix, al.Suffix, al.Verdict, doc.Logical, extra.Attached)
+			return fmt.Errorf("%w: composer did not settle to the complete prompt, nothing submitted (document_units=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s document_paragraphs=%d attached=%v)",
+				ErrNotSubmitted, al.Document, al.Prompt, al.Prefix, al.Suffix, al.Verdict, doc.Paragraphs, extra.Attached)
 		}
 		if err := pause(tab, 300*time.Millisecond); err != nil {
 			return err
@@ -1512,6 +1797,12 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 			cancel()
 			// An interrupted evaluation may have dispatched before its reply
 			// was lost. Neither retry nor downgrade that outcome.
+			if err != nil || clicked {
+				// A dispatched (or unprovable) Send makes the draft evidence of
+				// an uncertain turn: it must never be cleared, reused or resent
+				// just because the composer still holds it.
+				c.markDraftSubmitted(string(chromedp.FromContext(tab).Target.TargetID), prompt)
+			}
 			if err != nil {
 				return fmt.Errorf("send action outcome unknown: %w", err)
 			}
@@ -1522,6 +1813,9 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 		}
 		if actionAttempted {
 			if sent, err := c.turnSubmitted(tab); err == nil && sent {
+				// The turn reached the thread: its draft is no longer scratch
+				// space and there is nothing left to reconcile.
+				c.clearDraftOwnership()
 				return nil
 			}
 		}

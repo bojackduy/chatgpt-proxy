@@ -341,7 +341,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		seedTurns++
 		seedBytes += len(rt.prompt)
 		if err != nil {
-			if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
+			if !chatgpt.IsPreSubmit(err) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
 				if res.URL != "" {
 					s.URL = res.URL
 				}
@@ -396,7 +396,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	seedTurns++
 	seedBytes += len(prompt)
 	if err != nil {
-		if !errors.Is(err, chatgpt.ErrNotSubmitted) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
+		if !chatgpt.IsPreSubmit(err) && (res.URL != "" || !chatgpt.IsNavigateError(err)) {
 			if res.URL != "" {
 				s.URL = res.URL
 			}

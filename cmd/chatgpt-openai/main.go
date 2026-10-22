@@ -788,7 +788,7 @@ func (h *handler) requestFormatRepair(r *http.Request, id, lane, url string, req
 	res, err := h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{Prompt: prompt, URL: url, Thinking: thinking})
 	h.recordTurnOutcome(id, prompt, url, res, err, 1, 1)
 	if err != nil {
-		if errors.Is(err, chatgpt.ErrNotSubmitted) || chatgpt.IsNavigateError(err) {
+		if chatgpt.IsPreSubmit(err) || chatgpt.IsNavigateError(err) {
 			s.PendingPrompt, s.RepairPendingPrompt = oldPrompt, ""
 			if err := h.save(); err != nil {
 				return res, repairStoreFailed
@@ -1561,7 +1561,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			disp, answerHash := "completed", ""
 			if err != nil {
 				disp = "interrupted"
-				if errors.Is(err, chatgpt.ErrNotSubmitted) {
+				if chatgpt.IsPreSubmit(err) {
 					disp = "failed"
 				}
 			} else {
@@ -1574,7 +1574,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// so the dirty journal records a usable repair target, not a page
 			// like the Project root. Uncertain sessions still return 409 and
 			// never retry.
-			if errors.Is(err, chatgpt.ErrNotSubmitted) || (res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err)) {
+			if chatgpt.IsPreSubmit(err) || (res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err)) {
 				// Stage evidence concerns this turn, not whether an older thread exists.
 				s.Dirty, s.Phase = false, ""
 				s.PendingRequest, s.PendingPrompt = nil, ""
@@ -1702,6 +1702,25 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 }
 func (h *handler) backendError(w http.ResponseWriter, err error) {
 	log.Printf("[openai] BACKEND FAILURE: %v; REPAIR: check CDP port/profile login, composer/send/assistant DOM selectors, ChatGPT page alerts; uncertain completion requests require read-only recovery", err)
+	if errors.Is(err, chatgpt.ErrForeignDraft) || errors.Is(err, chatgpt.ErrDraftOwned) {
+		// Nothing was overwritten and nothing was sent. Retrying the same
+		// request would only refuse again, so the person gets the outcome and
+		// the one thing they can do — never a selector diagnostic, and never a
+		// suggestion that recovery clears a browser draft (it does not).
+		log.Printf("[openai] draft refused: %v", err)
+		// "cannot verify it wrote" is deliberate: the bridge does not know who
+		// wrote that text, so it must not claim the person did either.
+		unknown := "This chat box holds text this bridge cannot verify it wrote, so it was left untouched."
+		next := "Next: open the dedicated ChatGPT Web Chrome window and keep or clear that text yourself before sending your message again."
+		if errors.Is(err, chatgpt.ErrDraftOwned) {
+			unknown = "This chat box still holds a message from an attempt that may already have been sent, so it was left untouched."
+			// Read-only guidance: an uncertain turn must never invite a resend,
+			// and journal recovery must not be sold as a way to clear a draft.
+			next = "Do not resend it. Next: open the dedicated ChatGPT Web Chrome window and read that conversation for the answer; clearing the chat box is a separate manual step there."
+		}
+		apiError(w, 422, errors.New(failureText(unknown, next)))
+		return
+	}
 	if errors.Is(err, chatgpt.ErrMissingAnswer) {
 		// Generation was observed but no answer can be delivered. A 5xx makes
 		// installed hosts retry an already-submitted turn. Keep its journal;

@@ -2285,3 +2285,187 @@ func TestTerminalFailuresAreActionableAndKeepClassification(t *testing.T) {
 		}
 	})
 }
+
+// A draft this bridge cannot prove it wrote must be a NON-RETRYABLE refusal
+// that leaves the session clean: nothing was typed over and nothing was sent.
+// The person gets what happened and what to do instead — never a selector or an
+// endpoint. Recovery clears journal uncertainty only, never a browser draft, so
+// the sentence must not imply otherwise.
+func TestDraftRefusalsArePreSubmitAndActionable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			"foreign draft",
+			fmt.Errorf("%w (target=ABC document_units=28 verdict=diverged retryable=false)", chatgpt.ErrForeignDraft),
+			[]string{"cannot verify it wrote", "keep or clear that text yourself", "Nothing from your previous message was resent"},
+		},
+		{
+			"attempted turn draft",
+			fmt.Errorf("%w (target=ABC document_units=28 retryable=false)", chatgpt.ErrDraftOwned),
+			[]string{"may already have been sent", "Do not resend it", "separate manual step", "Nothing from your previous message was resent"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !chatgpt.IsPreSubmit(tc.err) {
+				t.Fatal("a draft refusal must be pre-submit so the session stays clean")
+			}
+			if errors.Is(tc.err, chatgpt.ErrNotSubmitted) {
+				t.Fatal("a draft refusal must not claim the retryable pre-submit class")
+			}
+			h := testHandler(&fakeBackend{})
+			w := httptest.NewRecorder()
+			h.backendError(w, tc.err)
+			if w.Code != 422 {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			var v struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+				t.Fatalf("not structured JSON: %s", w.Body.String())
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(v.Error.Message, want) {
+					t.Fatalf("message missing %q: %s", want, v.Error.Message)
+				}
+			}
+			// A draft refusal must never claim to know who wrote the text, and
+			// an uncertain turn must never invite a blind retry.
+			for _, bad := range []string{"did not type", "check whether that message was sent", "before retrying"} {
+				if strings.Contains(v.Error.Message, bad) {
+					t.Fatalf("unsafe guidance %q: %s", bad, v.Error.Message)
+				}
+			}
+			for _, leak := range []string{"POST /v1/sessions", "http://", "chatgpt-recover"} {
+				if strings.Contains(v.Error.Message, leak) {
+					t.Fatalf("runbook or recovery hint leaked into the chat sentence: %s", v.Error.Message)
+				}
+			}
+		})
+	}
+}
+
+// Concurrent sessions must not share a backend, a target or a draft decision.
+// One session's failed insertion is a clean, immediately retryable pre-submit
+// failure that is never resubmitted; its peer's turn is unaffected, and neither
+// session's text reaches the other.
+func TestConcurrentSessionDraftIsolation(t *testing.T) {
+	entered := make(chan string, 2)
+	var mu sync.Mutex
+	seen := map[string][]string{}
+	record := func(backend, prompt string) {
+		mu.Lock()
+		seen[prompt] = append(seen[prompt], backend)
+		mu.Unlock()
+	}
+	// The reported shape: an oversized legacy insertion truncated in the
+	// composer, nothing submitted. The pool hands out whichever backend is free,
+	// so every backend must behave by request, not by identity.
+	client := func(name string) *fakeBackend {
+		return &fakeBackend{turn: func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+			record(name, opt.Prompt)
+			entered <- name
+			if strings.Contains(opt.Prompt, "FAIL_A") {
+				return chatgpt.TurnResult{URL: "https://chatgpt.com/c/iso-a"},
+					fmt.Errorf("%w: composer did not settle to the complete prompt, nothing submitted (document_units=3327 prompt_units=180955 verdict=truncated)",
+						chatgpt.ErrNotSubmitted)
+			}
+			return chatgpt.TurnResult{Answer: "B_ANSWER", URL: "https://chatgpt.com/c/iso-b"}, nil
+		}}
+	}
+	h := testHandler(&fakeBackend{})
+	h.profileDir = t.TempDir()
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.enableParallel([]backend{client("backend-1"), client("backend-2")})
+
+	doneA := make(chan *httptest.ResponseRecorder, 1)
+	doneB := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneA <- request(h, "iso-a", completionsRequest{Messages: []message{{Role: "user", Content: "FAIL_A"}}, ToolChoice: "none"})
+	}()
+	go func() {
+		doneB <- request(h, "iso-b", completionsRequest{Messages: []message{{Role: "user", Content: "KEEP_B"}}, ToolChoice: "none"})
+	}()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent sessions did not reach their own backend")
+		}
+	}
+	var wA, wB *httptest.ResponseRecorder
+	select {
+	case wA = <-doneA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failing session did not complete")
+	}
+	select {
+	case wB = <-doneB:
+	case <-time.After(5 * time.Second):
+		t.Fatal("healthy session did not complete")
+	}
+
+	// Each session was served exactly once, on its own backend, and never with
+	// the other session's text. A resend would show up as a second entry.
+	mu.Lock()
+	var failBy, okBy []string
+	var failPrompt, okPrompt string
+	for prompt, backends := range seen {
+		switch {
+		case strings.Contains(prompt, "FAIL_A"):
+			failPrompt, failBy = prompt, backends
+		case strings.Contains(prompt, "KEEP_B"):
+			okPrompt, okBy = prompt, backends
+		}
+	}
+	mu.Unlock()
+	// Exactly one attempt each: an automatic resend would appear as a second
+	// entry for the same session's text.
+	if failPrompt == "" || len(failBy) != 1 {
+		t.Fatalf("failing session was attempted %d times", len(failBy))
+	}
+	if okPrompt == "" || len(okBy) != 1 {
+		t.Fatalf("peer session was attempted %d times", len(okBy))
+	}
+	// Concurrent sessions must never share one backend (one browser target).
+	if failBy[0] == okBy[0] {
+		t.Fatalf("both concurrent sessions were served by %s", failBy[0])
+	}
+
+	if wB.Code != 200 {
+		t.Fatalf("peer status %d: %s", wB.Code, wB.Body.String())
+	}
+	if got := contentText(assistant(t, wB)); got != "B_ANSWER" {
+		t.Fatalf("peer answer = %q, want B_ANSWER", got)
+	}
+	if strings.Contains(wB.Body.String(), "FAIL_A") {
+		t.Fatal("the failing session's text leaked into the peer response")
+	}
+
+	// A proven pre-submit failure is retryable and leaves the session clean; it
+	// must not be reclassified as a foreign draft or handed recovery advice.
+	if wA.Code == 200 || wA.Code == 422 {
+		t.Fatalf("failed insertion status %d: %s", wA.Code, wA.Body.String())
+	}
+	if strings.Contains(wA.Body.String(), "chatgpt-recover") || strings.Contains(wA.Body.String(), "cannot verify it wrote") {
+		t.Fatalf("failed insertion was misreported: %s", wA.Body.String())
+	}
+	if strings.Contains(wA.Body.String(), "KEEP_B") {
+		t.Fatal("the peer's text leaked into the failing response")
+	}
+	if s := h.sessions["iso-a"]; s == nil || s.Dirty || s.PendingRequest != nil {
+		t.Fatalf("failed insertion kept uncertainty: %+v", s)
+	}
+	if s := h.sessions["iso-b"]; s == nil || s.Dirty || s.PendingRequest != nil {
+		t.Fatalf("peer session was left unclean: %+v", s)
+	}
+	if v := stateBody(t, h, "iso-a"); fmt.Sprint(v["state"]) != stateClean {
+		t.Fatalf("failed insertion not reported clean: %v", v["state"])
+	}
+}

@@ -24,23 +24,37 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
 	alloc, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
-	tab, cancelTab := chromedp.NewContext(alloc)
-	defer cancelTab()
-	tab, timeout := context.WithTimeout(tab, 45*time.Second)
-	defer timeout()
-	set := func(html string) {
+	// root is the unbounded fixture connection. Every subtest derives its OWN
+	// bounded context from it, so a slow — or externally suspended — subtest can
+	// no longer drain a single shared wall-clock budget and cancel the cases
+	// that follow it.
+	root, cancelRoot := chromedp.NewContext(alloc)
+	defer cancelRoot()
+	tab := root
+	// set replaces the fixture DOM. It takes the SUBTEST's *testing.T and runs
+	// on root: a fixture failure is reported inside that subtest instead of
+	// failing the parent test and cascading into unrelated cases.
+	set := func(t *testing.T, html string) {
 		t.Helper()
-		if err := chromedp.Run(tab, chromedp.ActionFunc(func(ctx context.Context) error { return nil })); err != nil {
+		if err := chromedp.Run(root, chromedp.ActionFunc(func(ctx context.Context) error { return nil })); err != nil {
 			t.Fatal(err)
 		}
-		if err := chromedp.Run(tab, chromedp.Evaluate(`document.body.innerHTML = `+quoteJS(html), nil)); err != nil {
+		if err := chromedp.Run(root, chromedp.Evaluate(`document.body.innerHTML = `+quoteJS(html), nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Run("composer settles complete logical document", func(t *testing.T) {
+	// sub runs one browser subtest with its own budget derived from root.
+	sub := func(name string, fn func(t *testing.T, tab context.Context)) {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(root, 45*time.Second)
+			defer cancel()
+			fn(t, ctx)
+		})
+	}
+	sub("composer settles complete logical document", func(t *testing.T, tab context.Context) {
 		c := &Client{}
 		for _, size := range []int{300, 19000, 190000, 120} {
-			set(`<div class="ProseMirror" contenteditable="true" role="textbox"></div>`)
+			set(t, `<div class="ProseMirror" contenteditable="true" role="textbox"></div>`)
 			// Reproduce the observed race: DOM text is already long enough for
 			// the old 200-character check while the editor model is still empty.
 			// Real editors batch DOM reconciliation; only their logical document
@@ -63,14 +77,18 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 		}
 		// A long visual prefix is never enough; persistent partial input must
 		// fail before submission. Keep this test bounded by caller cancellation.
-		set(`<div class="ProseMirror" contenteditable="true"></div>`)
+		set(t, `<div class="ProseMirror" contenteditable="true"></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`document.querySelector('.ProseMirror').pmViewDesc={node:{type:{name:'doc'},content:{size:250},textBetween(){return 'x'.repeat(250)}}}`, nil)); err != nil {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithTimeout(tab, 1800*time.Millisecond)
 		defer cancel()
-		if err := c.typePrompt(ctx, tab, strings.Repeat("x", 500)); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			t.Fatalf("persistent partial model accepted or cancellation lost: %v", err)
+		err := c.typePrompt(ctx, tab, strings.Repeat("x", 500))
+		if err == nil {
+			t.Fatal("persistent partial model was accepted")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrForeignDraft) && !errors.Is(err, ErrDraftOwned) {
+			t.Fatalf("persistent partial draft neither cancelled nor refused: %v", err)
 		}
 		ctx, cancel = context.WithCancel(tab)
 		cancel()
@@ -78,7 +96,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			t.Fatalf("cancelled insertion: %v", err)
 		}
 	})
-	t.Run("post-click DOM is never proof of non-submission", func(t *testing.T) {
+	sub("post-click DOM is never proof of non-submission", func(t *testing.T, tab context.Context) {
 		p := sendProof{Readable: true, ComposerExact: true}
 		if !p.provenUnsubmitted() {
 			t.Fatal("no-action exact readable draft should be retryable")
@@ -93,7 +111,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 				t.Fatalf("ambiguous send permitted retry: %+v", p)
 			}
 		}
-		set(`<div class="ProseMirror" contenteditable="true">draft</div><button data-testid="send-button">Send</button>`)
+		set(t, `<div class="ProseMirror" contenteditable="true">draft</div><button data-testid="send-button">Send</button>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.sendClicks=0;document.querySelector('button').onclick=()=>window.sendClicks++`, nil)); err != nil {
 			t.Fatal(err)
 		}
@@ -103,11 +121,14 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			t.Fatalf("in-flight/cancelled Send lost uncertainty: %v", err)
 		}
 		var clicks int
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.sendClicks`, &clicks)); err != nil || clicks != 1 {
+		// Observe the click count over the unbounded root connection: the send
+		// attempt is what must be counted exactly once, and a subtest-local
+		// deadline expiring must not masquerade as a missing click.
+		if err := chromedp.Run(root, chromedp.Evaluate(`window.sendClicks`, &clicks)); err != nil || clicks != 1 {
 			t.Fatalf("possibly submitted turn repeated: clicks=%d err=%v", clicks, err)
 		}
 	})
-	t.Run("chrome icon svgs are not answer visuals", func(t *testing.T) {
+	sub("chrome icon svgs are not answer visuals", func(t *testing.T, tab context.Context) {
 		// A real ChatGPT message with no ".markdown" container exposes the whole
 		// block, including 16-24px UI icon SVGs. Those are page chrome, not answer
 		// visuals: they must not become "[SVG: no accessible description...]"
@@ -120,7 +141,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			`<div data-d-component="row"><svg width="1em" height="1em" data-d-component="icon"><path d="M0 0h10v10H0z"/></svg><span>Alpha</span></div>` +
 			`<svg width="600" height="400" viewBox="0 0 600 400"><title>Diagram</title><rect width="600" height="400" fill="#eee"/></svg>` +
 			`</div></div></div>`
-		set(fixture)
+		set(t, fixture)
 		st, err := responseProbe(tab, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -149,14 +170,14 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 		}
 	})
 	old := `<div data-chatgpt-search-message-ids="old"><h4>ChatGPT said:</h4><div>OLD TOOL CALL</div></div>`
-	set(old + `<div data-chatgpt-search-message-ids="analysis"><h4>ChatGPT said:</h4><div>Thought for 4 seconds</div></div>`)
+	set(t, old+`<div data-chatgpt-search-message-ids="analysis"><h4>ChatGPT said:</h4><div>Thought for 4 seconds</div></div>`)
 	before, err := responseProbe(tab, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Two old nodes collapse into one; the total heading count does not grow.
 	// A stale role node and unrelated markdown/footer must not override NEW.
-	set(old + `<div data-message-author-role="assistant" data-message-id="old-role">STALE</div><h4>You said:</h4><div>tool output</div><div data-talvt-turn-state="complete"><div data-chatgpt-search-message-ids="new new"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><p>NEW</p><button>Copy</button></div></div></div><div class="markdown">UNRELATED</div><h4>Latest response</h4><div>FOOTER</div>`)
+	set(t, old+`<div data-message-author-role="assistant" data-message-id="old-role">STALE</div><h4>You said:</h4><div>tool output</div><div data-talvt-turn-state="complete"><div data-chatgpt-search-message-ids="new new"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><p>NEW</p><button>Copy</button></div></div></div><div class="markdown">UNRELATED</div><h4>Latest response</h4><div>FOOTER</div>`)
 	st, err := responseProbe(tab, before.IDs)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +185,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 	if st.Last != "NEW" || !st.Complete {
 		t.Fatalf("wrong fresh scoped response: %+v", st)
 	}
-	set(old + `<h4>You said:</h4><div><div class="markdown">PRIVATE USER TEXT</div></div><div role="alert">Something went wrong</div>`)
+	set(t, old+`<h4>You said:</h4><div><div class="markdown">PRIVATE USER TEXT</div></div><div role="alert">Something went wrong</div>`)
 	st, err = responseProbe(tab, before.IDs)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +193,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 	if st.Last != "" || !st.ErrorText {
 		t.Fatalf("old/user text leaked or error missed: %+v", st)
 	}
-	set(`<div data-message-author-role="user">request</div><div data-message-author-role="assistant" data-message-id="legacy"><div class="markdown"><div data-markdown-copy="code-block"><pre><code class="language-json">{"x":1}</code></pre></div></div></div>`)
+	set(t, `<div data-message-author-role="user">request</div><div data-message-author-role="assistant" data-message-id="legacy"><div class="markdown"><div data-markdown-copy="code-block"><pre><code class="language-json">{"x":1}</code></pre></div></div></div>`)
 	st, err = responseProbe(tab, before.IDs)
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +201,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 	if strings.Count(st.Last, `{"x":1}`) != 1 || !strings.Contains(st.Last, "```json") {
 		t.Fatalf("nested code block corrupt: %q", st.Last)
 	}
-	set(`<div data-message-author-role="assistant" data-message-id="old-thought"><div data-thinking>PRIVATE OLD REASONING</div></div><h4>You said:</h4><div>request</div><div data-chatgpt-search-message-ids="thought-new"><h4>ChatGPT said:</h4><div><div data-testid="thought-block">Thought for 3 seconds
+	set(t, `<div data-message-author-role="assistant" data-message-id="old-thought"><div data-thinking>PRIVATE OLD REASONING</div></div><h4>You said:</h4><div>request</div><div data-chatgpt-search-message-ids="thought-new"><h4>ChatGPT said:</h4><div><div data-testid="thought-block">Thought for 3 seconds
 Scoped reasoning</div><p>Only answer</p></div></div>`)
 	st, err = responseProbe(tab, before.IDs)
 	if err != nil || st.Last != "Only answer" || st.Reasoning != "Scoped reasoning" || st.LastID != "thought-new" {
@@ -188,14 +209,14 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 	}
 	probe := func(body string) string {
 		t.Helper()
-		set(old + `<h4>You said:</h4><div>PRIVATE USER</div><div data-message-id="rich"><h4>ChatGPT said:</h4><div><div class="markdown">` + body + `</div><button>Regenerate</button></div></div><div class="markdown">FOOTER</div>`)
+		set(t, old+`<h4>You said:</h4><div>PRIVATE USER</div><div data-message-id="rich"><h4>ChatGPT said:</h4><div><div class="markdown">`+body+`</div><button>Regenerate</button></div></div><div class="markdown">FOOTER</div>`)
 		got, err := responseProbe(tab, before.IDs)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return got.Last
 	}
-	t.Run("rich Markdown", func(t *testing.T) {
+	sub("rich Markdown", func(t *testing.T, tab context.Context) {
 		math := probe(`<p>Potentially <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>O</mi><mo>(</mo><msup><mi>n</mi><mn>2</mn></msup><mo>)</mo></mrow><annotation encoding="application/x-tex">O(n^2)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">O(n^2)</span></span>. Linear <span class="katex"><span class="katex-mathml"><math><semantics><mrow>O(n)</mrow><annotation encoding="application/x-tex">O(n)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">O(n)</span></span>.</p><span class="katex-display"><span class="katex"><span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">x^2 + y^2</annotation></semantics></math></span><span class="katex-html">DUPLICATE GLYPHS</span></span></span><p>Repeat O(n) O(n) intentionally.</p>`)
 		if math != "Potentially O(n^2). Linear O(n).\n\nx^2 + y^2\n\nRepeat O(n) O(n) intentionally." {
 			t.Fatalf("math duplicated or source/prose lost: %q", math)
@@ -290,7 +311,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			t.Fatalf("card grouping leaked icon or merged paragraphs: %s", got)
 		}
 	})
-	t.Run("code whitespace and safe fences", func(t *testing.T) {
+	sub("code whitespace and safe fences", func(t *testing.T, tab context.Context) {
 		raw := "{\n  \"fence\": \"```\",\n\n\n  \"path\": \"a\\\\b\"\n}\n"
 		got := probe(`<div data-markdown-copy="code-block"><span data-markdown-copy="exclude">JSON</span><pre><code class="language-json">` + raw + `</code></pre></div>`)
 		if got != "````json\n"+raw+"````" {
@@ -301,7 +322,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			t.Fatalf("nested code layout: %q", got)
 		}
 	})
-	t.Run("literal wire protocol and plain text", func(t *testing.T) {
+	sub("literal wire protocol and plain text", func(t *testing.T, tab context.Context) {
 		raw := "<opencode_bridge_call>\n{\n  \"name\": \"echo\",\n  \"arguments\": {\"text\": \"a\\\\b_*`\"}\n}\n</opencode_bridge_call>"
 		html := strings.ReplaceAll(strings.ReplaceAll(raw, "<", "&lt;"), ">", "&gt;")
 		if got := probe(`<p>` + html + `</p>`); got != raw {
@@ -313,9 +334,9 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			}
 		}
 	})
-	t.Run("exact collapsed user recovery and bound serialized source", func(t *testing.T) {
+	sub("exact collapsed user recovery and bound serialized source", func(t *testing.T, tab context.Context) {
 		full := strings.Repeat("Long literal prompt_* with  two spaces\tand JSON \\\"quoted\\\".\n", 2200) + " … Show more"
-		set(`<div data-turn-key="fixture-user"><h4>You said:</h4><div><span class="text">truncated prefix</span><button onclick="this.parentElement.querySelector('.text').textContent=window.__full;this.textContent='Show less'">Show more</button><button aria-label="Copy message">Copy</button></div></div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div>finished</div></div>`)
+		set(t, `<div data-turn-key="fixture-user"><h4>You said:</h4><div><span class="text">truncated prefix</span><button onclick="this.parentElement.querySelector('.text').textContent=window.__full;this.textContent='Show less'">Show more</button><button aria-label="Copy message">Copy</button></div></div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div>finished</div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__full = `+quoteJS(full), nil)); err != nil {
 			t.Fatal(err)
 		}
@@ -330,7 +351,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != strings.TrimSpace(full) || corr.UserID != "fixture-user" || corr.Answers != 1 {
 			t.Fatal("full exact binding or literal UI suffix lost", err)
 		}
-		set(`<div><h4>You said:</h4><div>old matching prompt</div><h4>ChatGPT said:</h4><div>old answer</div><h4>You said:</h4><div>genuinely different prompt</div><h4>ChatGPT said:</h4><div>new answer</div></div>`)
+		set(t, `<div><h4>You said:</h4><div>old matching prompt</div><h4>ChatGPT said:</h4><div>old answer</div><h4>You said:</h4><div>genuinely different prompt</div><h4>ChatGPT said:</h4><div>new answer</div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.User != "genuinely different prompt" || corr.User == "old matching prompt" {
 			t.Fatal("stale prompt binding", err)
 		}
@@ -376,7 +397,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		publish := func() { dilSource.Store(map[string]any{"mapping": mapping}) }
 		publish()
 		dilHTML := old + `<div data-talvt-turn-state="complete"><div><h4>You said:</h4><div data-chatgpt-search-message-ids="fixture-user"><p>request</p></div></div><div data-chatgpt-search-message-ids="dil-answer dil-answer"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><div class="MarkdownRoot-rZKhxa"><div hidden></div><div class="DilRenderer-tB76Jj"><div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div></div></div></div></div></div><h4>Latest response</h4><div>FOOTER</div>`
-		set(dilHTML)
+		set(t, dilHTML)
 		got, err := responseProbe(tab, before.IDs)
 		if err != nil || got.Last != raw || !got.Complete || got.LastID != "dil-answer" {
 			t.Fatalf("bound null-DIL wire changed: %+v %v", got, err)
@@ -407,18 +428,18 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		node["parent"] = "fixture-user"
 		publish()
 		for _, body := range []string{old + `<h4>You said:</h4><div>request</div>`, old + `<h4>You said:</h4><div>request</div><div data-talvt-turn-state="complete"><h4>ChatGPT said:</h4><div><div data-thinking>ONLY REASONING</div></div></div>`} {
-			set(body)
+			set(t, body)
 			got, err = responseProbe(tab, before.IDs)
 			if err != nil || got.Last != "" {
 				t.Fatal("no assistant/reasoning became answer", got, err)
 			}
 		}
-		set(dilHTML + `<button data-testid="stop-button">Stop</button>`)
+		set(t, dilHTML+`<button data-testid="stop-button">Stop</button>`)
 		got, err = responseProbe(tab, before.IDs)
 		if err != nil || got.Last != "" || !got.StopBtn {
 			t.Fatal("generating source adopted", got, err)
 		}
-		set(strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div>`, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"><p>NEW COMPLETE ANSWER</p></div>`, 1))
+		set(t, strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div>`, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"><p>NEW COMPLETE ANSWER</p></div>`, 1))
 		got, err = responseProbe(tab, before.IDs)
 		if err != nil || got.Last != "NEW COMPLETE ANSWER" || !got.Complete {
 			t.Fatal("actual rendered answer overridden", got, err)
@@ -430,7 +451,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		m["metadata"] = map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "not executed", "fallbackMarkdown": mixed}}
 		publish()
 		visibleHTML := strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div>`, `<div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"><p>I will call the declared function.</p><p>`+html.EscapeString(raw)+`</p><p>No tools have run yet.</p></div>`, 1)
-		set(visibleHTML)
+		set(t, visibleHTML)
 		got, err = responseProbe(tab, before.IDs)
 		if err != nil || !got.SourceRequired || got.Last != mixed || got.LastID != "dil-answer" {
 			t.Fatal("mixed DIL protocol source was transformed", err)
@@ -441,14 +462,14 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		plainHTML := strings.Replace(visibleHTML, ` data-dil-message-id="dil-answer"`, "", 1)
 		m["metadata"] = map[string]any{"is_complete": true}
 		publish()
-		set(plainHTML)
+		set(t, plainHTML)
 		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != mixed || !got.SourceRequired {
 			t.Fatal("non-DIL DOM-bound protocol source lost", err)
 		}
 		emptyPlain := strings.Replace(dilHTML, ` data-dil-message-id="dil-answer"`, "", 1)
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{"<escape>" + raw + "</escape>"}}
 		publish()
-		set(emptyPlain)
+		set(t, emptyPlain)
 		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "<escape>"+raw+"</escape>" {
 			t.Fatal("completed non-DIL empty rendering lost exact protocol source", err)
 		}
@@ -462,7 +483,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			{"replace user identity", `document.querySelector('[data-chatgpt-search-message-ids="fixture-user"]').setAttribute('data-chatgpt-search-message-ids','different-user')`, false},
 			{"replace assistant identity", `document.querySelector('[data-chatgpt-search-message-ids="dil-answer dil-answer"]').setAttribute('data-chatgpt-search-message-ids','different-answer')`, false},
 		} {
-			set(emptyPlain)
+			set(t, emptyPlain)
 			js := `window.__auditFetch=window.fetch;window.fetch=async(...args)=>{const r=await window.__auditFetch(...args);if(String(args[0]).includes('/backend-api/conversation/')){` + change.js + `}return r;};`
 			if err := chromedp.Run(tab, chromedp.Evaluate(js, nil)); err != nil {
 				t.Fatal(err)
@@ -480,7 +501,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		}
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{"ordinary prose"}}
 		publish()
-		set(emptyPlain)
+		set(t, emptyPlain)
 		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "" {
 			t.Fatal("non-DIL empty rendering adopted unverified prose", err)
 		}
@@ -488,7 +509,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		// exactly ACK, but its non-DIL renderer shows an empty answer.
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{"ACK"}}
 		publish()
-		set(emptyPlain)
+		set(t, emptyPlain)
 		if got, err := responseProbe(tab, before.IDs); err != nil || got.Last != "ACK" || !got.SourceVerified {
 			t.Fatal("exact completed import acknowledgement was lost", err)
 		}
@@ -507,7 +528,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		// readback's recheck the SAME final ACK had hydrated. The former
 		// nonempty-prose guard returned empty again, preserving stale state.
 		hydratedHTML := strings.Replace(emptyPlain, `<div class="DilResponseRoot-HfQrEh"></div>`, `<div class="DilResponseRoot-HfQrEh">ACK</div>`, 1)
-		set(hydratedHTML)
+		set(t, hydratedHTML)
 		var hydratedACK string
 		baselineJSON, _ := json.Marshal(before.IDs)
 		readACK := fmt.Sprintf(`(async()=>{const recheck=()=>%s(%s);const st=recheck();%s})()`, responseProbeJS, string(baselineJSON), nullDILWireJS)
@@ -516,7 +537,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		}
 		// The real hydration also mounts a nonempty DIL root whose fallback
 		// is ACK, not the narrowly handled null-code protocol failure.
-		set(strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh"></div>`, `<div class="DilResponseRoot-HfQrEh">ACK</div>`, 1))
+		set(t, strings.Replace(dilHTML, `<div class="DilResponseRoot-HfQrEh"></div>`, `<div class="DilResponseRoot-HfQrEh">ACK</div>`, 1))
 		if err := chromedp.Run(tab, chromedp.Evaluate(readACK, &hydratedACK, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil || hydratedACK != "ACK" {
 			t.Fatal("hydrated DIL ACK incorrectly required null-render diagnostics", err, hydratedACK)
 		}
@@ -525,14 +546,14 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(readACK, &hydratedACK, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil || hydratedACK != "" {
 			t.Fatal("hydrated ACK bypassed source ancestry", err)
 		}
-		set(emptyPlain)
+		set(t, emptyPlain)
 		if got, _ := responseProbe(tab, before.IDs); got.Last != "" {
 			t.Fatal("unrelated acknowledgement adopted")
 		}
 		node["parent"] = "fixture-user"
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{mixed}}
 		publish()
-		set(plainHTML)
+		set(t, plainHTML)
 		node["parent"] = "different-user"
 		publish()
 		if _, err := responseProbe(tab, before.IDs); err == nil {
@@ -547,7 +568,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		m["status"] = "finished_successfully"
 		m["metadata"] = map[string]any{"is_complete": true, "model_dil_v2": map[string]any{"code": "not executed", "fallbackMarkdown": mixed}}
 		publish()
-		set(visibleHTML)
+		set(t, visibleHTML)
 		artifactSource := "<escape></escape>\n" + raw
 		m["content"] = map[string]any{"content_type": "text", "parts": []string{artifactSource}}
 		publish()
@@ -586,7 +607,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		node["parent"] = "recap"
 		mapping["prior-call"] = map[string]any{"message": map[string]any{"id": "prior-call", "content": map[string]any{"content_type": "text", "parts": []string{raw}}}}
 		publish()
-		set(dilHTML)
+		set(t, dilHTML)
 		emptyProof := func() bool {
 			t.Helper()
 			var empty bool
@@ -629,7 +650,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		node["parent"] = "recap"
 		publish()
 		for _, html := range []string{dilHTML + `<button data-testid="stop-button">Stop</button>`, dilHTML + `<div role="alert">Something went wrong</div>`, strings.Replace(dilHTML, `fixture-user`, `different-user`, 1), old + `<h4>You said:</h4><div>new result</div>`} {
-			set(html)
+			set(t, html)
 			if emptyProof() {
 				t.Fatal("changed/generating/stale boundary accepted")
 			}
@@ -731,26 +752,49 @@ func TestSanitizeRasterAlt(t *testing.T) {
 // refuses. Only empty text, this exact prompt, or a character prefix of it is
 // ours. A composer holding our own stale first line was reported as foreign
 // text, which left every later attempt on that thread permanently refused.
-func TestComposerDraftOwnership(t *testing.T) {
-	prompt := "line one\nline two\nline three"
-	for _, tc := range []struct {
-		name  string
-		draft string
-		want  draftKind
-		rest  string
+// TestPreSendFailureClassification pins what askLocked's defer does with a
+// pre-send error: a typed draft refusal keeps its own class, because retrying
+// cannot help and must never look like a safe resubmission. A transient
+// pre-submit failure stays retryable.
+func TestPreSendFailureClassification(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		attempted bool
+		retryable bool
 	}{
-		{"empty composer", "", draftEmpty, prompt},
-		{"our exact prompt", prompt, draftOwnExact, ""},
-		{"our own first line", "line one", draftOwnPrefix, "\nline two\nline three"},
-		{"our own partial line", "line on", draftOwnPrefix, "e\nline two\nline three"},
-		{"crlf and edge whitespace folded", "line one\r\n", draftOwnPrefix, "\nline two\nline three"},
-		{"unrelated user draft", "notes the user typed earlier", draftForeign, ""},
-		{"our prompt with user text appended", prompt + " and more", draftForeign, ""},
-	} {
-		got, rest := classifyDraft(tc.draft, prompt)
-		if got != tc.want || rest != tc.rest {
-			t.Errorf("%s: got (%v,%q) want (%v,%q)", tc.name, got, rest, tc.want, tc.rest)
-		}
+		{"foreign draft is not retryable", fmt.Errorf("%w: text present", ErrForeignDraft), false, false},
+		{"owned draft is not retryable", fmt.Errorf("%w: turn may exist", ErrDraftOwned), false, false},
+		{"no composer is not retryable", fmt.Errorf("%w: %w", ErrNotSubmitted, ErrNoComposer), false, true},
+		{"transport failure stays retryable", errors.New("cdp blip"), false, true},
+		{"attempted turn is never reclassified", fmt.Errorf("%w: click", ErrForeignDraft), true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyPreSendFailure(tc.err, tc.attempted)
+			if errors.Is(got, ErrNotSubmitted) != tc.retryable {
+				t.Fatalf("retryable=%v want %v: %v", errors.Is(got, ErrNotSubmitted), tc.retryable, got)
+			}
+			if !errors.Is(got, tc.err) {
+				t.Fatalf("original error lost: %v", got)
+			}
+		})
+	}
+}
+
+// A truncated digest must never authorize an overwrite. Ownership is decided on
+// the full digest (and, for ChatGPT, on exact logical equality), so the
+// log-sized form must stay a different, shorter value.
+func TestDraftDigestsAreNotTruncated(t *testing.T) {
+	doc := "some document text"
+	if got := draftFingerprint(doc); len(got) != 64 {
+		t.Fatalf("ownership digest is %d hex chars, want 64", len(got))
+	}
+	if got := draftFingerprintShort(doc); len(got) != 8 {
+		t.Fatalf("log digest is %d hex chars, want 8", len(got))
+	}
+	if draftFingerprintShort(doc) == draftFingerprint(doc) {
+		t.Fatal("short and ownership digests must not be interchangeable")
 	}
 }
 
@@ -782,10 +826,12 @@ func TestComposerInsertModeFollowsContent(t *testing.T) {
 // native insert lands only the text up to the FIRST newline, a trusted
 // Shift+Enter breaks the line, and the logical document — not innerText — is
 // authoritative.
-func composerFixtureJS(initial string, deletesHonoured bool) string {
+func composerFixtureJS(initial string, deletesHonoured bool, capUnits int) string {
 	return `(() => {
   const e = document.querySelector('.ProseMirror');
   let model = ` + quoteJS(initial) + `;
+  window.__composerCap = ` + fmt.Sprintf("%d", capUnits) + `;
+  const cap = () => { if (window.__composerCap > 0 && model.length > window.__composerCap) model = model.slice(0, window.__composerCap); };
   const sync = () => { e.pmViewDesc.node.content.size = model.length; };
   e.pmViewDesc = { node: { type: { name: 'doc' }, content: { size: 0 }, textBetween() { return model } } };
   e.textContent = model;
@@ -803,10 +849,25 @@ func composerFixtureJS(initial string, deletesHonoured bool) string {
       window.__composerDeletes++;
       if (` + fmt.Sprintf("%v", deletesHonoured) + `) model = '';
     }
+    cap();
     sync();
   });
   const exec = document.execCommand.bind(document);
-  document.execCommand = (cmd, ...rest) => (cmd === 'selectAll' || cmd === 'delete') ? false : exec(cmd, ...rest);
+  document.execCommand = (cmd, ...rest) => {
+    if (cmd === 'selectAll' || cmd === 'delete') return false;
+    if (cmd === 'insertText' && rest.length > 1 && rest[1] != null) {
+      // Deterministic legacy insertion: the editor model absorbs exactly what
+      // the command carried here (a real oversized execCommand insertion is
+      // unreliable), then the composer limit truncates it exactly as the
+      // reported 180955-byte prompt was truncated.
+      model += String(rest[1]);
+      cap();
+      sync();
+      e.textContent = model;
+      return true;
+    }
+    return exec(cmd, ...rest);
+  };
 })()`
 }
 
@@ -825,15 +886,16 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 	defer cancelTab()
 	tab, timeout := context.WithTimeout(tab, 120*time.Second)
 	defer timeout()
-	set := func(initial string, deletesHonoured bool) {
+	setCap := func(initial string, deletesHonoured bool, capUnits int) {
 		t.Helper()
 		if err := chromedp.Run(tab, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
 			t.Fatal(err)
 		}
-		if err := chromedp.Run(tab, chromedp.Evaluate(composerFixtureJS(initial, deletesHonoured), nil)); err != nil {
+		if err := chromedp.Run(tab, chromedp.Evaluate(composerFixtureJS(initial, deletesHonoured, capUnits), nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	set := func(initial string, deletesHonoured bool) { setCap(initial, deletesHonoured, 0) }
 	model := func(when string) string {
 		t.Helper()
 		var got string
@@ -862,6 +924,16 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 			t.Fatalf("composer holds %q, want %q", got, multi)
 		}
 	})
+	t.Run("unicode urls markdown and punctuation survive exactly", func(t *testing.T) {
+		set("", true)
+		rich := "Ünïcode ✅ 日本語 — em dash\nmarkdown **bold** and `code` and [link](https://example.com/a)\nsee <https://example.com/x?y=1> and (https://example.com/z)\ntrailing: !?.,;: % $"
+		if err := c.typePrompt(tab, tab, rich); err != nil {
+			t.Fatalf("rich prompt not delivered: %v", err)
+		}
+		if got := model(t.Name()); got != rich {
+			t.Fatalf("composer holds %q, want %q", got, rich)
+		}
+	})
 	t.Run("single line prompt still lands", func(t *testing.T) {
 		set("", true)
 		if err := c.typePrompt(tab, tab, "one line only"); err != nil {
@@ -871,36 +943,136 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 			t.Fatalf("composer holds %q", got)
 		}
 	})
-	t.Run("own leftover first line is wiped by a trusted key", func(t *testing.T) {
-		set("line one", true)
+	// A filtered -run makes the parent body run before any subtest has driven
+	// the tab, so the CDP target may not exist yet.
+	tid := ""
+	if tr := chromedp.FromContext(tab); tr != nil && tr.Target != nil {
+		tid = string(tr.Target.TargetID)
+	}
+	t.Run("superseded owned draft is replaced, so A then B cannot lock out", func(t *testing.T) {
+		set("", true)
 		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("own leftover treated as foreign: %v", err)
+			t.Fatalf("first prompt not delivered: %v", err)
 		}
-		if got := model(t.Name()); got != multi {
-			t.Fatalf("composer holds %q, want %q", got, multi)
+		next := "a completely different request"
+		if err := c.typePrompt(tab, tab, next); err != nil {
+			t.Fatalf("own unsent draft from an earlier request locked the chat out: %v", err)
+		}
+		if got := model(t.Name()); got != next {
+			t.Fatalf("composer holds %q, want %q", got, next)
 		}
 		if got := deletes(); got == 0 {
-			t.Fatal("own leftover was not cleared through a trusted key event")
+			t.Fatal("superseded owned draft was not cleared through a trusted key event")
 		}
 	})
-	t.Run("own leftover that survives deletion is adopted once", func(t *testing.T) {
-		set("line one", false)
+	t.Run("failed insertion residual is replaced by a later different request", func(t *testing.T) {
+		// The reported user shape: insertion A does not land completely (here the
+		// editor only accepts 12 units), settlement fails, and a LATER request is
+		// a different prompt B. The residual must be provably ours, not foreign.
+		c := &Client{}
+		long := "alpha line one\nalpha line two\nalpha line three"
+		setCap("", true, 12)
+		ctx, cancel := context.WithTimeout(tab, 2500*time.Millisecond)
+		err := c.typePrompt(ctx, tab, long)
+		cancel()
+		if err == nil {
+			t.Fatal("a truncated insertion was reported as complete")
+		}
+		residual := model(t.Name())
+		if residual == "" || len(residual) >= len(long) {
+			t.Fatalf("fixture did not leave a partial residual: units=%d", len(residual))
+		}
+		// The editor recovers; the next request is a genuinely different prompt.
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCap = 0`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		next := "a completely different request after the failed insertion"
+		if err := c.typePrompt(tab, tab, next); err != nil {
+			t.Fatalf("own failed-insertion residual locked the chat out: %v", err)
+		}
+		if got := model(t.Name()); got != next {
+			t.Fatalf("composer holds %q, want %q", got, next)
+		}
+	})
+	t.Run("same turn exact reuse types nothing", func(t *testing.T) {
+		set("", true)
 		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("surviving own leftover treated as foreign: %v", err)
+			t.Fatalf("prompt not delivered: %v", err)
+		}
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("identical retry of the same turn was refused: %v", err)
 		}
 		if got := model(t.Name()); got != multi {
 			t.Fatalf("composer holds %q, want %q", got, multi)
+		}
+		if got := deletes(); got != 0 {
+			t.Fatalf("exact reuse touched the composer: %d deletions", got)
+		}
+	})
+	t.Run("user-edited once-owned draft is preserved and refused", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("prompt not delivered: %v", err)
+		}
+		edited := multi + "\nthe user kept typing"
+		set(edited, true)
+		if err := c.typePrompt(tab, tab, "unrelated new request"); err == nil {
+			t.Fatal("a user-edited draft was typed over")
+		}
+		if got := model(t.Name()); got != edited {
+			t.Fatalf("user-edited draft was modified: %q", got)
+		}
+		if got := deletes(); got != 0 {
+			t.Fatalf("refusal touched the user-edited draft: %d deletions", got)
+		}
+	})
+	t.Run("unrecorded leftover is refused and preserved", func(t *testing.T) {
+		// No ownership record exists (for example after an adapter restart), so
+		// a leftover prefix cannot be proved ours: a prefix alone is not
+		// ownership. It must survive intact.
+		fresh := &Client{}
+		leftover := "line one"
+		set(leftover, true)
+		err := fresh.typePrompt(tab, tab, multi)
+		if err == nil {
+			t.Fatal("unrecorded leftover was typed over")
+		}
+		if !strings.Contains(err.Error(), "cannot verify") {
+			t.Fatalf("refusal does not say why: %v", err)
+		}
+		if got := model(t.Name()); got != leftover {
+			t.Fatalf("refused draft was modified: %q", got)
+		}
+		if got := deletes(); got != 0 {
+			t.Fatalf("refusal touched the draft: %d deletions", got)
+		}
+	})
+	t.Run("draft is never cleared or reused after a send was attempted", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("prompt not delivered: %v", err)
+		}
+		c.markDraftSubmitted(tid, multi)
+		if err := c.typePrompt(tab, tab, "a later different request"); err == nil {
+			t.Fatal("an attempted turn's draft was reused or cleared")
+		}
+		if got := model(t.Name()); got != multi {
+			t.Fatalf("attempted turn's draft was modified: %q", got)
 		}
 	})
 	t.Run("unrelated draft is refused and preserved", func(t *testing.T) {
 		foreign := "notes the user typed earlier"
 		set(foreign, true)
-		err := c.typePrompt(tab, tab, multi)
+		// A fresh client has no ownership record, so this text cannot be ours.
+		err := (&Client{}).typePrompt(tab, tab, multi)
 		if err == nil {
 			t.Fatal("unrecognised draft was typed over")
 		}
-		if !strings.Contains(err.Error(), "unrecognised") {
+		if !strings.Contains(err.Error(), "verdict=") {
 			t.Fatalf("refusal does not describe what was found: %v", err)
+		}
+		if strings.Contains(err.Error(), foreign) {
+			t.Fatalf("refusal leaked draft content: %v", err)
 		}
 		if got := model(t.Name()); got != foreign {
 			t.Fatalf("refused draft was modified: %q", got)
@@ -909,4 +1081,303 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 			t.Fatalf("refusal touched the draft: %d deletions", got)
 		}
 	})
+
+	// The pre-submit gate is one call in askLocked; these drive that exact
+	// function against the same fixture, not a copy of its logic.
+	locate := func(t *testing.T) (string, string) {
+		t.Helper()
+		var thread string
+		if err := chromedp.Run(tab, chromedp.Location(&thread)); err != nil {
+			t.Fatal(err)
+		}
+		return string(chromedp.FromContext(tab).Target.TargetID), thread
+	}
+	t.Run("pre-submit gate accepts exactly this turn's prompt", func(t *testing.T) {
+		set(multi, true)
+		c := &Client{}
+		tid, thread := locate(t)
+		c.recordOwnedDraft(tid, thread, multi, multi)
+		if err := c.preSubmitGate(tab, multi); err != nil {
+			t.Fatalf("exact prompt was refused: %v", err)
+		}
+		if got := model(t.Name()); got != multi {
+			t.Fatalf("gate modified the prompt: %q", got)
+		}
+	})
+	t.Run("pre-submit gate preserves a user edit made after typing", func(t *testing.T) {
+		set("", true)
+		c := &Client{}
+		if err := c.typePrompt(tab, tab, multi); err != nil {
+			t.Fatal(err)
+		}
+		// The person adds text before Send, through a real editor input event.
+		if err := chromedp.Run(tab, chromedp.Evaluate(`(() => { const e = document.querySelector('.ProseMirror'); e.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:' plus', bubbles:true})); })()`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		edited := model(t.Name())
+		err := c.preSubmitGate(tab, multi)
+		if !errors.Is(err, ErrForeignDraft) {
+			t.Fatalf("edited draft was not refused as unverifiable: %v", err)
+		}
+		if errors.Is(err, ErrNotSubmitted) {
+			t.Fatal("a user edit must not be classified as a retryable transport failure")
+		}
+		if got := model(t.Name()); got != edited {
+			t.Fatalf("blind wipe destroyed the edit: %q", got)
+		}
+		if got := deletes(); got != 0 {
+			t.Fatalf("gate wiped the composer: %d deletions", got)
+		}
+	})
+	t.Run("pre-submit gate clears only its own residual for this same prompt", func(t *testing.T) {
+		long := "beta line one\nbeta line two\nbeta line three"
+		setCap("", true, 12)
+		c := &Client{}
+		ctx, cancel := context.WithTimeout(tab, 2500*time.Millisecond)
+		_ = c.typePrompt(ctx, tab, long)
+		cancel()
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCap = 0`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if residual := model(t.Name()); residual == "" || residual == long {
+			t.Fatalf("fixture left no residual: %q", residual)
+		}
+		err := c.preSubmitGate(tab, long)
+		if !errors.Is(err, ErrNotSubmitted) {
+			t.Fatalf("own residual: %v", err)
+		}
+		if errors.Is(err, ErrForeignDraft) {
+			t.Fatal("own residual must not be reported as foreign")
+		}
+		if got := model(t.Name()); got != "" {
+			t.Fatalf("verified wipe left text behind: %q", got)
+		}
+	})
+	t.Run("pre-submit gate preserves a user-shortened prefix", func(t *testing.T) {
+		set("line one", true)
+		err := (&Client{}).preSubmitGate(tab, multi)
+		if !errors.Is(err, ErrForeignDraft) {
+			t.Fatalf("prefix resemblance authorized a match: %v", err)
+		}
+		if got := model(t.Name()); got != "line one" || deletes() != 0 {
+			t.Fatalf("user-shortened draft was modified: %q", got)
+		}
+	})
+}
+
+// TestDecideDraftOwnership pins the ownership table without a browser: every
+// branch that can erase or preserve text is decided here.
+func TestDecideDraftOwnership(t *testing.T) {
+	const prompt = "the prompt we typed"
+	rec := &draftRecord{
+		Doc:    prompt,
+		Prompt: prompt,
+		Hash:   draftFingerprint(prompt),
+		Units:  utf16Len(prompt),
+		Target: "T1",
+		Thread: "https://chatgpt.com/c/abc",
+	}
+	// A residual from a FAILED insertion: what landed is not what was meant.
+	residual := "the prompt"
+	residualRec := &draftRecord{
+		Doc:    residual,
+		Prompt: prompt,
+		Hash:   draftFingerprint(residual),
+		Target: "T1",
+		Thread: rec.Thread,
+	}
+	own := composerDoc{Found: true, Logical: true, Text: prompt}
+	cases := []struct {
+		name   string
+		doc    composerDoc
+		rec    *draftRecord
+		prompt string
+		target string
+		thread string
+		want   draftAction
+	}{
+		{"empty composer types", composerDoc{Found: true, Logical: true}, rec, prompt, "T1", rec.Thread, draftTypeComposer},
+		{"missing composer refuses", composerDoc{}, rec, prompt, "T1", rec.Thread, draftRefuseForeign},
+		{"no record refuses", own, nil, prompt, "T1", rec.Thread, draftRefuseForeign},
+		{"non-logical read refuses", composerDoc{Found: true, Text: prompt}, rec, prompt, "T1", rec.Thread, draftRefuseForeign},
+		{"same turn exact reuses", own, rec, prompt, "T1", rec.Thread, draftReuse},
+		{"superseded same thread replaces", own, rec, "a different request", "T1", rec.Thread, draftReplace},
+		{"different target refuses", own, rec, "a different request", "T2", rec.Thread, draftRefuseForeign},
+		{"different thread refuses", own, rec, "a different request", "T1", "https://chatgpt.com/c/other", draftRefuseForeign},
+		{"attempted send refuses", own, &draftRecord{Doc: prompt, Prompt: prompt, Hash: rec.Hash, Target: "T1", Thread: rec.Thread, Submitted: true}, "a different request", "T1", rec.Thread, draftRefuseOwned},
+		{"user edit refuses", composerDoc{Found: true, Logical: true, Text: prompt + " plus"}, rec, "a different request", "T1", rec.Thread, draftRefuseForeign},
+		// Deleting a once-owned draft down to a PREFIX is a user edit: the
+		// document no longer equals the observed snapshot, so it is preserved.
+		{"user shortened to prefix refuses", composerDoc{Found: true, Logical: true, Text: "the prompt"}, rec, prompt, "T1", rec.Thread, draftRefuseForeign},
+		// The real user bug: insertion A failed, leaving a residual that is not
+		// the intended prompt; a later DIFFERENT request B may replace exactly
+		// that observed residual.
+		{"failed insertion residual is replaceable by a different request", composerDoc{Found: true, Logical: true, Text: residual}, residualRec, "a different request", "T1", rec.Thread, draftReplace},
+		{"failed insertion residual retries the same request", composerDoc{Found: true, Logical: true, Text: residual}, residualRec, prompt, "T1", rec.Thread, draftReplace},
+		// A truncated digest is not ownership: a record carrying one is rejected
+		// even when Doc and the document agree.
+		{"short hash is not ownership", composerDoc{Found: true, Logical: true, Text: residual}, &draftRecord{Doc: residual, Prompt: prompt, Hash: draftFingerprint(residual)[:8], Target: "T1", Thread: rec.Thread}, "a different request", "T1", rec.Thread, draftRefuseForeign},
+		// A record whose snapshot and digest disagree is not evidence.
+		{"inconsistent record refuses", composerDoc{Found: true, Logical: true, Text: residual}, &draftRecord{Doc: residual, Prompt: prompt, Hash: draftFingerprint(prompt), Target: "T1", Thread: rec.Thread}, "a different request", "T1", rec.Thread, draftRefuseForeign},
+		{"prefix of a different prompt is not ownership", composerDoc{Found: true, Logical: true, Text: "the prompt"}, rec, "the prompt we typed at length", "T1", rec.Thread, draftRefuseForeign},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decideDraft(tc.doc, tc.rec, tc.prompt, tc.target, tc.thread); got != tc.want {
+				t.Fatalf("decideDraft = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Two sessions must never share a target, a composer or a draft record. Here one
+// session's oversized insertion truncates and fails while its peer types a small
+// prompt: the peer must land untouched, must not wait for the slow failure, and
+// the failed session's residual must stay bound to its OWN target so a later
+// retry can safely replace it.
+func TestConcurrentComposerIsolation(t *testing.T) {
+	chrome := findChrome()
+	if chrome == "" {
+		t.Skip("Chrome unavailable for composer fixtures")
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
+	alloc, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
+	// One browser, two tabs: a second allocator context would try to launch a
+	// second Chrome against the same profile and fail.
+	root, cancelRoot := chromedp.NewContext(alloc)
+	defer cancelRoot()
+	// Start the browser once, on the root context, before any child context can
+	// try to launch its own instance against the same profile.
+	if err := chromedp.Run(root, chromedp.Evaluate(`1`, nil)); err != nil {
+		t.Fatal(err)
+	}
+	open := func() (context.Context, context.CancelFunc) {
+		ctx, cancel := chromedp.NewContext(root)
+		ctx, timeout := context.WithTimeout(ctx, 120*time.Second)
+		return ctx, func() { timeout(); cancel() }
+	}
+	tabA, closeA := open()
+	defer closeA()
+	tabB, closeB := open()
+	defer closeB()
+	// Distinct conversation identity, as two real chats have. Two tabs of one
+	// chat still differ by target, but the record binds both.
+	if err := chromedp.Run(tabB, chromedp.Navigate("about:blank#peer")); err != nil {
+		t.Fatal(err)
+	}
+
+	install := func(ctx context.Context, initial string, capUnits int) {
+		t.Helper()
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := chromedp.Run(ctx, chromedp.Evaluate(composerFixtureJS(initial, false, capUnits), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := func(ctx context.Context, when string) string {
+		t.Helper()
+		var got string
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
+			t.Fatalf("%s: %v", when, err)
+		}
+		return got
+	}
+	deletes := func(ctx context.Context) int {
+		t.Helper()
+		var got int
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	targetOf := func(ctx context.Context) string { return string(chromedp.FromContext(ctx).Target.TargetID) }
+
+	// The exact reported shape: a 180955-byte single-line prompt, above the
+	// inline limit, so it takes the legacy one-shot insertion path; the composer
+	// keeps only the first 12 units.
+	huge := strings.Repeat("q", 180955)
+	install(tabA, "", 12)
+	install(tabB, "", 0)
+	// Target identity only exists once each context has created its tab.
+	if string(chromedp.FromContext(tabA).Target.TargetID) == string(chromedp.FromContext(tabB).Target.TargetID) {
+		t.Fatal("independent sessions were given the same browser target")
+	}
+
+	cA, cB := &Client{}, &Client{}
+	start := time.Now()
+	errA := make(chan error, 1)
+	go func() { errA <- cA.typePrompt(context.Background(), tabA, huge) }()
+	errB := cB.typePrompt(context.Background(), tabB, "peer prompt")
+	elapsedB := time.Since(start)
+	var gotA error
+	select {
+	case gotA = <-errA:
+	case <-time.After(90 * time.Second):
+		t.Fatal("oversized legacy insertion never returned")
+	}
+	elapsedA := time.Since(start)
+
+	// The peer succeeded and was never serialized behind the slow failure.
+	if errB != nil {
+		t.Fatalf("peer insertion failed while a different session was failing: %v", errB)
+	}
+	if elapsedB > 10*time.Second || elapsedB >= elapsedA {
+		t.Fatalf("peer waited for the failing peer: peer=%v failing=%v", elapsedB, elapsedA)
+	}
+	if got := model(tabB, "peer model"); got != "peer prompt" {
+		t.Fatalf("peer composer = %q, want %q", got, "peer prompt")
+	}
+	// The failing session failed honestly, as a retryable pre-submit failure,
+	// never as a foreign-draft refusal of its own residual.
+	if gotA == nil || !errors.Is(gotA, ErrNotSubmitted) {
+		t.Fatalf("oversized insertion = %v, want ErrNotSubmitted", gotA)
+	}
+	if errors.Is(gotA, ErrForeignDraft) || errors.Is(gotA, ErrDraftOwned) {
+		t.Fatalf("own failed insertion was misclassified as foreign: %v", gotA)
+	}
+	if got := model(tabA, "residual model"); got != strings.Repeat("q", 12) {
+		t.Fatalf("residual = %d units, want 12", utf16Len(got))
+	}
+	if n := deletes(tabA) + deletes(tabB); n != 0 {
+		t.Fatalf("failed insertion wiped a composer (deletes=%d)", n)
+	}
+
+	// Each session's provenance names its OWN target and document; neither
+	// record can authorize a write in the other session's composer.
+	recA, recB := cA.draftOwnership(), cB.draftOwnership()
+	if recA == nil || recB == nil {
+		t.Fatalf("missing draft records: a=%v b=%v", recA != nil, recB != nil)
+	}
+	if recA.Target != targetOf(tabA) || recB.Target != targetOf(tabB) {
+		t.Fatalf("draft record not bound to its own target: a=%s/%s b=%s/%s",
+			recA.Target, targetOf(tabA), recB.Target, targetOf(tabB))
+	}
+	if recA.Target == recB.Target || recA.Thread == recB.Thread {
+		t.Fatal("two sessions share a target or a conversation identity")
+	}
+	if recA.Doc != strings.Repeat("q", 12) || recB.Doc != "peer prompt" {
+		t.Fatalf("draft records describe the wrong documents: a=%d units b=%d units", utf16Len(recA.Doc), utf16Len(recB.Doc))
+	}
+	if strings.Contains(recB.Doc, "q") && utf16Len(recB.Doc) > 100 {
+		t.Fatal("the peer's record absorbed the failing session's text")
+	}
+
+	// A small draft the bridge cannot prove it wrote is preserved, not wiped,
+	// even though this client already owns a record for an earlier turn.
+	install(tabB, "small stale", 0)
+	if err := cB.typePrompt(context.Background(), tabB, "peer prompt two"); !errors.Is(err, ErrForeignDraft) {
+		t.Fatalf("small stale draft = %v, want ErrForeignDraft", err)
+	}
+	if got := model(tabB, "stale model"); got != "small stale" {
+		t.Fatalf("small stale draft was modified: %q", got)
+	}
+	if n := deletes(tabB); n != 0 {
+		t.Fatalf("small stale draft was wiped (deletes=%d)", n)
+	}
+	// The failing session's own record is still intact and still its own.
+	if rec := cA.draftOwnership(); rec == nil || rec.Target != targetOf(tabA) {
+		t.Fatal("peer activity changed the failing session's provenance")
+	}
 }
