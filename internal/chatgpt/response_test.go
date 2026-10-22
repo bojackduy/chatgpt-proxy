@@ -820,6 +820,103 @@ func TestComposerInsertModeFollowsContent(t *testing.T) {
 	}
 }
 
+// Only a provable truncation may be repaired in-turn, only once, and never on
+// the composition path that owns its own fallback. Anything else stays a hard
+// refusal: a diverged document could be someone's edit.
+func TestRepairAllowedIsNarrow(t *testing.T) {
+	short := strings.Repeat("x", 100)
+	for _, tc := range []struct {
+		name       string
+		verdict    string
+		target     string
+		repairUsed bool
+		want       bool
+	}{
+		{"strict prefix of the prompt", verdictTruncated, short, false, true},
+		{"already repaired once", verdictTruncated, short, true, false},
+		{"nothing was typed", verdictTruncated, "", false, false},
+		{"diverged mid-document", verdictDiverged, short, false, false},
+		{"document longer than prompt", verdictExtra, short, false, false},
+		{"exact", verdictExact, short, false, false},
+		{"legacy oversized path", verdictTruncated, strings.Repeat("x", composerInlineLimit+1), false, false},
+	} {
+		if got := repairAllowed(tc.verdict, tc.target, tc.repairUsed); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A trusted insert that lands only part of the prompt is what poisoned bridge
+// threads: the settle gate refused to submit, and the residual then blocked
+// every later turn. One bounded repair of a provable truncation must converge,
+// and a truncation that persists must still refuse without looping.
+func TestComposerTruncationRepair(t *testing.T) {
+	chrome := findChrome()
+	if chrome == "" {
+		t.Skip("Chrome unavailable for composer fixtures")
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
+	alloc, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+	tab, cancelTab := chromedp.NewContext(alloc)
+	defer cancelTab()
+	tab, timeout := context.WithTimeout(tab, 180*time.Second)
+	defer timeout()
+	install := func(capUnits int, oneShot bool) {
+		t.Helper()
+		if err := chromedp.Run(tab, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(composerFixtureJS("", true, capUnits), nil)); err != nil {
+			t.Fatal(err)
+		}
+		if oneShot {
+			if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCapOneShot = true`, nil)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	model := func() string {
+		t.Helper()
+		var got string
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
+			t.Fatalf("model: %v", err)
+		}
+		return got
+	}
+	deletes := func() int {
+		t.Helper()
+		var got int
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
+			t.Fatalf("deletes: %v", err)
+		}
+		return got
+	}
+	c := &Client{}
+	prompt := "repair me please, the tail keeps going missing at the end"
+	t.Run("a short insert is repaired once and settles", func(t *testing.T) {
+		install(len(prompt)-9, true)
+		if err := c.typePrompt(tab, tab, prompt); err != nil {
+			t.Fatalf("truncated insert was not repaired: %v", err)
+		}
+		if got := model(); got != prompt {
+			t.Fatalf("composer holds %d units, want %d", len(got), len(prompt))
+		}
+		if got := deletes(); got == 0 {
+			t.Fatal("repair must clear the proven-own prefix before retyping")
+		}
+	})
+	t.Run("a truncation that persists still refuses and is bounded", func(t *testing.T) {
+		install(len(prompt)-9, false)
+		if err := c.typePrompt(tab, tab, prompt); !errors.Is(err, ErrNotSubmitted) {
+			t.Fatalf("persistent truncation must stay a pre-submit refusal, got %v", err)
+		}
+		if got := deletes(); got != 1 {
+			t.Fatalf("repair ran %d times, want exactly 1", got)
+		}
+	})
+}
+
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
 // composer on a dedicated bridge tab: the deprecated execCommand wipe pair does
 // not clear it, a trusted deletion key event does (when deletesHonoured), one
@@ -831,7 +928,8 @@ func composerFixtureJS(initial string, deletesHonoured bool, capUnits int) strin
   const e = document.querySelector('.ProseMirror');
   let model = ` + quoteJS(initial) + `;
   window.__composerCap = ` + fmt.Sprintf("%d", capUnits) + `;
-  const cap = () => { if (window.__composerCap > 0 && model.length > window.__composerCap) model = model.slice(0, window.__composerCap); };
+  window.__composerCapOneShot = false;
+  const cap = () => { if (window.__composerCap > 0 && model.length > window.__composerCap) { model = model.slice(0, window.__composerCap); if (window.__composerCapOneShot) window.__composerCap = 0; } };
   const sync = () => { e.pmViewDesc.node.content.size = model.length; };
   e.pmViewDesc = { node: { type: { name: 'doc' }, content: { size: 0 }, textBetween() { return model } } };
   e.textContent = model;
@@ -1267,12 +1365,12 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	install := func(ctx context.Context, initial string, capUnits int) {
+	install := func(ctx context.Context, initial string, capUnits int, deletesHonoured bool) {
 		t.Helper()
 		if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
 			t.Fatal(err)
 		}
-		if err := chromedp.Run(ctx, chromedp.Evaluate(composerFixtureJS(initial, false, capUnits), nil)); err != nil {
+		if err := chromedp.Run(ctx, chromedp.Evaluate(composerFixtureJS(initial, deletesHonoured, capUnits), nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1298,8 +1396,8 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 	// inline limit, so it takes the legacy one-shot insertion path; the composer
 	// keeps only the first 12 units.
 	huge := strings.Repeat("q", 180955)
-	install(tabA, "", 12)
-	install(tabB, "", 0)
+	install(tabA, "", 12, true)
+	install(tabB, "", 0, true)
 	// Target identity only exists once each context has created its tab.
 	if string(chromedp.FromContext(tabA).Target.TargetID) == string(chromedp.FromContext(tabB).Target.TargetID) {
 		t.Fatal("independent sessions were given the same browser target")
@@ -1364,9 +1462,26 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 		t.Fatal("the peer's record absorbed the failing session's text")
 	}
 
+	// The peer now types a LARGE prompt on the very path that just failed for
+	// session A. The legacy one-shot insertion must succeed on an uncapped
+	// composer, and it must not disturb session A's residual.
+	large := strings.Repeat("z", 120000)
+	if err := cB.typePrompt(context.Background(), tabB, large); err != nil {
+		t.Fatalf("peer large legacy insertion failed: %v", err)
+	}
+	if got := model(tabB, "peer large"); got != large {
+		t.Fatalf("peer large composer = %d units, want %d", utf16Len(got), utf16Len(large))
+	}
+	if got := model(tabA, "residual after peer large"); got != strings.Repeat("q", 12) {
+		t.Fatalf("peer activity changed the failing session's residual: %d units", utf16Len(got))
+	}
+	if n := deletes(tabA); n != 0 {
+		t.Fatalf("peer activity wiped the failing session's composer (deletes=%d)", n)
+	}
+
 	// A small draft the bridge cannot prove it wrote is preserved, not wiped,
 	// even though this client already owns a record for an earlier turn.
-	install(tabB, "small stale", 0)
+	install(tabB, "small stale", 0, true)
 	if err := cB.typePrompt(context.Background(), tabB, "peer prompt two"); !errors.Is(err, ErrForeignDraft) {
 		t.Fatalf("small stale draft = %v, want ErrForeignDraft", err)
 	}
@@ -1379,5 +1494,138 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 	// The failing session's own record is still intact and still its own.
 	if rec := cA.draftOwnership(); rec == nil || rec.Target != targetOf(tabA) {
 		t.Fatal("peer activity changed the failing session's provenance")
+	}
+}
+
+// The pool lends a backend PER TRANSACTION, so one session can run its second
+// turn on a different client, and a client can serve different sessions over
+// time. Provenance must survive that handoff: a record is bound to the client's
+// own target and to the conversation in it, never to the session, and a tab that
+// now shows a DIFFERENT conversation must refuse text left by the old one.
+func TestClientHandoffProvenance(t *testing.T) {
+	chrome := findChrome()
+	if chrome == "" {
+		t.Skip("Chrome unavailable for composer fixtures")
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
+	alloc, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
+	root, cancelRoot := chromedp.NewContext(alloc)
+	defer cancelRoot()
+	if err := chromedp.Run(root, chromedp.Evaluate(`1`, nil)); err != nil {
+		t.Fatal(err)
+	}
+	open := func(fragment string) (context.Context, context.CancelFunc) {
+		ctx, cancel := chromedp.NewContext(root)
+		ctx, timeout := context.WithTimeout(ctx, 120*time.Second)
+		if fragment != "" {
+			if err := chromedp.Run(ctx, chromedp.Navigate("about:blank#"+fragment)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return ctx, func() { timeout(); cancel() }
+	}
+	tabA, closeA := open("client-a")
+	defer closeA()
+	tabB, closeB := open("client-b")
+	defer closeB()
+
+	install := func(ctx context.Context, initial string) {
+		t.Helper()
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := chromedp.Run(ctx, chromedp.Evaluate(composerFixtureJS(initial, false, 0), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	navigate := func(ctx context.Context, fragment string) {
+		t.Helper()
+		if err := chromedp.Run(ctx, chromedp.Navigate("about:blank#"+fragment)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := func(ctx context.Context, when string) string {
+		t.Helper()
+		var got string
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
+			t.Fatalf("%s: %v", when, err)
+		}
+		return got
+	}
+	deletes := func(ctx context.Context) int {
+		t.Helper()
+		var got int
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	install(tabA, "")
+	install(tabB, "")
+
+	cA, cB := &Client{}, &Client{}
+	// Turn 1 on client A.
+	if err := cA.typePrompt(context.Background(), tabA, "turn one"); err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	recA1 := cA.draftOwnership()
+	if recA1 == nil || recA1.Doc != "turn one" {
+		t.Fatalf("client A did not record its own document: %+v", recA1)
+	}
+	// Turn 2 on client B, the same session round-robining onto another backend.
+	if err := cB.typePrompt(context.Background(), tabB, "turn two"); err != nil {
+		t.Fatalf("handoff turn: %v", err)
+	}
+	recB := cB.draftOwnership()
+	if recB == nil || recB.Doc != "turn two" {
+		t.Fatalf("second client did not record its own document: %+v", recB)
+	}
+	if recA1.Target == recB.Target || recA1.Thread == recB.Thread {
+		t.Fatal("handoff reused a target or a conversation identity")
+	}
+	if again := cA.draftOwnership(); again == nil || again.Doc != "turn one" || again.Thread != recA1.Thread {
+		t.Fatal("the handoff rewrote the first client's provenance")
+	}
+
+	// Turn 3 back on client A, now that its tab shows a DIFFERENT conversation:
+	// the record must rebind to the new thread while keeping the same target.
+	navigate(tabA, "second-conversation")
+	install(tabA, "")
+	if err := cA.typePrompt(context.Background(), tabA, "turn three"); err != nil {
+		t.Fatalf("turn after navigation: %v", err)
+	}
+	recA2 := cA.draftOwnership()
+	if recA2 == nil || recA2.Doc != "turn three" || recA2.Target != recA1.Target {
+		t.Fatalf("record did not rebind across navigation: %+v", recA2)
+	}
+	if recA2.Thread == recA1.Thread {
+		t.Fatal("record kept the previous conversation identity after navigation")
+	}
+
+	// Now the tab is on a THIRD conversation but still holds the text this client
+	// typed in the second one: same target, different thread. That is not proof
+	// of authorship here, so it must be refused and preserved, and the refusal
+	// must not rewrite the provenance it refused against.
+	navigate(tabA, "third-conversation")
+	install(tabA, "turn three")
+	if err := cA.typePrompt(context.Background(), tabA, "turn four"); !errors.Is(err, ErrForeignDraft) {
+		t.Fatalf("stale text across a conversation change = %v, want ErrForeignDraft", err)
+	}
+	if got := model(tabA, "stale across threads"); got != "turn three" {
+		t.Fatalf("text left by the previous conversation was modified: %q", got)
+	}
+	if n := deletes(tabA); n != 0 {
+		t.Fatalf("text left by the previous conversation was wiped (deletes=%d)", n)
+	}
+	if rec := cA.draftOwnership(); rec == nil || rec.Doc != "turn three" || rec.Thread != recA2.Thread {
+		t.Fatal("a refusal rewrote the provenance it refused against")
+	}
+	// The peer client is untouched by any of it.
+	if rec := cB.draftOwnership(); rec == nil || rec.Doc != "turn two" || rec.Target != recB.Target {
+		t.Fatal("another client's turns changed the peer's provenance")
+	}
+	if got := model(tabB, "peer after handoff"); got != "turn two" {
+		t.Fatalf("peer composer changed during the handoff: %q", got)
 	}
 }

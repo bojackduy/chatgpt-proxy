@@ -1500,6 +1500,19 @@ func insertModeFor(text string) insertMode {
 	return insertNative
 }
 
+// repairAllowed is the whole condition under which a settlement timeout may be
+// repaired inside the same turn. It is deliberately narrow: only a document
+// that is a STRICT PREFIX of the prompt says exactly what is missing, only text
+// this turn typed may be retyped (an empty target means the composer already
+// held the prompt), the oversized legacy paste path keeps its own fallback, and
+// a repair runs at most once. A diverged or longer document is never repaired.
+func repairAllowed(verdict, target string, repairUsed bool) bool {
+	if repairUsed || target == "" || verdict != verdictTruncated {
+		return false
+	}
+	return insertModeFor(target) != insertLegacy
+}
+
 // composerKeyActions is one trusted key press as keydown plus keyup. Trusted
 // key events are what the editor honours; the deprecated command pair does not
 // clear its composer. A key that generates text carries it, exactly as a real
@@ -1706,6 +1719,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// measurement (the visual DOM carries extra hard breaks). Never submit
 	// partial input.
 	exactReads := 0
+	repairUsed := false
 	deadline = time.Now().Add(15 * time.Second)
 	for {
 		var doc composerDoc
@@ -1749,6 +1763,31 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
 			log.Printf("[chatgpt] composer settlement target=%s document_units=%d document_paragraphs=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s logical=%v attached=%v",
 				tid, al.Document, doc.Paragraphs, al.Prompt, al.Prefix, al.Suffix, al.Verdict, doc.Logical, extra.Attached)
+			// One bounded repair of a PROVABLE truncation: the document is the
+			// text this turn itself typed, only shorter. Nothing has been
+			// submitted, and the wipe proves logical emptiness before anything is
+			// retyped, so no text can double up and nothing a person wrote is
+			// touched. A diverged or longer document is never repaired.
+			if repairAllowed(al.Verdict, target, repairUsed) {
+				repairUsed = true
+				log.Printf("[chatgpt] composer repair target=%s attempt=1 document_units=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s",
+					tid, al.Document, al.Prompt, al.Prefix, al.Suffix, al.Verdict)
+				repairCtx, repairCancel := context.WithTimeout(tab, 30*time.Second)
+				werr := c.wipeComposer(repairCtx, compSel)
+				if werr == nil {
+					insCtx, insCancel := context.WithTimeout(repairCtx, 20*time.Second)
+					insErr = chromedp.Run(insCtx, composerInsertActions(target)...)
+					insCancel()
+				}
+				repairCancel()
+				if werr != nil {
+					return werr
+				}
+				log.Printf("[chatgpt] composer repair typed_units=%d inserr=%v", utf16Len(target), insErr)
+				exactReads = 0
+				deadline = time.Now().Add(15 * time.Second)
+				continue
+			}
 			return fmt.Errorf("%w: composer did not settle to the complete prompt, nothing submitted (document_units=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s document_paragraphs=%d attached=%v)",
 				ErrNotSubmitted, al.Document, al.Prompt, al.Prefix, al.Suffix, al.Verdict, doc.Paragraphs, extra.Attached)
 		}
