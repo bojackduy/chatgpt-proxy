@@ -1715,3 +1715,23 @@ func TestClientHandoffProvenance(t *testing.T) {
 		t.Fatalf("peer composer changed during the handoff: %q", got)
 	}
 }
+
+func TestComposerTextKeyAndBridgeEnvelope(t *testing.T) {
+	// The editor may add, merge or drop line breaks; the same words must still
+	// compare equal, while any changed word must not.
+	if a, b := composerTextKey("alpha.\n\nbeta"), composerTextKey("alpha.beta"); a != b {
+		t.Fatalf("line-break reshape was not treated as equal: %q != %q", a, b)
+	}
+	if a, b := composerTextKey("alpha beta"), composerTextKey("alpha gamma"); a == b {
+		t.Fatal("different words compared equal")
+	}
+	envelope := "CURRENT REQUEST\nConversation messages for this turn (JSON):\n[]"
+	if !looksLikeBridgeDraft(envelope) {
+		t.Fatal("bridge envelope not recognised")
+	}
+	if looksLikeBridgeDraft("please summarise this thread") ||
+		looksLikeBridgeDraft("CURRENT REQUEST only") ||
+		looksLikeBridgeDraft("Conversation messages for this turn only") {
+		t.Fatal("ordinary draft misclassified as bridge envelope")
+	}
+}

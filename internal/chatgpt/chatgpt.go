@@ -1123,6 +1123,24 @@ func canonicalComposerText(s string) string {
 	return composerURLSpace.ReplaceAllString(strings.TrimSpace(s), "$1$2")
 }
 
+// composerTextKey is the comparison form of composer text: whitespace runs
+// compare as one space, because the editor adds, merges or drops line breaks
+// between blocks while absorbing an insertion. Word content must still match
+// exactly, so a real edit is never mistaken for the bridge's own draft.
+func composerTextKey(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// looksLikeBridgeDraft reports whether a composer document carries the envelope
+// every bridge prompt is composed with. It is used ONLY to replace a stale
+// bridge draft whose in-memory record was lost (adapter restart); that marker
+// pair is not something a person types by accident, while the text itself is
+// still verified before anything is deleted.
+func looksLikeBridgeDraft(text string) bool {
+	return strings.Contains(text, "CURRENT REQUEST") &&
+		strings.Contains(text, "Conversation messages for this turn")
+}
+
 // ---------------------------------------------------------------------------
 // Composer draft provenance.
 //
@@ -1300,10 +1318,10 @@ func decideDraft(doc composerDoc, rec *draftRecord, prompt, tid, thread string) 
 	if rec.Target != tid || rec.Thread != thread {
 		return draftRefuseForeign
 	}
-	if canonicalComposerText(doc.Text) != rec.Doc {
+	if composerTextKey(doc.Text) != composerTextKey(rec.Doc) {
 		return draftRefuseForeign
 	}
-	if canonicalComposerText(prompt) == rec.Doc {
+	if composerTextKey(prompt) == composerTextKey(rec.Doc) {
 		return draftReuse
 	}
 	return draftReplace
@@ -1413,14 +1431,14 @@ func (c *Client) preSubmitGate(tab context.Context, prompt string) error {
 	if !doc.Found {
 		return ErrNoComposer
 	}
-	if doc.Logical && canonicalComposerText(doc.Text) == canonicalComposerText(prompt) {
+	if doc.Logical && composerTextKey(doc.Text) == composerTextKey(prompt) {
 		return nil
 	}
 	log.Printf("[chatgpt] pre-submit composer mismatch logical=%v target=%s document_units=%d document_hash=%s prompt_units=%d",
 		doc.Logical, tid, utf16Len(doc.Text), draftFingerprintShort(doc.Text), utf16Len(prompt))
 	rec := c.draftOwnership()
 	owned := rec != nil && !rec.Submitted && rec.Target == tid && rec.Thread == doc.URL &&
-		rec.Doc != "" && rec.Prompt == prompt && canonicalComposerText(doc.Text) == rec.Doc
+		rec.Doc != "" && composerTextKey(rec.Prompt) == composerTextKey(prompt) && composerTextKey(doc.Text) == composerTextKey(rec.Doc)
 	if !owned {
 		// A user edit after typing lands here. Their text wins, and a retry
 		// cannot fix it, so it must not be classified as a safe resubmission.
@@ -1450,12 +1468,22 @@ func (c *Client) wipeComposer(ctx context.Context, sel string) error {
 	if expected == "" {
 		expected = rec.Doc
 	}
+	return c.clearComposerExact(ctx, sel, expected, rec.Thread)
+}
+
+// clearComposerExact deletes the composer's contents only while the SAME
+// in-page read still shows the expected document and thread. Text comparison
+// ignores whitespace runs: the editor may reshape line breaks while absorbing
+// the insertion, and that must not turn the bridge's own draft into a refusal.
+func (c *Client) clearComposerExact(ctx context.Context, sel, expected, thread string) error {
+	keyJS := `const key = t => (t || '').replace(/\s+/g, ' ').trim();`
 	// Compare and delete in ONE editor transaction. A CDP selection followed by
 	// a separate Backspace could erase an edit arriving between those calls.
 	js := `(() => {
 	  const el = ` + sel + `;
+	  ` + keyJS + `
 	  const doc = ` + composerDocJS(sel) + `;
-	  if (!el || !doc.logical || doc.url !== ` + strconv.Quote(rec.Thread) + ` || doc.text !== ` + strconv.Quote(expected) + `) return false;
+	  if (!el || !doc.logical || doc.url !== ` + strconv.Quote(thread) + ` || key(doc.text) !== key(` + strconv.Quote(expected) + `)) return false;
 	  const view = el.pmViewDesc && el.pmViewDesc.view;
 	  if (view && view.state && view.dispatch) {
 	    view.dispatch(view.state.tr.delete(0, view.state.doc.content.size));
@@ -1471,7 +1499,7 @@ func (c *Client) wipeComposer(ctx context.Context, sel string) error {
 	    selection.removeAllRanges();
 	    selection.addRange(range);
 	    const current = ` + composerDocJS(sel) + `;
-	    if (!current.logical || current.text !== ` + strconv.Quote(expected) + ` || current.url !== ` + strconv.Quote(rec.Thread) + `) return false;
+	    if (!current.logical || key(current.text) !== key(` + strconv.Quote(expected) + `) || current.url !== ` + strconv.Quote(thread) + `) return false;
 	    // No asynchronous gap between the last comparison and the deletion.
 	    // Editors that ignore this command fail the logical-empty check below;
 	    // never fall back to a later, unchecked Backspace.
@@ -1643,6 +1671,17 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		return fmt.Errorf("%w (target=%s document_units=%d document_hash=%s retryable=false); this chat's draft belongs to a turn that may already have been sent, so it is left untouched and must not be resent",
 			ErrDraftOwned, tid, utf16Len(draft.Text), draftFingerprintShort(draft.Text))
 	default:
+		// A restart forgets the in-memory ownership record, but a draft that
+		// carries the bridge's own prompt envelope is still the bridge's, not a
+		// person's. Replace it so a stale draft cannot deadlock every later
+		// turn; the in-page delete still verifies the exact text first.
+		if looksLikeBridgeDraft(draft.Text) {
+			if err := c.clearComposerExact(typeCtx, compSel, draft.Text, thread); err != nil {
+				return err
+			}
+			log.Printf("[chatgpt] draft replaced unrecorded_bridge_draft target=%s was_units=%d was_hash=%s prompt_units=%d", tid, utf16Len(draft.Text), draftFingerprintShort(draft.Text), utf16Len(prompt))
+			break
+		}
 		al := alignComposer(draft.Text, prompt)
 		return fmt.Errorf("%w (target=%s document_units=%d document_paragraphs=%d document_hash=%s prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s retryable=false); cannot verify who wrote the text currently in this chat's composer, so it is left untouched",
 			ErrForeignDraft, tid, al.Document, draft.Paragraphs, draftFingerprintShort(draft.Text), al.Prompt, al.Prefix, al.Suffix, al.Verdict)
@@ -1698,10 +1737,10 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		if !doc.Logical || doc.URL != observed.URL {
 			return ErrForeignDraft
 		}
-		if doc.Text == observed.Text {
+		if composerTextKey(doc.Text) == composerTextKey(observed.Text) {
 			return nil
 		}
-		if canonicalComposerText(doc.Text) != canonicalComposerText(prompt) {
+		if composerTextKey(doc.Text) != composerTextKey(prompt) {
 			return ErrForeignDraft
 		}
 		observed = doc
