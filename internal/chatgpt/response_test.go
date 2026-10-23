@@ -51,51 +51,6 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 			fn(t, ctx)
 		})
 	}
-	sub("composer settles complete logical document", func(t *testing.T, tab context.Context) {
-		c := &Client{}
-		for _, size := range []int{300, 19000, 190000, 120} {
-			set(t, `<div class="ProseMirror" contenteditable="true" role="textbox"></div>`)
-			// Reproduce the observed race: DOM text is already long enough for
-			// the old 200-character check while the editor model is still empty.
-			// Real editors batch DOM reconciliation; only their logical document
-			// is authoritative for pre-submit verification.
-			js := `(() => {const e=document.querySelector('.ProseMirror'); let model=''; let timer;
-			 e.pmViewDesc={node:{type:{name:'doc'},content:{size:0},textBetween(){return model}}};
-			 e.addEventListener('input',()=>{clearTimeout(timer);const next=e.innerText;timer=setTimeout(()=>{model=next},1600)});
-			})()`
-			if err := chromedp.Run(tab, chromedp.Evaluate(js, nil)); err != nil {
-				t.Fatal(err)
-			}
-			prompt := strings.Repeat("x", size)
-			if err := c.typePrompt(tab, tab, prompt); err != nil {
-				t.Fatalf("size %d: %v", size, err)
-			}
-			var exact bool
-			if err := chromedp.Run(tab, chromedp.Evaluate(`document.querySelector('.ProseMirror').pmViewDesc.node.textBetween() === `+quoteJS(prompt), &exact)); err != nil || !exact {
-				t.Fatalf("returned before full model settlement: size=%d exact=%v err=%v", size, exact, err)
-			}
-		}
-		// A long visual prefix is never enough; persistent partial input must
-		// fail before submission. Keep this test bounded by caller cancellation.
-		set(t, `<div class="ProseMirror" contenteditable="true"></div>`)
-		if err := chromedp.Run(tab, chromedp.Evaluate(`document.querySelector('.ProseMirror').pmViewDesc={node:{type:{name:'doc'},content:{size:250},textBetween(){return 'x'.repeat(250)}}}`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(tab, 1800*time.Millisecond)
-		defer cancel()
-		err := c.typePrompt(ctx, tab, strings.Repeat("x", 500))
-		if err == nil {
-			t.Fatal("persistent partial model was accepted")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrForeignDraft) && !errors.Is(err, ErrDraftOwned) {
-			t.Fatalf("persistent partial draft neither cancelled nor refused: %v", err)
-		}
-		ctx, cancel = context.WithCancel(tab)
-		cancel()
-		if err := c.typePrompt(ctx, tab, "must not type"); !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled insertion: %v", err)
-		}
-	})
 	sub("post-click DOM is never proof of non-submission", func(t *testing.T, tab context.Context) {
 		p := sendProof{Readable: true, ComposerExact: true}
 		if !p.provenUnsubmitted() {
@@ -820,103 +775,6 @@ func TestComposerInsertModeFollowsContent(t *testing.T) {
 	}
 }
 
-// Only a provable truncation may be repaired in-turn, only once, and never on
-// the composition path that owns its own fallback. Anything else stays a hard
-// refusal: a diverged document could be someone's edit.
-func TestRepairAllowedIsNarrow(t *testing.T) {
-	short := strings.Repeat("x", 100)
-	for _, tc := range []struct {
-		name       string
-		verdict    string
-		target     string
-		repairUsed bool
-		want       bool
-	}{
-		{"strict prefix of the prompt", verdictTruncated, short, false, true},
-		{"already repaired once", verdictTruncated, short, true, false},
-		{"nothing was typed", verdictTruncated, "", false, false},
-		{"diverged mid-document", verdictDiverged, short, false, false},
-		{"document longer than prompt", verdictExtra, short, false, false},
-		{"exact", verdictExact, short, false, false},
-		{"legacy oversized path", verdictTruncated, strings.Repeat("x", composerInlineLimit+1), false, false},
-	} {
-		if got := repairAllowed(tc.verdict, tc.target, tc.repairUsed); got != tc.want {
-			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
-// A trusted insert that lands only part of the prompt is what poisoned bridge
-// threads: the settle gate refused to submit, and the residual then blocked
-// every later turn. One bounded repair of a provable truncation must converge,
-// and a truncation that persists must still refuse without looping.
-func TestComposerTruncationRepair(t *testing.T) {
-	chrome := findChrome()
-	if chrome == "" {
-		t.Skip("Chrome unavailable for composer fixtures")
-	}
-	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
-	alloc, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
-	tab, cancelTab := chromedp.NewContext(alloc)
-	defer cancelTab()
-	tab, timeout := context.WithTimeout(tab, 180*time.Second)
-	defer timeout()
-	install := func(capUnits int, oneShot bool) {
-		t.Helper()
-		if err := chromedp.Run(tab, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		if err := chromedp.Run(tab, chromedp.Evaluate(composerFixtureJS("", true, capUnits), nil)); err != nil {
-			t.Fatal(err)
-		}
-		if oneShot {
-			if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCapOneShot = true`, nil)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	model := func() string {
-		t.Helper()
-		var got string
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
-			t.Fatalf("model: %v", err)
-		}
-		return got
-	}
-	deletes := func() int {
-		t.Helper()
-		var got int
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
-			t.Fatalf("deletes: %v", err)
-		}
-		return got
-	}
-	c := &Client{}
-	prompt := "repair me please, the tail keeps going missing at the end"
-	t.Run("a short insert is repaired once and settles", func(t *testing.T) {
-		install(len(prompt)-9, true)
-		if err := c.typePrompt(tab, tab, prompt); err != nil {
-			t.Fatalf("truncated insert was not repaired: %v", err)
-		}
-		if got := model(); got != prompt {
-			t.Fatalf("composer holds %d units, want %d", len(got), len(prompt))
-		}
-		if got := deletes(); got == 0 {
-			t.Fatal("repair must clear the proven-own prefix before retyping")
-		}
-	})
-	t.Run("a truncation that persists still refuses and is bounded", func(t *testing.T) {
-		install(len(prompt)-9, false)
-		if err := c.typePrompt(tab, tab, prompt); !errors.Is(err, ErrNotSubmitted) {
-			t.Fatalf("persistent truncation must stay a pre-submit refusal, got %v", err)
-		}
-		if got := deletes(); got != 1 {
-			t.Fatalf("repair ran %d times, want exactly 1", got)
-		}
-	})
-}
-
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
 // composer on a dedicated bridge tab: the deprecated execCommand wipe pair does
 // not clear it, a trusted deletion key event does (when deletesHonoured), one
@@ -984,9 +842,6 @@ func composerFixtureJS(initial string, deletesHonoured bool, capUnits int) strin
 })()`
 }
 
-// The composer must receive multi-line prompts complete, must treat its own
-// leftover first line as ours instead of foreign, must still refuse text it
-// cannot account for, and must clear a draft the deprecated commands cannot.
 func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 	chrome := findChrome()
 	if chrome == "" {
@@ -1042,63 +897,6 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 			t.Fatal("the intervening edit was erased")
 		}
 	})
-	t.Run("guarded deletion without a private editor view", func(t *testing.T) {
-		set("", true)
-		if err := chromedp.Run(tab, chromedp.Evaluate(`(() => {
-		  const el = document.querySelector('.ProseMirror');
-		  delete el.pmViewDesc.view;
-		  el.pmViewDesc.node.textBetween = () => el.textContent;
-		  document.execCommand = Document.prototype.execCommand.bind(document);
-		})()`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		if err := c.typePrompt(tab, tab, "owned text"); err != nil {
-			t.Fatal(err)
-		}
-		if err := c.wipeComposer(tab, composerSelector); err != nil {
-			t.Fatalf("guarded editor command failed: %v", err)
-		}
-		var doc composerDoc
-		if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(composerSelector), &doc)); err != nil || canonicalComposerText(doc.Text) != "" {
-			t.Fatal("guarded editor command did not clear the logical document")
-		}
-	})
-	t.Run("edit during settlement never becomes owned", func(t *testing.T) {
-		set("", true)
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerReadsUntilEdit = 2`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		err := c.typePrompt(tab, tab, "bridge insertion")
-		if !errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrNotSubmitted) {
-			t.Fatalf("settlement edit did not stop without a retry: %v", err)
-		}
-		if rec := c.draftOwnership(); rec != nil && rec.Doc == "human replacement" {
-			t.Fatal("settlement promoted a human edit to bridge ownership")
-		}
-		if model(t.Name()) != "human replacement" || deletes() != 0 {
-			t.Fatal("settlement erased the human edit")
-		}
-	})
-	t.Run("edit between final gate and wipe remains nonretryable", func(t *testing.T) {
-		set("", true)
-		if err := c.typePrompt(tab, tab, "owned residual"); err != nil {
-			t.Fatal(err)
-		}
-		rec := c.draftOwnership()
-		rec.Prompt = "requested full prompt"
-		c.setDraftOwnership(rec)
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerReadsUntilEdit = 1`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		err := c.preSubmitGate(tab, rec.Prompt)
-		if !errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrNotSubmitted) {
-			t.Fatalf("gate lost nonretryable classification: %v", err)
-		}
-		if model(t.Name()) != "human replacement" || deletes() != 0 {
-			t.Fatal("the gate erased the intervening edit")
-		}
-	})
-
 	t.Run("multi-line prompt lands complete", func(t *testing.T) {
 		set("", true)
 		if err := c.typePrompt(tab, tab, multi); err != nil {
@@ -1127,224 +925,16 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 			t.Fatalf("composer holds %q", got)
 		}
 	})
-	// A filtered -run makes the parent body run before any subtest has driven
-	// the tab, so the CDP target may not exist yet.
-	tid := ""
-	if tr := chromedp.FromContext(tab); tr != nil && tr.Target != nil {
-		tid = string(tr.Target.TargetID)
-	}
-	t.Run("superseded owned draft is replaced, so A then B cannot lock out", func(t *testing.T) {
-		set("", true)
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("first prompt not delivered: %v", err)
+	t.Run("typing never refuses and never deletes", func(t *testing.T) {
+		set("notes the user typed earlier", true)
+		if err := (&Client{}).typePrompt(tab, tab, multi); err != nil {
+			t.Fatalf("fire-and-forget typing refused: %v", err)
 		}
-		next := "a completely different request"
-		if err := c.typePrompt(tab, tab, next); err != nil {
-			t.Fatalf("own unsent draft from an earlier request locked the chat out: %v", err)
-		}
-		if got := model(t.Name()); got != next {
-			t.Fatalf("composer holds %q, want %q", got, next)
-		}
-		if got := deletes(); got == 0 {
-			t.Fatal("superseded owned draft was not cleared through a trusted key event")
-		}
-	})
-	t.Run("failed insertion residual is replaced by a later different request", func(t *testing.T) {
-		// The reported user shape: insertion A does not land completely (here the
-		// editor only accepts 12 units), settlement fails, and a LATER request is
-		// a different prompt B. The residual must be provably ours, not foreign.
-		c := &Client{}
-		long := "alpha line one\nalpha line two\nalpha line three"
-		setCap("", true, 12)
-		ctx, cancel := context.WithTimeout(tab, 2500*time.Millisecond)
-		err := c.typePrompt(ctx, tab, long)
-		cancel()
-		if err == nil {
-			t.Fatal("a truncated insertion was reported as complete")
-		}
-		residual := model(t.Name())
-		if residual == "" || len(residual) >= len(long) {
-			t.Fatalf("fixture did not leave a partial residual: units=%d", len(residual))
-		}
-		// The editor recovers; the next request is a genuinely different prompt.
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCap = 0`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		next := "a completely different request after the failed insertion"
-		if err := c.typePrompt(tab, tab, next); err != nil {
-			t.Fatalf("own failed-insertion residual locked the chat out: %v", err)
-		}
-		if got := model(t.Name()); got != next {
-			t.Fatalf("composer holds %q, want %q", got, next)
-		}
-	})
-	t.Run("same turn exact reuse types nothing", func(t *testing.T) {
-		set("", true)
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("prompt not delivered: %v", err)
-		}
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("identical retry of the same turn was refused: %v", err)
-		}
-		if got := model(t.Name()); got != multi {
-			t.Fatalf("composer holds %q, want %q", got, multi)
+		if got := model(t.Name()); !strings.HasSuffix(got, multi) {
+			t.Fatalf("typed prompt did not land after existing text: %q", got)
 		}
 		if got := deletes(); got != 0 {
-			t.Fatalf("exact reuse touched the composer: %d deletions", got)
-		}
-	})
-	t.Run("user-edited once-owned draft is preserved and refused", func(t *testing.T) {
-		set("", true)
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("prompt not delivered: %v", err)
-		}
-		edited := multi + "\nthe user kept typing"
-		set(edited, true)
-		if err := c.typePrompt(tab, tab, "unrelated new request"); err == nil {
-			t.Fatal("a user-edited draft was typed over")
-		}
-		if got := model(t.Name()); got != edited {
-			t.Fatalf("user-edited draft was modified: %q", got)
-		}
-		if got := deletes(); got != 0 {
-			t.Fatalf("refusal touched the user-edited draft: %d deletions", got)
-		}
-	})
-	t.Run("unrecorded leftover is refused and preserved", func(t *testing.T) {
-		// No ownership record exists (for example after an adapter restart), so
-		// a leftover prefix cannot be proved ours: a prefix alone is not
-		// ownership. It must survive intact.
-		fresh := &Client{}
-		leftover := "line one"
-		set(leftover, true)
-		err := fresh.typePrompt(tab, tab, multi)
-		if err == nil {
-			t.Fatal("unrecorded leftover was typed over")
-		}
-		if !strings.Contains(err.Error(), "cannot verify") {
-			t.Fatalf("refusal does not say why: %v", err)
-		}
-		if got := model(t.Name()); got != leftover {
-			t.Fatalf("refused draft was modified: %q", got)
-		}
-		if got := deletes(); got != 0 {
-			t.Fatalf("refusal touched the draft: %d deletions", got)
-		}
-	})
-	t.Run("draft is never cleared or reused after a send was attempted", func(t *testing.T) {
-		set("", true)
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatalf("prompt not delivered: %v", err)
-		}
-		c.markDraftSubmitted(tid, multi)
-		if err := c.typePrompt(tab, tab, "a later different request"); err == nil {
-			t.Fatal("an attempted turn's draft was reused or cleared")
-		}
-		if got := model(t.Name()); got != multi {
-			t.Fatalf("attempted turn's draft was modified: %q", got)
-		}
-	})
-	t.Run("unrelated draft is refused and preserved", func(t *testing.T) {
-		foreign := "notes the user typed earlier"
-		set(foreign, true)
-		// A fresh client has no ownership record, so this text cannot be ours.
-		err := (&Client{}).typePrompt(tab, tab, multi)
-		if err == nil {
-			t.Fatal("unrecognised draft was typed over")
-		}
-		if !strings.Contains(err.Error(), "verdict=") {
-			t.Fatalf("refusal does not describe what was found: %v", err)
-		}
-		if strings.Contains(err.Error(), foreign) {
-			t.Fatalf("refusal leaked draft content: %v", err)
-		}
-		if got := model(t.Name()); got != foreign {
-			t.Fatalf("refused draft was modified: %q", got)
-		}
-		if got := deletes(); got != 0 {
-			t.Fatalf("refusal touched the draft: %d deletions", got)
-		}
-	})
-
-	// The pre-submit gate is one call in askLocked; these drive that exact
-	// function against the same fixture, not a copy of its logic.
-	locate := func(t *testing.T) (string, string) {
-		t.Helper()
-		var thread string
-		if err := chromedp.Run(tab, chromedp.Location(&thread)); err != nil {
-			t.Fatal(err)
-		}
-		return string(chromedp.FromContext(tab).Target.TargetID), thread
-	}
-	t.Run("pre-submit gate accepts exactly this turn's prompt", func(t *testing.T) {
-		set(multi, true)
-		c := &Client{}
-		tid, thread := locate(t)
-		c.recordOwnedDraft(tid, thread, multi, multi)
-		if err := c.preSubmitGate(tab, multi); err != nil {
-			t.Fatalf("exact prompt was refused: %v", err)
-		}
-		if got := model(t.Name()); got != multi {
-			t.Fatalf("gate modified the prompt: %q", got)
-		}
-	})
-	t.Run("pre-submit gate preserves a user edit made after typing", func(t *testing.T) {
-		set("", true)
-		c := &Client{}
-		if err := c.typePrompt(tab, tab, multi); err != nil {
-			t.Fatal(err)
-		}
-		// The person adds text before Send, through a real editor input event.
-		if err := chromedp.Run(tab, chromedp.Evaluate(`(() => { const e = document.querySelector('.ProseMirror'); e.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:' plus', bubbles:true})); })()`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		edited := model(t.Name())
-		err := c.preSubmitGate(tab, multi)
-		if !errors.Is(err, ErrForeignDraft) {
-			t.Fatalf("edited draft was not refused as unverifiable: %v", err)
-		}
-		if errors.Is(err, ErrNotSubmitted) {
-			t.Fatal("a user edit must not be classified as a retryable transport failure")
-		}
-		if got := model(t.Name()); got != edited {
-			t.Fatalf("blind wipe destroyed the edit: %q", got)
-		}
-		if got := deletes(); got != 0 {
-			t.Fatalf("gate wiped the composer: %d deletions", got)
-		}
-	})
-	t.Run("pre-submit gate clears only its own residual for this same prompt", func(t *testing.T) {
-		long := "beta line one\nbeta line two\nbeta line three"
-		setCap("", true, 12)
-		c := &Client{}
-		ctx, cancel := context.WithTimeout(tab, 2500*time.Millisecond)
-		_ = c.typePrompt(ctx, tab, long)
-		cancel()
-		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerCap = 0`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		if residual := model(t.Name()); residual == "" || residual == long {
-			t.Fatalf("fixture left no residual: %q", residual)
-		}
-		err := c.preSubmitGate(tab, long)
-		if !errors.Is(err, ErrNotSubmitted) {
-			t.Fatalf("own residual: %v", err)
-		}
-		if errors.Is(err, ErrForeignDraft) {
-			t.Fatal("own residual must not be reported as foreign")
-		}
-		if got := model(t.Name()); got != "" {
-			t.Fatalf("verified wipe left text behind: %q", got)
-		}
-	})
-	t.Run("pre-submit gate preserves a user-shortened prefix", func(t *testing.T) {
-		set("line one", true)
-		err := (&Client{}).preSubmitGate(tab, multi)
-		if !errors.Is(err, ErrForeignDraft) {
-			t.Fatalf("prefix resemblance authorized a match: %v", err)
-		}
-		if got := model(t.Name()); got != "line one" || deletes() != 0 {
-			t.Fatalf("user-shortened draft was modified: %q", got)
+			t.Fatalf("typing deleted composer text: %d deletions", got)
 		}
 	})
 }
@@ -1476,8 +1066,6 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 		}
 		return got
 	}
-	targetOf := func(ctx context.Context) string { return string(chromedp.FromContext(ctx).Target.TargetID) }
-
 	// The exact reported shape: a 180955-byte single-line prompt, above the
 	// inline limit, so it takes the legacy one-shot insertion path; the composer
 	// keeps only the first 12 units.
@@ -1513,39 +1101,15 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 	if got := model(tabB, "peer model"); got != "peer prompt" {
 		t.Fatalf("peer composer = %q, want %q", got, "peer prompt")
 	}
-	// The failing session failed honestly, as a retryable pre-submit failure,
-	// never as a foreign-draft refusal of its own residual.
-	if gotA == nil || !errors.Is(gotA, ErrNotSubmitted) {
-		t.Fatalf("oversized insertion = %v, want ErrNotSubmitted", gotA)
-	}
-	if errors.Is(gotA, ErrForeignDraft) || errors.Is(gotA, ErrDraftOwned) {
-		t.Fatalf("own failed insertion was misclassified as foreign: %v", gotA)
+	// Fire and forget: a partial insertion is still a completed typing step.
+	if gotA != nil {
+		t.Fatalf("oversized insertion = %v, want nil", gotA)
 	}
 	if got := model(tabA, "residual model"); got != strings.Repeat("q", 12) {
 		t.Fatalf("residual = %d units, want 12", utf16Len(got))
 	}
 	if n := deletes(tabA) + deletes(tabB); n != 0 {
 		t.Fatalf("failed insertion wiped a composer (deletes=%d)", n)
-	}
-
-	// Each session's provenance names its OWN target and document; neither
-	// record can authorize a write in the other session's composer.
-	recA, recB := cA.draftOwnership(), cB.draftOwnership()
-	if recA == nil || recB == nil {
-		t.Fatalf("missing draft records: a=%v b=%v", recA != nil, recB != nil)
-	}
-	if recA.Target != targetOf(tabA) || recB.Target != targetOf(tabB) {
-		t.Fatalf("draft record not bound to its own target: a=%s/%s b=%s/%s",
-			recA.Target, targetOf(tabA), recB.Target, targetOf(tabB))
-	}
-	if recA.Target == recB.Target || recA.Thread == recB.Thread {
-		t.Fatal("two sessions share a target or a conversation identity")
-	}
-	if recA.Doc != strings.Repeat("q", 12) || recB.Doc != "peer prompt" {
-		t.Fatalf("draft records describe the wrong documents: a=%d units b=%d units", utf16Len(recA.Doc), utf16Len(recB.Doc))
-	}
-	if strings.Contains(recB.Doc, "q") && utf16Len(recB.Doc) > 100 {
-		t.Fatal("the peer's record absorbed the failing session's text")
 	}
 
 	// The peer now types a LARGE prompt on the very path that just failed for
@@ -1555,8 +1119,8 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 	if err := cB.typePrompt(context.Background(), tabB, large); err != nil {
 		t.Fatalf("peer large legacy insertion failed: %v", err)
 	}
-	if got := model(tabB, "peer large"); got != large {
-		t.Fatalf("peer large composer = %d units, want %d", utf16Len(got), utf16Len(large))
+	if got := model(tabB, "peer large"); !strings.HasSuffix(got, large) {
+		t.Fatalf("peer large composer does not end with the new prompt: %d units", utf16Len(got))
 	}
 	if got := model(tabA, "residual after peer large"); got != strings.Repeat("q", 12) {
 		t.Fatalf("peer activity changed the failing session's residual: %d units", utf16Len(got))
@@ -1565,154 +1129,17 @@ func TestConcurrentComposerIsolation(t *testing.T) {
 		t.Fatalf("peer activity wiped the failing session's composer (deletes=%d)", n)
 	}
 
-	// A small draft the bridge cannot prove it wrote is preserved, not wiped,
-	// even though this client already owns a record for an earlier turn.
+	// Existing composer text is not verified, cleared, or refused: the new
+	// prompt lands after it.
 	install(tabB, "small stale", 0, true)
-	if err := cB.typePrompt(context.Background(), tabB, "peer prompt two"); !errors.Is(err, ErrForeignDraft) {
-		t.Fatalf("small stale draft = %v, want ErrForeignDraft", err)
+	if err := cB.typePrompt(context.Background(), tabB, "peer prompt two"); err != nil {
+		t.Fatalf("typing after existing text refused: %v", err)
 	}
-	if got := model(tabB, "stale model"); got != "small stale" {
-		t.Fatalf("small stale draft was modified: %q", got)
+	if got := model(tabB, "stale model"); !strings.HasSuffix(got, "peer prompt two") {
+		t.Fatalf("new prompt did not land after existing text: %q", got)
 	}
 	if n := deletes(tabB); n != 0 {
-		t.Fatalf("small stale draft was wiped (deletes=%d)", n)
-	}
-	// The failing session's own record is still intact and still its own.
-	if rec := cA.draftOwnership(); rec == nil || rec.Target != targetOf(tabA) {
-		t.Fatal("peer activity changed the failing session's provenance")
-	}
-}
-
-// The pool lends a backend PER TRANSACTION, so one session can run its second
-// turn on a different client, and a client can serve different sessions over
-// time. Provenance must survive that handoff: a record is bound to the client's
-// own target and to the conversation in it, never to the session, and a tab that
-// now shows a DIFFERENT conversation must refuse text left by the old one.
-func TestClientHandoffProvenance(t *testing.T) {
-	chrome := findChrome()
-	if chrome == "" {
-		t.Skip("Chrome unavailable for composer fixtures")
-	}
-	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
-	alloc, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancelAlloc()
-	root, cancelRoot := chromedp.NewContext(alloc)
-	defer cancelRoot()
-	if err := chromedp.Run(root, chromedp.Evaluate(`1`, nil)); err != nil {
-		t.Fatal(err)
-	}
-	open := func(fragment string) (context.Context, context.CancelFunc) {
-		ctx, cancel := chromedp.NewContext(root)
-		ctx, timeout := context.WithTimeout(ctx, 120*time.Second)
-		if fragment != "" {
-			if err := chromedp.Run(ctx, chromedp.Navigate("about:blank#"+fragment)); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return ctx, func() { timeout(); cancel() }
-	}
-	tabA, closeA := open("client-a")
-	defer closeA()
-	tabB, closeB := open("client-b")
-	defer closeB()
-
-	install := func(ctx context.Context, initial string) {
-		t.Helper()
-		if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'`, nil)); err != nil {
-			t.Fatal(err)
-		}
-		if err := chromedp.Run(ctx, chromedp.Evaluate(composerFixtureJS(initial, false, 0), nil)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	navigate := func(ctx context.Context, fragment string) {
-		t.Helper()
-		if err := chromedp.Run(ctx, chromedp.Navigate("about:blank#"+fragment)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	model := func(ctx context.Context, when string) string {
-		t.Helper()
-		var got string
-		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerModel()`, &got)); err != nil {
-			t.Fatalf("%s: %v", when, err)
-		}
-		return got
-	}
-	deletes := func(ctx context.Context) int {
-		t.Helper()
-		var got int
-		if err := chromedp.Run(ctx, chromedp.Evaluate(`window.__composerDeletes`, &got)); err != nil {
-			t.Fatal(err)
-		}
-		return got
-	}
-	install(tabA, "")
-	install(tabB, "")
-
-	cA, cB := &Client{}, &Client{}
-	// Turn 1 on client A.
-	if err := cA.typePrompt(context.Background(), tabA, "turn one"); err != nil {
-		t.Fatalf("first turn: %v", err)
-	}
-	recA1 := cA.draftOwnership()
-	if recA1 == nil || recA1.Doc != "turn one" {
-		t.Fatalf("client A did not record its own document: %+v", recA1)
-	}
-	// Turn 2 on client B, the same session round-robining onto another backend.
-	if err := cB.typePrompt(context.Background(), tabB, "turn two"); err != nil {
-		t.Fatalf("handoff turn: %v", err)
-	}
-	recB := cB.draftOwnership()
-	if recB == nil || recB.Doc != "turn two" {
-		t.Fatalf("second client did not record its own document: %+v", recB)
-	}
-	if recA1.Target == recB.Target || recA1.Thread == recB.Thread {
-		t.Fatal("handoff reused a target or a conversation identity")
-	}
-	if again := cA.draftOwnership(); again == nil || again.Doc != "turn one" || again.Thread != recA1.Thread {
-		t.Fatal("the handoff rewrote the first client's provenance")
-	}
-
-	// Turn 3 back on client A, now that its tab shows a DIFFERENT conversation:
-	// the record must rebind to the new thread while keeping the same target.
-	navigate(tabA, "second-conversation")
-	install(tabA, "")
-	if err := cA.typePrompt(context.Background(), tabA, "turn three"); err != nil {
-		t.Fatalf("turn after navigation: %v", err)
-	}
-	recA2 := cA.draftOwnership()
-	if recA2 == nil || recA2.Doc != "turn three" || recA2.Target != recA1.Target {
-		t.Fatalf("record did not rebind across navigation: %+v", recA2)
-	}
-	if recA2.Thread == recA1.Thread {
-		t.Fatal("record kept the previous conversation identity after navigation")
-	}
-
-	// Now the tab is on a THIRD conversation but still holds the text this client
-	// typed in the second one: same target, different thread. That is not proof
-	// of authorship here, so it must be refused and preserved, and the refusal
-	// must not rewrite the provenance it refused against.
-	navigate(tabA, "third-conversation")
-	install(tabA, "turn three")
-	if err := cA.typePrompt(context.Background(), tabA, "turn four"); !errors.Is(err, ErrForeignDraft) {
-		t.Fatalf("stale text across a conversation change = %v, want ErrForeignDraft", err)
-	}
-	if got := model(tabA, "stale across threads"); got != "turn three" {
-		t.Fatalf("text left by the previous conversation was modified: %q", got)
-	}
-	if n := deletes(tabA); n != 0 {
-		t.Fatalf("text left by the previous conversation was wiped (deletes=%d)", n)
-	}
-	if rec := cA.draftOwnership(); rec == nil || rec.Doc != "turn three" || rec.Thread != recA2.Thread {
-		t.Fatal("a refusal rewrote the provenance it refused against")
-	}
-	// The peer client is untouched by any of it.
-	if rec := cB.draftOwnership(); rec == nil || rec.Doc != "turn two" || rec.Target != recB.Target {
-		t.Fatal("another client's turns changed the peer's provenance")
-	}
-	if got := model(tabB, "peer after handoff"); got != "turn two" {
-		t.Fatalf("peer composer changed during the handoff: %q", got)
+		t.Fatalf("existing text was wiped (deletes=%d)", n)
 	}
 }
 
