@@ -1123,12 +1123,13 @@ func canonicalComposerText(s string) string {
 	return composerURLSpace.ReplaceAllString(strings.TrimSpace(s), "$1$2")
 }
 
-// composerTextKey is the comparison form of composer text: whitespace runs
-// compare as one space, because the editor adds, merges or drops line breaks
-// between blocks while absorbing an insertion. Word content must still match
-// exactly, so a real edit is never mistaken for the bridge's own draft.
+// composerTextKey is the comparison form of composer text: whitespace is
+// ignored entirely, because the editor may add, merge or drop line breaks
+// between blocks while absorbing an insertion ("instead.\n\nNo" arrives as
+// "instead.No"). Word content must still match exactly, so a real edit is
+// never mistaken for the bridge's own draft.
 func composerTextKey(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	return strings.Join(strings.Fields(s), "")
 }
 
 // looksLikeBridgeDraft reports whether a composer document carries the envelope
@@ -1476,7 +1477,7 @@ func (c *Client) wipeComposer(ctx context.Context, sel string) error {
 // ignores whitespace runs: the editor may reshape line breaks while absorbing
 // the insertion, and that must not turn the bridge's own draft into a refusal.
 func (c *Client) clearComposerExact(ctx context.Context, sel, expected, thread string) error {
-	keyJS := `const key = t => (t || '').replace(/\s+/g, ' ').trim();`
+	keyJS := `const key = t => (t || '').replace(/\s+/g, '');`
 	// Compare and delete in ONE editor transaction. A CDP selection followed by
 	// a separate Backspace could erase an edit arriving between those calls.
 	js := `(() => {
