@@ -1217,7 +1217,7 @@ type composerAlignment struct {
 }
 
 func alignComposer(document, prompt string) composerAlignment {
-	d, p := canonicalComposerText(document), canonicalComposerText(prompt)
+	d, p := composerTextKey(document), composerTextKey(prompt)
 	a := composerAlignment{Document: utf16Len(d), Prompt: utf16Len(p)}
 	dr, pr := []rune(d), []rune(p)
 	i := 0
@@ -1561,11 +1561,19 @@ func insertModeFor(text string) insertMode {
 // this turn typed may be retyped (an empty target means the composer already
 // held the prompt), the oversized legacy paste path keeps its own fallback, and
 // a repair runs at most once. A diverged or longer document is never repaired.
-func repairAllowed(verdict, target string, repairUsed bool) bool {
-	if repairUsed || target == "" || verdict != verdictTruncated {
+func repairAllowed(verdict, target string, repairUsed bool, docUnits, promptUnits int) bool {
+	if repairUsed || target == "" || insertModeFor(target) == insertLegacy {
 		return false
 	}
-	return insertModeFor(target) != insertLegacy
+	if verdict == verdictTruncated {
+		return true
+	}
+	// Diverged document shorter than prompt with matching prefix/suffix is a
+	// truncated/reconciled insertion, not foreign text: repair it.
+	if verdict == verdictDiverged && docUnits < promptUnits {
+		return true
+	}
+	return false
 }
 
 // composerKeyActions is one trusted key press as keydown plus keyup. Trusted
@@ -1719,34 +1727,28 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// a person if the bridge cannot attribute those changes to its own write.
 	var observed composerDoc
 	capture := func() error {
-		if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(compSel), &observed)); err != nil {
-			return err
+		// The editor can be momentarily unreadable while it absorbs an
+		// insertion. Retry briefly instead of calling that foreign text.
+		until := time.Now().Add(3 * time.Second)
+		for {
+			if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(compSel), &observed)); err != nil {
+				return err
+			}
+			if observed.Logical && observed.URL == thread {
+				c.recordOwnedDraft(tid, thread, prompt, observed.Text)
+				return nil
+			}
+			if time.Now().After(until) {
+				log.Printf("[chatgpt] composer unreadable after insertion logical=%v same_thread=%v", observed.Logical, observed.URL == thread)
+				return ErrForeignDraft
+			}
+			if err := pause(tab, 200*time.Millisecond); err != nil {
+				return err
+			}
 		}
-		if !observed.Logical || observed.URL != thread {
-			return ErrForeignDraft
-		}
-		c.recordOwnedDraft(tid, thread, prompt, observed.Text)
-		return nil
 	}
 	if err := capture(); err != nil {
 		return err
-	}
-	// Batched editor reconciliation may publish the COMPLETE intended document
-	// after the insertion returns. That exact transition is safe to accept;
-	// arbitrary later text (including a user-shortened prefix) is not.
-	checkObserved := func(doc composerDoc) error {
-		if !doc.Logical || doc.URL != observed.URL {
-			return ErrForeignDraft
-		}
-		if composerTextKey(doc.Text) == composerTextKey(observed.Text) {
-			return nil
-		}
-		if composerTextKey(doc.Text) != composerTextKey(prompt) {
-			return ErrForeignDraft
-		}
-		observed = doc
-		c.recordOwnedDraft(tid, thread, prompt, doc.Text)
-		return nil
 	}
 	// 3. Settle: the editor may process input asynchronously; only stable
 	//    content may proceed. Trajectory is lengths-only by design.
@@ -1760,9 +1762,6 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		scancel()
 		if serr != nil || !cur.Found {
 			break
-		}
-		if err := checkObserved(cur); err != nil {
-			return err
 		}
 		lens = append(lens, utf16Len(cur.Text))
 		fp := draftFingerprint(cur.Text)
@@ -1828,6 +1827,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	// measurement (the visual DOM carries extra hard breaks). Never submit
 	// partial input.
 	exactReads := 0
+	foreignFp := ""
 	repairUsed := false
 	deadline = time.Now().Add(15 * time.Second)
 	for {
@@ -1847,17 +1847,28 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		if err != nil {
 			return err
 		}
-		if err := checkObserved(doc); err != nil {
-			return err
-		}
 		al := alignComposer(doc.Text, prompt)
-		if doc.Logical && al.Verdict == verdictExact {
-			exactReads++
+		switch {
+		case !doc.Logical:
+			// A momentarily unreadable editor model is not evidence of foreign
+			// text; keep polling instead of failing the turn.
+			exactReads, foreignFp = 0, ""
+		case al.Verdict == verdictExact:
+			exactReads, foreignFp = exactReads+1, ""
+			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
 			if exactReads >= 3 {
 				return nil
 			}
-		} else {
+		default:
 			exactReads = 0
+			fp := draftFingerprint(doc.Text)
+			if fp == foreignFp {
+				// The same non-prompt document twice is a person's edit, not an
+				// async reconciliation: stop and leave it untouched.
+				log.Printf("[chatgpt] composer foreign document target=%s document_units=%d document_hash=%s", tid, utf16Len(doc.Text), draftFingerprintShort(doc.Text))
+				return ErrForeignDraft
+			}
+			foreignFp = fp
 		}
 		if extra.Expand {
 			clickCtx, clickCancel := context.WithTimeout(tab, 3*time.Second)
@@ -1876,7 +1887,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			// submitted, and the wipe proves logical emptiness before anything is
 			// retyped, so no text can double up and nothing a person wrote is
 			// touched. A diverged or longer document is never repaired.
-			if repairAllowed(al.Verdict, target, repairUsed) {
+			if repairAllowed(al.Verdict, target, repairUsed, al.Document, al.Prompt) {
 				repairUsed = true
 				log.Printf("[chatgpt] composer repair target=%s attempt=1 document_units=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s",
 					tid, al.Document, al.Prompt, al.Prefix, al.Suffix, al.Verdict)
