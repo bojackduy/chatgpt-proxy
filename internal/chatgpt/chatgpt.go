@@ -66,7 +66,8 @@ var (
 // imply that retrying helps: a foreign draft is pre-submit yet needs a person,
 // which is why retryability is decided separately.
 func IsPreSubmit(err error) bool {
-	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned)
+	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned) ||
+		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn)
 }
 
 // IsNavigateError reports a page-navigation or explicit project-setup failure. All
@@ -1244,6 +1245,7 @@ func draftFingerprintShort(s string) string {
 // kept only to recognise a same-turn reuse — it is never proof of what landed.
 type draftRecord struct {
 	Doc       string
+	Raw       string
 	Prompt    string
 	Hash      string
 	Units     int
@@ -1355,6 +1357,7 @@ func (c *Client) recordOwnedDraft(tid, thread, prompt, observed string) {
 	}
 	c.draftOwn = &draftRecord{
 		Doc:       doc,
+		Raw:       observed,
 		Prompt:    canonicalComposerText(prompt),
 		Hash:      draftFingerprint(doc),
 		Units:     utf16Len(doc),
@@ -1408,9 +1411,9 @@ func (c *Client) preSubmitGate(tab context.Context, prompt string) error {
 		return fmt.Errorf("%w: read composer: %v", ErrNotSubmitted, err)
 	}
 	if !doc.Found {
-		return fmt.Errorf("%w: %w", ErrNotSubmitted, ErrNoComposer)
+		return ErrNoComposer
 	}
-	if canonicalComposerText(doc.Text) == canonicalComposerText(prompt) {
+	if doc.Logical && canonicalComposerText(doc.Text) == canonicalComposerText(prompt) {
 		return nil
 	}
 	log.Printf("[chatgpt] pre-submit composer mismatch logical=%v target=%s document_units=%d document_hash=%s prompt_units=%d",
@@ -1425,7 +1428,7 @@ func (c *Client) preSubmitGate(tab context.Context, prompt string) error {
 			ErrForeignDraft, tid, utf16Len(doc.Text), draftFingerprintShort(doc.Text), utf16Len(prompt))
 	}
 	if err := c.wipeComposer(tab, sel); err != nil {
-		return fmt.Errorf("%w: %v", ErrNotSubmitted, err)
+		return fmt.Errorf("pre-submit wipe: %w", err)
 	}
 	var after composerDoc
 	if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(sel), &after)); err != nil {
@@ -1438,27 +1441,50 @@ func (c *Client) preSubmitGate(tab context.Context, prompt string) error {
 }
 
 func (c *Client) wipeComposer(ctx context.Context, sel string) error {
-	selectJS := `(() => {
+	rec := c.draftOwnership()
+	tr := chromedp.FromContext(ctx)
+	if rec == nil || rec.Submitted || tr == nil || tr.Target == nil || rec.Target != string(tr.Target.TargetID) || draftFingerprint(rec.Doc) != rec.Hash {
+		return ErrForeignDraft
+	}
+	expected := rec.Raw
+	if expected == "" {
+		expected = rec.Doc
+	}
+	// Compare and delete in ONE editor transaction. A CDP selection followed by
+	// a separate Backspace could erase an edit arriving between those calls.
+	js := `(() => {
 	  const el = ` + sel + `;
-	  if (!el) return false;
-	  el.focus();
-	  const range = document.createRange();
-	  range.selectNodeContents(el);
-	  const s = document.getSelection();
-	  if (!s) return false;
-	  s.removeAllRanges();
-	  s.addRange(range);
+	  const doc = ` + composerDocJS(sel) + `;
+	  if (!el || !doc.logical || doc.url !== ` + strconv.Quote(rec.Thread) + ` || doc.text !== ` + strconv.Quote(expected) + `) return false;
+	  const view = el.pmViewDesc && el.pmViewDesc.view;
+	  if (view && view.state && view.dispatch) {
+	    view.dispatch(view.state.tr.delete(0, view.state.doc.content.size));
+	  } else if (el.tagName === 'TEXTAREA') {
+	    el.value = '';
+	    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+	  } else {
+	    el.focus();
+	    const range = document.createRange();
+	    range.selectNodeContents(el);
+	    const selection = document.getSelection();
+	    if (!selection) return false;
+	    selection.removeAllRanges();
+	    selection.addRange(range);
+	    const current = ` + composerDocJS(sel) + `;
+	    if (!current.logical || current.text !== ` + strconv.Quote(expected) + ` || current.url !== ` + strconv.Quote(rec.Thread) + `) return false;
+	    // No asynchronous gap between the last comparison and the deletion.
+	    // Editors that ignore this command fail the logical-empty check below;
+	    // never fall back to a later, unchecked Backspace.
+	    document.execCommand('delete', false);
+	  }
 	  return true;
 	})()`
-	var selected bool
-	if err := chromedp.Run(ctx, chromedp.Evaluate(selectJS, &selected)); err != nil {
+	var cleared bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &cleared)); err != nil {
 		return fmt.Errorf("type prompt wipe: %w", err)
 	}
-	if !selected {
-		return ErrNoComposer
-	}
-	if err := chromedp.Run(ctx, composerKeyActions(input.KeyRawDown, "Backspace", "Backspace", "", 8, input.ModifierNone)...); err != nil {
-		return fmt.Errorf("type prompt wipe: %w", err)
+	if !cleared {
+		return ErrForeignDraft
 	}
 	var after composerDoc
 	if err := chromedp.Run(ctx, chromedp.Evaluate(composerDocJS(sel), &after)); err != nil {
@@ -1647,6 +1673,41 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		insErr = chromedp.Run(insCtx, composerInsertActions(target)...)
 		insCancel()
 	}
+	// Snapshot immediately after our write, not after waiting for settlement.
+	// Later changes cannot silently become bridge-owned merely because a timer
+	// expired. An editor that updates asynchronously must be inspected again by
+	// a person if the bridge cannot attribute those changes to its own write.
+	var observed composerDoc
+	capture := func() error {
+		if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(compSel), &observed)); err != nil {
+			return err
+		}
+		if !observed.Logical || observed.URL != thread {
+			return ErrForeignDraft
+		}
+		c.recordOwnedDraft(tid, thread, prompt, observed.Text)
+		return nil
+	}
+	if err := capture(); err != nil {
+		return err
+	}
+	// Batched editor reconciliation may publish the COMPLETE intended document
+	// after the insertion returns. That exact transition is safe to accept;
+	// arbitrary later text (including a user-shortened prefix) is not.
+	checkObserved := func(doc composerDoc) error {
+		if !doc.Logical || doc.URL != observed.URL {
+			return ErrForeignDraft
+		}
+		if doc.Text == observed.Text {
+			return nil
+		}
+		if canonicalComposerText(doc.Text) != canonicalComposerText(prompt) {
+			return ErrForeignDraft
+		}
+		observed = doc
+		c.recordOwnedDraft(tid, thread, prompt, doc.Text)
+		return nil
+	}
 	// 3. Settle: the editor may process input asynchronously; only stable
 	//    content may proceed. Trajectory is lengths-only by design.
 	var lens []int
@@ -1659,6 +1720,9 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		scancel()
 		if serr != nil || !cur.Found {
 			break
+		}
+		if err := checkObserved(cur); err != nil {
+			return err
 		}
 		lens = append(lens, utf16Len(cur.Text))
 		fp := draftFingerprint(cur.Text)
@@ -1677,10 +1741,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		}
 	}
 	log.Printf("[chatgpt] type settle prompt_units=%d typed_units=%d trajectory=%v inserr=%v", utf16Len(prompt), utf16Len(target), lens, insErr)
-	// Record what the editor actually holds now, before any return path below.
-	// A failed or truncated insertion leaves a residual that a LATER, different
-	// request must still be able to recognise as this bridge's own.
-	c.recordOwnedDraft(tid, thread, prompt, settledDoc)
+	// The write-time snapshot above owns any residual; settlement only checks it.
 	if canonicalComposerText(settledDoc) == "" && settledRendered == 0 && target != "" {
 		// 4. Fallback: legacy execCommand/paste for renderers where trusted
 		//    input cannot land. The composer above holds either nothing or only
@@ -1695,6 +1756,8 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		  const t = %s;
 		  const el = %s;
 		  if (!el) return 'missing';
+		  const previous = %s;
+		  if (!previous.logical || previous.text !== %s || previous.url !== %s) return 'changed';
 		  try { document.execCommand('insertText', false, t); } catch (e) {}
 		  if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
 		  try {
@@ -1704,13 +1767,19 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		    if ((el.innerText || el.value || '').trim().length > 0) return 'ok';
 		  } catch (e) {}
 		  return 'empty';
-		})()`, strconv.Quote(target), compSel)
+		})()`, strconv.Quote(target), compSel, composerDocJS(compSel), strconv.Quote(observed.Text), strconv.Quote(thread))
 		var legacy string
 		if err := chromedp.Run(fbCtx, chromedp.Evaluate(legacyJS, &legacy)); err != nil {
 			return fmt.Errorf("type prompt: %w", err)
 		}
 		if legacy != "ok" {
+			if legacy == "changed" {
+				return ErrForeignDraft
+			}
 			return ErrNoComposer
+		}
+		if err := capture(); err != nil {
+			return err
 		}
 	}
 	// DOM text can appear before ProseMirror absorbs an execCommand insertion.
@@ -1738,10 +1807,11 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		if err != nil {
 			return err
 		}
+		if err := checkObserved(doc); err != nil {
+			return err
+		}
 		al := alignComposer(doc.Text, prompt)
 		if doc.Logical && al.Verdict == verdictExact {
-			// The last full read is authoritative for what we own.
-			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
 			exactReads++
 			if exactReads >= 3 {
 				return nil
@@ -1758,9 +1828,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 			clickCancel()
 		}
 		if time.Now().After(deadline) {
-			// Keep whatever actually landed as the owned snapshot: this is the
-			// failed-insertion residual the next request must be able to replace.
-			c.recordOwnedDraft(tid, thread, prompt, doc.Text)
+			// Retain the write-time snapshot, never adopt a later edit on timeout.
 			log.Printf("[chatgpt] composer settlement target=%s document_units=%d document_paragraphs=%d prompt_units=%d common_prefix_units=%d common_suffix_units=%d verdict=%s logical=%v attached=%v",
 				tid, al.Document, doc.Paragraphs, al.Prompt, al.Prefix, al.Suffix, al.Verdict, doc.Logical, extra.Attached)
 			// One bounded repair of a PROVABLE truncation: the document is the
@@ -1782,6 +1850,9 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 				repairCancel()
 				if werr != nil {
 					return werr
+				}
+				if err := capture(); err != nil {
+					return err
 				}
 				log.Printf("[chatgpt] composer repair typed_units=%d inserr=%v", utf16Len(target), insErr)
 				exactReads = 0

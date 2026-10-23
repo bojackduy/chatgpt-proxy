@@ -865,7 +865,11 @@ func TestNavigateFailureDoesNotWedgeFreshSession(t *testing.T) {
 			url, completed := s.URL, len(s.Messages)
 			req.Messages = append(req.Messages, message{Role: "assistant", Content: "first answer"}, message{Role: "user", Content: "next"})
 			f.err, f.errorURL = errors.Join(chatgpt.ErrNotSubmitted, cause), url
-			if w := request(h, "existing", req); w.Code != 502 {
+			wantStatus := 502
+			if errors.Is(cause, chatgpt.ErrNoComposer) {
+				wantStatus = 422 // blocked composer requires intervention, not retries
+			}
+			if w := request(h, "existing", req); w.Code != wantStatus {
 				t.Fatal(w.Code, w.Body.String())
 			}
 			if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" || s.URL != url || len(s.Messages) != completed {
@@ -2351,12 +2355,39 @@ func TestDraftRefusalsArePreSubmitAndActionable(t *testing.T) {
 	}
 }
 
+func TestUnavailableComposerIsCleanAndNonRetryable(t *testing.T) {
+	for _, err := range []error{chatgpt.ErrNoComposer, chatgpt.ErrNotLoggedIn} {
+		t.Run(err.Error(), func(t *testing.T) {
+			calls := 0
+			h := testHandler(&fakeBackend{turn: func(context.Context, chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+				calls++
+				return chatgpt.TurnResult{}, err
+			}})
+			w := request(h, "unavailable", completionsRequest{Messages: []message{{Role: "user", Content: "synthetic request"}}, ToolChoice: "none"})
+			if w.Code != 422 || calls != 1 {
+				t.Fatalf("status=%d calls=%d", w.Code, calls)
+			}
+			s := h.sessions["unavailable"]
+			if s == nil || s.Dirty || s.PendingRequest != nil || s.PendingPrompt != "" {
+				t.Fatal("known unsent refusal left false uncertainty")
+			}
+			if !strings.Contains(w.Body.String(), "nothing was submitted") {
+				t.Fatal("refusal does not explain the unsent outcome")
+			}
+		})
+	}
+}
+
 // Concurrent sessions must not share a backend, a target or a draft decision.
 // One session's failed insertion is a clean, immediately retryable pre-submit
 // failure that is never resubmitted; its peer's turn is unaffected, and neither
 // session's text reaches the other.
-func TestConcurrentSessionDraftIsolation(t *testing.T) {
+func TestParallelDraftIsolationAndHandoff(t *testing.T) {
 	entered := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	var mu sync.Mutex
 	seen := map[string][]string{}
 	record := func(backend, prompt string) {
@@ -2371,10 +2402,14 @@ func TestConcurrentSessionDraftIsolation(t *testing.T) {
 		return &fakeBackend{turn: func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
 			record(name, opt.Prompt)
 			entered <- name
+			<-release
 			if strings.Contains(opt.Prompt, "FAIL_A") {
 				return chatgpt.TurnResult{URL: "https://chatgpt.com/c/iso-a"},
 					fmt.Errorf("%w: composer did not settle to the complete prompt, nothing submitted (document_units=3327 prompt_units=180955 verdict=truncated)",
 						chatgpt.ErrNotSubmitted)
+			}
+			if strings.Contains(opt.Prompt, "NEW_A_AFTER_HANDOFF") {
+				return chatgpt.TurnResult{Answer: "A_HANDOFF", URL: "https://chatgpt.com/c/iso-a"}, nil
 			}
 			return chatgpt.TurnResult{Answer: "B_ANSWER", URL: "https://chatgpt.com/c/iso-b"}, nil
 		}}
@@ -2382,7 +2417,8 @@ func TestConcurrentSessionDraftIsolation(t *testing.T) {
 	h := testHandler(&fakeBackend{})
 	h.profileDir = t.TempDir()
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
-	h.enableParallel([]backend{client("backend-1"), client("backend-2")})
+	b1, b2 := client("backend-1"), client("backend-2")
+	h.enableParallel([]backend{b1, b2})
 
 	doneA := make(chan *httptest.ResponseRecorder, 1)
 	doneB := make(chan *httptest.ResponseRecorder, 1)
@@ -2399,6 +2435,7 @@ func TestConcurrentSessionDraftIsolation(t *testing.T) {
 			t.Fatal("concurrent sessions did not reach their own backend")
 		}
 	}
+	unblock()
 	var wA, wB *httptest.ResponseRecorder
 	select {
 	case wA = <-doneA:
@@ -2467,5 +2504,43 @@ func TestConcurrentSessionDraftIsolation(t *testing.T) {
 	}
 	if v := stateBody(t, h, "iso-a"); fmt.Sprint(v["state"]) != stateClean {
 		t.Fatalf("failed insertion not reported clean: %v", v["state"])
+	}
+	// Force the next ordinary request onto the other worker. This is a new
+	// request after proven non-submission, not a resend of uncertain history.
+	<-h.parallel.clients
+	<-h.parallel.clients
+	other, original := backend(b1), backend(b2)
+	otherName := "backend-1"
+	if failBy[0] == otherName {
+		other, original, otherName = b2, b1, "backend-2"
+	}
+	h.parallel.clients <- other
+	w := request(h, "iso-a", completionsRequest{Messages: []message{{Role: "user", Content: "NEW_A_AFTER_HANDOFF"}}, ToolChoice: "none"})
+	h.parallel.clients <- original
+	if w.Code != 200 {
+		t.Fatalf("new request after handoff: status=%d", w.Code)
+	}
+	if contentText(assistant(t, w)) != "A_HANDOFF" || h.sessions["iso-a"].URL == h.sessions["iso-b"].URL {
+		t.Fatal("handoff mixed results or thread identities")
+	}
+	if h.sessions["iso-b"].Dirty || len(h.sessions["iso-b"].Messages) != 2 {
+		t.Fatal("handoff changed the healthy peer's completed state")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	handoffCalls := 0
+	for prompt, workers := range seen {
+		if strings.Contains(prompt, "NEW_A_AFTER_HANDOFF") {
+			handoffCalls++
+			if len(workers) != 1 || workers[0] != otherName {
+				t.Fatal("handoff did not use the other worker exactly once")
+			}
+		}
+		if strings.Contains(prompt, "FAIL_A") && len(workers) != 1 {
+			t.Fatal("handoff resubmitted the failed earlier request")
+		}
+	}
+	if handoffCalls != 1 {
+		t.Fatal("handoff request was not isolated")
 	}
 }

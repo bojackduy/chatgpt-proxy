@@ -1702,6 +1702,10 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 }
 func (h *handler) backendError(w http.ResponseWriter, err error) {
 	log.Printf("[openai] BACKEND FAILURE: %v; REPAIR: check CDP port/profile login, composer/send/assistant DOM selectors, ChatGPT page alerts; uncertain completion requests require read-only recovery", err)
+	if errors.Is(err, chatgpt.ErrNoComposer) || errors.Is(err, chatgpt.ErrNotLoggedIn) {
+		apiError(w, 422, errors.New(failureText("ChatGPT's message box is unavailable or the browser needs you to sign in; nothing was submitted.", "Next: open the dedicated ChatGPT Web window, sign in if needed, and return to the message box before trying again.")))
+		return
+	}
 	if errors.Is(err, chatgpt.ErrForeignDraft) || errors.Is(err, chatgpt.ErrDraftOwned) {
 		// Nothing was overwritten and nothing was sent. Retrying the same
 		// request would only refuse again, so the person gets the outcome and

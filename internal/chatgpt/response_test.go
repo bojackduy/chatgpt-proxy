@@ -931,10 +931,25 @@ func composerFixtureJS(initial string, deletesHonoured bool, capUnits int) strin
   window.__composerCapOneShot = false;
   const cap = () => { if (window.__composerCap > 0 && model.length > window.__composerCap) { model = model.slice(0, window.__composerCap); if (window.__composerCapOneShot) window.__composerCap = 0; } };
   const sync = () => { e.pmViewDesc.node.content.size = model.length; };
-  e.pmViewDesc = { node: { type: { name: 'doc' }, content: { size: 0 }, textBetween() { return model } } };
+  e.pmViewDesc = { node: { type: { name: 'doc' }, content: { size: 0 }, textBetween() {
+    const text = model;
+    if (window.__composerReadsUntilEdit > 0 && --window.__composerReadsUntilEdit === 0) {
+      queueMicrotask(() => window.__composerEdit('human replacement'));
+    }
+    return text;
+  } } };
+  e.pmViewDesc.view = {
+    get state() { return { doc: e.pmViewDesc.node, tr: { delete() { return { clear: true }; } } }; },
+    dispatch(tr) {
+      if (!tr.clear) return;
+      window.__composerDeletes++;
+      if (` + fmt.Sprintf("%v", deletesHonoured) + `) { model = ''; e.textContent = ''; sync(); }
+    }
+  };
   e.textContent = model;
   sync();
   window.__composerModel = () => model;
+  window.__composerEdit = text => { model = text; e.textContent = text; sync(); };
   window.__composerDeletes = 0;
   e.addEventListener('input', ev => {
     const t = ev.data == null ? '' : String(ev.data);
@@ -1012,6 +1027,77 @@ func TestComposerInsertionAndDraftOwnership(t *testing.T) {
 	}
 	c := &Client{}
 	multi := "line one\nline two\n\nline four"
+	t.Run("edit between ownership check and wipe is preserved", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, "owned residual"); err != nil {
+			t.Fatal(err)
+		}
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerEdit('human replacement')`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.wipeComposer(tab, composerSelector); !errors.Is(err, ErrForeignDraft) {
+			t.Fatalf("changed draft was not refused: %v", err)
+		}
+		if model(t.Name()) != "human replacement" || deletes() != 0 {
+			t.Fatal("the intervening edit was erased")
+		}
+	})
+	t.Run("guarded deletion without a private editor view", func(t *testing.T) {
+		set("", true)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`(() => {
+		  const el = document.querySelector('.ProseMirror');
+		  delete el.pmViewDesc.view;
+		  el.pmViewDesc.node.textBetween = () => el.textContent;
+		  document.execCommand = Document.prototype.execCommand.bind(document);
+		})()`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.typePrompt(tab, tab, "owned text"); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.wipeComposer(tab, composerSelector); err != nil {
+			t.Fatalf("guarded editor command failed: %v", err)
+		}
+		var doc composerDoc
+		if err := chromedp.Run(tab, chromedp.Evaluate(composerDocJS(composerSelector), &doc)); err != nil || canonicalComposerText(doc.Text) != "" {
+			t.Fatal("guarded editor command did not clear the logical document")
+		}
+	})
+	t.Run("edit during settlement never becomes owned", func(t *testing.T) {
+		set("", true)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerReadsUntilEdit = 2`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		err := c.typePrompt(tab, tab, "bridge insertion")
+		if !errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrNotSubmitted) {
+			t.Fatalf("settlement edit did not stop without a retry: %v", err)
+		}
+		if rec := c.draftOwnership(); rec != nil && rec.Doc == "human replacement" {
+			t.Fatal("settlement promoted a human edit to bridge ownership")
+		}
+		if model(t.Name()) != "human replacement" || deletes() != 0 {
+			t.Fatal("settlement erased the human edit")
+		}
+	})
+	t.Run("edit between final gate and wipe remains nonretryable", func(t *testing.T) {
+		set("", true)
+		if err := c.typePrompt(tab, tab, "owned residual"); err != nil {
+			t.Fatal(err)
+		}
+		rec := c.draftOwnership()
+		rec.Prompt = "requested full prompt"
+		c.setDraftOwnership(rec)
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__composerReadsUntilEdit = 1`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		err := c.preSubmitGate(tab, rec.Prompt)
+		if !errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrNotSubmitted) {
+			t.Fatalf("gate lost nonretryable classification: %v", err)
+		}
+		if model(t.Name()) != "human replacement" || deletes() != 0 {
+			t.Fatal("the gate erased the intervening edit")
+		}
+	})
 
 	t.Run("multi-line prompt lands complete", func(t *testing.T) {
 		set("", true)
