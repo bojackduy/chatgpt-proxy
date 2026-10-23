@@ -845,9 +845,21 @@ func classifyPreSendFailure(err error, submissionAttempted bool) error {
 }
 
 // askLocked owns navigation through URL capture under one browser transaction.
+type flowIDKey struct{}
+
+func flowID(ctx context.Context) string {
+	id, _ := ctx.Value(flowIDKey{}).(string)
+	return id
+}
+
 func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, timeout, pollInterval time.Duration, onProgress func(string)) (out TurnResult, err error) {
+	id := fmt.Sprintf("chatgpt-%x", time.Now().UnixNano())
+	ctx = context.WithValue(ctx, flowIDKey{}, id)
 	submissionAttempted := false
+	started := time.Now()
+	log.Printf("[chatgpt-flow] id=%s stage=start prompt_bytes=%d page=%t thinking=%v timeout=%s", id, len(opt.Prompt), page != "", opt.Thinking, timeout)
 	defer func() {
+		log.Printf("[chatgpt-flow] id=%s stage=finish err=%v submitted=%v answer_bytes=%d reasoning_bytes=%d url=%t duration=%s", id, err, submissionAttempted, len(out.Answer), len(out.Reasoning), out.URL != "", time.Since(started).Round(time.Millisecond))
 		// A typed draft refusal is documented as NOT wrapping ErrNotSubmitted:
 		// re-adding it here would hand callers a "safe retry" that cannot work.
 		err = classifyPreSendFailure(err, submissionAttempted)
@@ -1583,6 +1595,8 @@ func composerInsertActions(text string) []chromedp.Action {
 }
 
 func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt string) error {
+	id := flowID(ctx)
+	log.Printf("[chatgpt-flow] id=%s stage=composer_wait start prompt_bytes=%d", id, len(prompt))
 	tab, cancelRequest := requestContext(ctx, tab)
 	defer cancelRequest()
 	if err := ctx.Err(); err != nil {
@@ -1624,8 +1638,10 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		return fmt.Errorf("type prompt focus: %w", err)
 	}
 	if !focused {
+		log.Printf("[chatgpt-flow] id=%s stage=composer_focus result=missing", id)
 		return ErrNoComposer
 	}
+	log.Printf("[chatgpt-flow] id=%s stage=composer_focus result=ok", id)
 	// Some renderers ignore trusted input, and oversized prompts can only ride
 	// the legacy command/paste path. Emptiness before the write tells the two
 	// cases apart without comparing against the prompt afterwards.
@@ -1686,6 +1702,7 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 		}
 	}
 	log.Printf("[chatgpt] typed prompt bytes=%d inserr=%v", len(prompt), insErr)
+	log.Printf("[chatgpt-flow] id=%s stage=composer_insert result=returned native_error=%v legacy=%v", id, insErr, needLegacy)
 	return nil
 }
 
@@ -1716,6 +1733,8 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	deadline := time.Now().Add(15 * time.Second)
 	retries := 0
 	actionAttempted := false
+	id := flowID(ctx)
+	log.Printf("[chatgpt-flow] id=%s stage=send_wait start", id)
 	for time.Now().Before(deadline) {
 		retries++
 		if err := tab.Err(); err != nil {
@@ -1734,6 +1753,7 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 				// just because the composer still holds it.
 				c.markDraftSubmitted(string(chromedp.FromContext(tab).Target.TargetID), prompt)
 			}
+			log.Printf("[chatgpt-flow] id=%s stage=send_click clicked=%v err=%v", id, clicked, err)
 			if err != nil {
 				return fmt.Errorf("send action outcome unknown: %w", err)
 			}
@@ -1747,6 +1767,7 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 				// The turn reached the thread: its draft is no longer scratch
 				// space and there is nothing left to reconcile.
 				c.clearDraftOwnership()
+				log.Printf("[chatgpt-flow] id=%s stage=send_observed result=submitted retries=%d", id, retries)
 				return nil
 			}
 		}
@@ -1843,6 +1864,8 @@ func (c *Client) turnSubmitted(tab context.Context) (bool, error) {
 // stop button disappears), handling the "Continue generating" button.
 // onProgress (may be nil) receives the full answer-so-far whenever it grows.
 func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout, pollInterval time.Duration, onProgress func(string), before []string) (string, string, error) {
+	id := flowID(ctx)
+	log.Printf("[chatgpt-flow] id=%s stage=stream_wait start poll_interval=%s", id, pollInterval)
 	deadline := time.Now().Add(timeout)
 	lastText := ""
 	stablePolls := 0
@@ -1856,6 +1879,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 			return "", "", fmt.Errorf("poll: %w", err)
 		}
 		log.Printf("[chatgpt] target=%s poll: stop=%v, cont=%v, err=%v, len=%d reasoning=%d", chromedp.FromContext(tab).Target.TargetID, st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning))
+		log.Printf("[chatgpt-flow] id=%s stage=stream_poll stop=%v continue=%v page_error=%v answer_bytes=%d reasoning_bytes=%d complete=%v", id, st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning), st.Complete)
 
 		if st.ErrorText {
 			return "", "", errors.New("ChatGPT reported a page error; inspect the stored thread before recovery; no automatic resubmission")
@@ -1873,6 +1897,7 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 		if st.StopBtn {
 			stablePolls = 0
 			if onProgress != nil && st.Last != "" && st.Last != lastText {
+				log.Printf("[chatgpt-flow] id=%s stage=stream_delta answer_bytes=%d", id, len(st.Last))
 				onProgress(st.Last)
 				lastText = st.Last
 			}

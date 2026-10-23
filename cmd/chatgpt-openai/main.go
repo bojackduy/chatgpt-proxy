@@ -1767,6 +1767,7 @@ func imageMarkdown(images []chatgpt.RasterImage) string {
 	return b.String()
 }
 func (h *handler) respond(w http.ResponseWriter, req completionsRequest, out result) {
+	log.Printf("[openai-flow] stage=response stream=%v answer_bytes=%d reasoning_bytes=%d tool_calls=%d images=%d", req.Stream, len(out.Text), len(out.Reasoning), len(out.Calls), len(out.Images))
 	id, created := out.ID, out.Created
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
