@@ -1706,18 +1706,24 @@ func (c *Client) typePrompt(ctx context.Context, tab context.Context, prompt str
 	return nil
 }
 
+// sendButtonExpr resolves the Send control across the renderers we have seen.
+// The readiness read and the click share this one lookup so they can never
+// disagree about which control is being clicked.
+const sendButtonExpr = `(document.querySelector('[data-testid="send-button"]')
+	    || document.querySelector('form[data-chatgpt-composer] button[aria-label^="Send"]')
+	    || document.querySelector('button[aria-label="Send message"]')
+	    || document.querySelector('button[aria-label="Send prompt"]')
+	    || document.querySelector('button[aria-label="Send"]'))`
+
 func (c *Client) submit(ctx context.Context, tab context.Context, prompt string) error {
 	tab, cancelRequest := requestContext(ctx, tab)
 	defer cancelRequest()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	sendJS := `(() => {
-	  const btn = document.querySelector('[data-testid="send-button"]')
-	    || document.querySelector('form[data-chatgpt-composer] button[aria-label^="Send"]')
-	    || document.querySelector('button[aria-label="Send message"]')
-	    || document.querySelector('button[aria-label="Send prompt"]')
-	    || document.querySelector('button[aria-label="Send"]');
+	readyJS := fmt.Sprintf("(() => { const btn = %s; return !!btn && !btn.disabled; })()", sendButtonExpr)
+	sendJS := fmt.Sprintf(`(() => {
+	  const btn = %s;
 	  if (btn && !btn.disabled) {
 	    btn.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
 	    btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
@@ -1726,63 +1732,84 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	    return true;
 	  }
 	  return false;
-	})()`
-	// Wait for an enabled Send, dispatch at most once, then observe. An intact
-	// composer is not proof a dispatched action was swallowed: the request may
-	// be in flight while React has not yet cleared the draft or rendered a turn.
-	deadline := time.Now().Add(15 * time.Second)
-	retries := 0
-	actionAttempted := false
+	})()`, sendButtonExpr)
 	id := flowID(ctx)
-	log.Printf("[chatgpt-flow] id=%s stage=send_wait start", id)
-	for time.Now().Before(deadline) {
-		retries++
+	log.Printf("[chatgpt-flow] id=%s stage=send_wait start prompt_bytes=%d", id, len(prompt))
+	started := time.Now()
+	// Phase 1 only READS whether Send became enabled. A large paste is absorbed
+	// asynchronously and can block the renderer's main thread for seconds, so
+	// this gets its own deadline and a per-read timeout wider than a click
+	// needs. Nothing is dispatched here, so failing this phase is provably
+	// pre-send and must never mark the turn uncertain.
+	readyDeadline := time.Now().Add(30 * time.Second)
+	var lastRead error
+	for {
 		if err := tab.Err(); err != nil {
 			return err
 		}
-		if !actionAttempted {
-			clickCtx, cancel := context.WithTimeout(tab, 3*time.Second)
-			var clicked bool
-			err := chromedp.Run(clickCtx, chromedp.Evaluate(sendJS, &clicked))
-			cancel()
-			// An interrupted evaluation may have dispatched before its reply
-			// was lost. Neither retry nor downgrade that outcome.
-			if err != nil || clicked {
-				// A dispatched (or unprovable) Send makes the draft evidence of
-				// an uncertain turn: it must never be cleared, reused or resent
-				// just because the composer still holds it.
-				c.markDraftSubmitted(string(chromedp.FromContext(tab).Target.TargetID), prompt)
-			}
-			log.Printf("[chatgpt-flow] id=%s stage=send_click clicked=%v err=%v", id, clicked, err)
-			if err != nil {
-				return fmt.Errorf("send action outcome unknown: %w", err)
-			}
-			actionAttempted = clicked
+		probe, cancel := context.WithTimeout(tab, 10*time.Second)
+		var enabled bool
+		err := chromedp.Run(probe, chromedp.Evaluate(readyJS, &enabled))
+		cancel()
+		if err == nil && enabled {
+			log.Printf("[chatgpt-flow] id=%s stage=send_ready enabled=true waited=%s", id, time.Since(started).Round(time.Millisecond))
+			break
 		}
-		if err := pause(tab, 700*time.Millisecond); err != nil {
+		lastRead = err
+		if time.Now().After(readyDeadline) {
+			log.Printf("[chatgpt-flow] id=%s stage=send_ready enabled=false waited=%s last_err=%v", id, time.Since(started).Round(time.Millisecond), lastRead)
+			return fmt.Errorf("%w: Send control never became enabled after %s with %d bytes inserted; nothing was submitted",
+				ErrNotSubmitted, time.Since(started).Round(time.Millisecond), len(prompt))
+		}
+		if err := pause(tab, 500*time.Millisecond); err != nil {
 			return err
 		}
-		if actionAttempted {
-			if sent, err := c.turnSubmitted(tab); err == nil && sent {
-				// The turn reached the thread: its draft is no longer scratch
-				// space and there is nothing left to reconcile.
-				c.clearDraftOwnership()
-				log.Printf("[chatgpt-flow] id=%s stage=send_observed result=submitted retries=%d", id, retries)
-				return nil
-			}
+	}
+	// Phase 2: dispatch exactly once. Only a failure or an unprovable reply
+	// here can leave the turn uncertain.
+	clickCtx, cancel := context.WithTimeout(tab, 15*time.Second)
+	var clicked bool
+	err := chromedp.Run(clickCtx, chromedp.Evaluate(sendJS, &clicked))
+	cancel()
+	// An interrupted evaluation may have dispatched before its reply was lost.
+	if err != nil || clicked {
+		// A dispatched (or unprovable) Send makes the draft evidence of an
+		// uncertain turn: it must never be cleared, reused or resent just
+		// because the composer still holds it.
+		c.markDraftSubmitted(string(chromedp.FromContext(tab).Target.TargetID), prompt)
+	}
+	log.Printf("[chatgpt-flow] id=%s stage=send_click clicked=%v err=%v", id, clicked, err)
+	if err != nil {
+		return fmt.Errorf("send action outcome unknown: %w", err)
+	}
+	if !clicked {
+		// The control went disabled between the read and the click. Nothing was
+		// dispatched, so this is still a proven pre-send outcome.
+		return fmt.Errorf("%w: Send control disabled again before the click; nothing was submitted", ErrNotSubmitted)
+	}
+	// Phase 3: observe only. A click whose turn never appears stays uncertain:
+	// the request may be in flight while React has not cleared the draft yet.
+	observeDeadline := time.Now().Add(10 * time.Second)
+	retries := 0
+	for time.Now().Before(observeDeadline) {
+		retries++
+		if err := pause(tab, 700*time.Millisecond); err != nil {
+			return fmt.Errorf("send action outcome unknown: %w", err)
+		}
+		if err := tab.Err(); err != nil {
+			return fmt.Errorf("send action outcome unknown: %w", err)
+		}
+		if sent, err := c.turnSubmitted(tab); err == nil && sent {
+			// The turn reached the thread: its draft is no longer scratch
+			// space and there is nothing left to reconcile.
+			c.clearDraftOwnership()
+			log.Printf("[chatgpt-flow] id=%s stage=send_observed result=submitted retries=%d", id, retries)
+			return nil
 		}
 	}
-	// Only a turn with NO dispatched action can be proven unsubmitted. Missing
-	// or disabled controls can be retried later; a swallowed/in-flight click
-	// cannot, even if the DOM still looks identical to the pre-send snapshot.
 	proof, perr := c.turnUnsubmitted(tab, prompt)
-	proof.ActionAttempted = actionAttempted
-	if perr == nil && proof.provenUnsubmitted() {
-		log.Printf("[chatgpt] send verified no-op after %d retries: compLen=%d wantLen=%d userBubble=%v generating=%v sendDisabled=%v",
-			retries, proof.CompLen, proof.WantLen, proof.UserBubble, proof.Generating, proof.SendDisabled)
-		return fmt.Errorf("%w: no enabled Send action after %d checks; composer still holds the prompt, no user bubble, no generation indicator", ErrNotSubmitted, retries)
-	}
-	log.Printf("[chatgpt] send did not submit, outcome unproven after %d retries: readable=%v compLen=%d wantLen=%d composerExact=%v userBubble=%v generating=%v sendDisabled=%v probe=%v",
+	proof.ActionAttempted = true
+	log.Printf("[chatgpt] send did not submit, outcome unproven after %d observations: readable=%v compLen=%d wantLen=%d composerExact=%v userBubble=%v generating=%v sendDisabled=%v probe=%v",
 		retries, proof.Readable, proof.CompLen, proof.WantLen, proof.ComposerExact, proof.UserBubble, proof.Generating, proof.SendDisabled, perr)
 	return errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM — outcome unproven")
 }
