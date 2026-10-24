@@ -946,7 +946,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	}
 
 	// 4. Submit. No composer verification: the bridge types and sends.
-	before, err := responseProbe(tab, nil)
+	beforeIDs, err := responseBaseline(tab)
 	if err != nil {
 		return out, err
 	}
@@ -961,13 +961,13 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 
 	// 5. Wait for the answer.
 	log.Printf("[chatgpt] waiting for answer (timeout: %v)...", timeout)
-	answer, reasoning, err := c.waitForAnswer(ctx, tab, timeout, pollInterval, onProgress, before.IDs)
+	answer, reasoning, err := c.waitForAnswer(ctx, tab, timeout, pollInterval, onProgress, beforeIDs)
 	out.Answer, out.Reasoning = answer, reasoning
 	if err == nil {
 		// Rasterize substantive answer SVGs to PNG bridge-side: the TUI
 		// demotes SVG to plain text while raster image parts preview.
 		// Best-effort; a nil result keeps the text fallback.
-		out.Images = c.rasterizeAnswerSVG(tab, answer, before.IDs)
+		out.Images = c.rasterizeAnswerSVG(tab, answer, beforeIDs)
 	}
 	var url string
 	// Capture an uncertain submitted turn's URL even after request cancellation.

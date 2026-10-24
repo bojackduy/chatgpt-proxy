@@ -353,9 +353,35 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		publish()
 		dilHTML := old + `<div data-talvt-turn-state="complete"><div><h4>You said:</h4><div data-chatgpt-search-message-ids="fixture-user"><p>request</p></div></div><div data-chatgpt-search-message-ids="dil-answer dil-answer"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div><div class="MarkdownRoot-rZKhxa"><div hidden></div><div class="DilRenderer-tB76Jj"><div class="DilResponseRoot-HfQrEh" data-dil-message-id="dil-answer"></div></div></div></div></div></div><h4>Latest response</h4><div>FOOTER</div>`
 		set(t, dilHTML)
+		// A pre-send baseline needs identities only. Prior protocol source may
+		// be offline; capturing it must never fetch or validate the old answer.
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__baselineFetch=window.fetch;window.__baselineReads=0;window.fetch=()=>{window.__baselineReads++;return Promise.reject(new Error('offline'));}`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		ids, baselineErr := responseBaseline(tab)
+		var baselineReads int
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__baselineReads`, &baselineReads), chromedp.Evaluate(`window.fetch=window.__baselineFetch;delete window.__baselineFetch`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if baselineErr != nil || baselineReads != 0 || !strings.Contains(strings.Join(ids, ","), "dil-answer") {
+			t.Fatalf("baseline fetched prior source: ids=%v reads=%d err=%v", ids, baselineReads, baselineErr)
+		}
 		got, err := responseProbe(tab, before.IDs)
 		if err != nil || got.Last != raw || !got.Complete || got.LastID != "dil-answer" {
 			t.Fatalf("bound null-DIL wire changed: %+v %v", got, err)
+		}
+		// Transient auth/network failures must retry exact source, never accept
+		// the renderer's escaped tool arguments instead.
+		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__retryFetch=window.fetch;window.__retryReads=0;window.fetch=(...args)=>{if(String(args[0]).includes('/api/auth/session')&&window.__retryReads++===0)return Promise.reject(new Error('temporary'));return window.__retryFetch(...args);}`, nil)); err != nil {
+			t.Fatal(err)
+		}
+		got, err = responseProbe(tab, before.IDs)
+		var retryReads int
+		if restoreErr := chromedp.Run(tab, chromedp.Evaluate(`window.__retryReads`, &retryReads), chromedp.Evaluate(`window.fetch=window.__retryFetch`, nil)); restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
+		if err != nil || got.Last != raw || !got.SourceVerified || retryReads != 2 {
+			t.Fatalf("transient exact-source recovery failed: verified=%v reads=%d err=%v", got.SourceVerified, retryReads, err)
 		}
 		if err := chromedp.Run(tab, chromedp.Evaluate(recoveryUserJS, &corr)); err != nil || corr.UserID != "fixture-user" {
 			t.Fatal("actual sibling user identity lost", corr, err)
@@ -1160,5 +1186,32 @@ func TestComposerTextKeyAndBridgeEnvelope(t *testing.T) {
 		looksLikeBridgeDraft("CURRENT REQUEST only") ||
 		looksLikeBridgeDraft("Conversation messages for this turn only") {
 		t.Fatal("ordinary draft misclassified as bridge envelope")
+	}
+}
+
+// TestBubbleOnlyDivergenceWaitsForExactSource pins the adoption classification:
+// a rendered bubble without its DOM message ID cannot prove a prompt mismatch,
+// while the authoritative ID-bound source still can.
+func TestBubbleOnlyDivergenceWaitsForExactSource(t *testing.T) {
+	prompt := "the 26543 byte pending prompt"
+	cases := []struct {
+		name     string
+		srcPath  string
+		userText string
+		expected []string
+		want     bool
+	}{
+		{"unhydrated empty bubble", "bubble", "", []string{prompt}, true},
+		{"collapsed bubble", "bubble", "the 26543", []string{prompt}, true},
+		{"matching bubble", "bubble", prompt, []string{prompt}, false},
+		{"authoritative mapping mismatch", "mapping", "edited", []string{prompt}, false},
+		{"latest-turn read has nothing to compare", "bubble", "anything", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bubbleOnlyDivergence(tc.srcPath, tc.userText, tc.expected); got != tc.want {
+				t.Fatalf("bubbleOnlyDivergence(%q, %q) = %v, want %v", tc.srcPath, tc.userText, got, tc.want)
+			}
+		})
 	}
 }

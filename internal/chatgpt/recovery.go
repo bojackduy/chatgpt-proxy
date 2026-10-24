@@ -30,6 +30,18 @@ func normalizeRecoveryPrompt(s string) string {
 	return autolinkSpaceRe.ReplaceAllString(s, "$1$2")
 }
 
+// bubbleOnlyDivergence reports a snapshot whose only user text came from the
+// rendered bubble (no DOM message ID) and still differs from the expected
+// prompt. Visible text of a long message can be collapsed or partially
+// hydrated, so it cannot prove a mismatch: the caller retries until the
+// ID-bound source is readable. An exact bubble match still passes.
+func bubbleOnlyDivergence(srcPath, userText string, expected []string) bool {
+	if srcPath != "bubble" || len(expected) != 1 {
+		return false
+	}
+	return userText != normalizeRecoveryPrompt(expected[0])
+}
+
 // ErrCompletedEmpty is authoritative rejection, not a missing DOM extraction.
 // It is returned only after full pending-prompt and final-source binding.
 var ErrCompletedEmpty = errors.New("ChatGPT stored a completed empty final response; no new tool calls were delivered; continue with a distinct new ordinary user message")
@@ -356,6 +368,13 @@ func (c *Client) snapshotThread(ctx context.Context, url string, expected ...str
 		snap.srcPath = "mapping"
 	}
 	snap.userText = userText
+	// A bubble without its DOM message ID is an unhydrated or collapsed render,
+	// not the authoritative user source. Comparing it would report a structural
+	// prompt mismatch for a page that simply has not finished rendering, and a
+	// mismatch is terminal. Wait for the exact ID-bound source instead.
+	if bubbleOnlyDivergence(snap.srcPath, userText, expected) {
+		return snap, errors.New("recovery user boundary not fully rendered yet; retry")
+	}
 	visible, err := responseProbe(tab, nil)
 	if err != nil {
 		snap.probeErr = fmt.Errorf("recovery response probe: %w", err)

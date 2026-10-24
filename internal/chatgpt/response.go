@@ -4,7 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"time"
@@ -52,6 +52,14 @@ func (w *emptyAnswerWatch) expired(st responseState, now time.Time) bool {
 	return false
 }
 
+// responseBaseline captures DOM identities only. A previous answer's source
+// availability must never gate submission of a new turn.
+func responseBaseline(tab context.Context) ([]string, error) {
+	var ids []string
+	err := chromedp.Run(tab, chromedp.Evaluate("("+responseProbeJS+"([])).ids", &ids))
+	return ids, err
+}
+
 func responseProbe(tab context.Context, baseline []string) (responseState, error) {
 	if baseline == nil {
 		baseline = []string{}
@@ -64,18 +72,23 @@ func responseProbe(tab context.Context, baseline []string) (responseState, error
 		// null. Read only that fresh DOM identity, never a backend latest branch.
 		// Re-probe inside the readback to fence a changed user/assistant boundary.
 		probe := responseProbeJS + "(" + string(b) + ")"
-		var recovered string
+		var recovered struct {
+			Text   string `json:"text"`
+			Reason string `json:"reason"`
+		}
 		expected, _ := json.Marshal(st.LastID)
 		// Observed source fetches take about fourteen seconds even for a
 		// finished answer. Still bounded by the caller/recovery deadline.
 		read, cancel := context.WithTimeout(tab, 20*time.Second)
 		defer cancel()
-		js := "(async () => {const recheck = () => " + probe + "; const st = recheck(); if (st.lastID !== " + string(expected) + ") return '';" + nullDILWireJS + "})()"
-		if rerr := chromedp.Run(read, chromedp.Evaluate(js, &recovered, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); rerr == nil && recovered != "" {
-			st.Last = recovered
+		js := "(async () => {const recheck = () => " + probe + "; const st = recheck(); let reason='identity'; const sourceFailure = r => {reason=r;return '';}; const text=await(async()=>{if (st.lastID !== " + string(expected) + ") return '';" + nullDILWireJS + "})(); return {text,reason};})()"
+		if rerr := chromedp.Run(read, chromedp.Evaluate(js, &recovered, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); rerr != nil {
+			return st, fmt.Errorf("completed source readback stage=cdp: %w", rerr)
+		} else if recovered.Text != "" {
+			st.Last = recovered.Text
 			st.SourceVerified = true
 		} else if st.SourceRequired {
-			return st, errors.New("completed protocol source could not be verified against its DOM identity; rendered arguments are not safe")
+			return st, fmt.Errorf("completed protocol source could not be verified against its DOM identity; rendered arguments are not safe (reason=%s)", recovered.Reason)
 		}
 	}
 	return st, err
@@ -109,11 +122,32 @@ const nullDILWireJS = `
  const thread = location.pathname.split('/c/')[1];
  if (!thread) return '';
  try {
-   const auth = await (await fetch('/api/auth/session')).json();
-   if (!auth.accessToken) return '';
-   const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers:{Authorization:'Bearer ' + auth.accessToken}});
-   if (!r.ok) return '';
-   const mapping = (await r.json()).mapping;
+   // Retry transport/auth availability only. Keep the original DOM root,
+   // assistant, user and thread bound across every read; never select latest.
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), 18000);
+   let mapping, reason = 'unavailable';
+   try {
+     for (let attempt = 0; attempt < 3; attempt++) {
+       try {
+         const authResponse = await fetch('/api/auth/session', {signal:controller.signal});
+         if (!authResponse.ok) { reason='auth-http'; if(authResponse.status < 500 && authResponse.status !== 429) break; }
+         else {
+           const auth = await authResponse.json();
+           if (!auth.accessToken) reason='auth-unavailable';
+           else {
+             const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers:{Authorization:'Bearer ' + auth.accessToken},signal:controller.signal});
+             if (r.ok) { mapping=(await r.json()).mapping; break; }
+             reason='conversation-http';
+             if (r.status < 500 && r.status !== 429 && r.status !== 404) break;
+           }
+         }
+       } catch (_) { reason=controller.signal.aborted?'timeout':'transport'; }
+       if (controller.signal.aborted) break;
+       await new Promise(resolve => setTimeout(resolve, 250));
+     }
+   } finally { clearTimeout(timer); }
+   if (!mapping) return typeof sourceFailure === 'function' ? sourceFailure(reason) : '';
    const node = mapping?.[id], m = node?.message, dil = m?.metadata?.model_dil_v2;
    if (m?.id !== id || m.author?.role !== 'assistant' || m.channel !== 'final' || m.recipient !== 'all' ||
        m.status !== 'finished_successfully' || m.end_turn !== true || m.metadata?.is_complete !== true ||
@@ -148,7 +182,7 @@ const nullDILWireJS = `
     // not equality of the renderer's temporary text representation.
     const after = recheck();
     const afterUser = [...document.querySelectorAll('h4')].filter(e => e.textContent.trim() === 'You said:').at(-1);
-     if (!root.isConnected || after.lastID !== id || !after.fresh || !after.complete || after.stopBtn || after.continueBtn || after.errorText || userID(afterUser) !== uid || !afterUser || !(afterUser.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
+     if (location.pathname.split('/c/')[1] !== thread || !root.isConnected || after.lastID !== id || !after.fresh || !after.complete || after.stopBtn || after.continueBtn || after.errorText || userID(afterUser) !== uid || !afterUser || !(afterUser.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)) return '';
    return text;
- } catch (_) { return ''; }
+ } catch (_) { return typeof sourceFailure === 'function' ? sourceFailure('exception') : ''; }
 `
