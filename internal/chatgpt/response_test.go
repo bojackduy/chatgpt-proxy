@@ -498,7 +498,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackFetch=window.fetch;window.__ackReads=0;window.fetch=(...a)=>{if(String(a[0]).includes('/backend-api/conversation/'))window.__ackReads++;return window.__ackFetch(...a)}`, nil)); err != nil {
 			t.Fatal(err)
 		}
-		text, _, waitErr := (&Client{}).waitForAnswer(context.Background(), tab, time.Second, time.Millisecond, nil, before.IDs, nil, "", false)
+		text, _, waitErr := (&Client{}).waitForAnswer(context.Background(), tab, time.Second, time.Millisecond, nil, before.IDs, nil, false)
 		var reads int
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackReads`, &reads), chromedp.Evaluate(`window.fetch=window.__ackFetch;delete window.__ackFetch;delete window.__ackReads`, nil)); err != nil {
 			t.Fatal(err)
@@ -1393,12 +1393,30 @@ func TestShadowStreamLineageAndLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("source read refuses an empty identity", func(t *testing.T) {
-		if got := readTurnSource(context.Background(), "", "m-answer", "P"); got != "" {
-			t.Fatalf("read with an empty thread returned %q", got)
+	t.Run("delivery refuses a capture with no bridge call", func(t *testing.T) {
+		s := newShadowCapture("PROMPT-TEXT")
+		shadowFeed(t, s, shadowStream(shadowFixture("PROMPT-TEXT", "just prose")), 64)
+		if text, ok := s.answer(); ok {
+			t.Fatalf("delivered %q from a capture without an envelope", text)
 		}
-		if got := readTurnSource(context.Background(), "conv-1", "", "P"); got != "" {
-			t.Fatalf("read with an empty message id returned %q", got)
+	})
+
+	t.Run("delivery returns the reconstructed server text", func(t *testing.T) {
+		const envelope = `<opencode_bridge_call>{"name":"shell"}</opencode_bridge_call>`
+		s := newShadowCapture("PROMPT-TEXT")
+		shadowFeed(t, s, shadowStream(shadowFixture("PROMPT-TEXT", envelope)), 64)
+		text, ok := s.answer()
+		if !ok || text != envelope {
+			t.Fatalf("ok=%v text=%q, want the captured envelope", ok, text)
+		}
+	})
+
+	t.Run("delivery refuses an incomplete capture", func(t *testing.T) {
+		s := newShadowCapture("PROMPT-TEXT")
+		frames := shadowFixture("PROMPT-TEXT", `<opencode_bridge_call>{"name":"shell"}</opencode_bridge_call>`)
+		shadowFeed(t, s, shadowStream(frames[:len(frames)-1]), 64)
+		if text, ok := s.answer(); ok {
+			t.Fatalf("delivered %q without an explicit completion", text)
 		}
 	})
 

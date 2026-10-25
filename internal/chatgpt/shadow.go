@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"regexp"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -522,6 +520,20 @@ func (s *shadowCapture) turn() (thread, assistantID string, ok bool) {
 	return thread, assistantID, reason == ""
 }
 
+// answer returns the reply this capture proved, and only when that reply is
+// safe to deliver. A capture that reached an explicit completion carries the
+// server's own final message: status, completeness, lineage and conversation
+// were all asserted on that message, not read back from the page. The DOM path
+// refuses a final message without a bridge call envelope, so this applies the
+// same rule rather than delivering arbitrary prose.
+func (s *shadowCapture) answer() (text string, ok bool) {
+	_, body, reason := s.result()
+	if reason != "" || !streamAnswerAcceptable(body) {
+		return "", false
+	}
+	return body, true
+}
+
 func (s *shadowCapture) resolve() (thread, userID, assistantID, text, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -698,91 +710,6 @@ func countNonASCII(s string) int {
 // callers that matter deliver code.
 func sameAnswerText(shadow, delivered string) bool {
 	return strings.TrimSpace(shadow) == strings.TrimSpace(delivered)
-}
-
-// sourceByIDJS reads one finished answer from the authenticated conversation
-// mapping. It is bound to the conversation and message the stream declared,
-// and to a user message whose collapsed text is the prompt — never to the DOM,
-// to a sibling, or to "latest". Every schema and ancestry check the DOM path
-// relies on is repeated here, minus the DOM settle that fails on recovery.
-const sourceByIDJS = `
-(async () => {
-  const thread = %s, id = %s, key = %s;
-  const collapse = s => (s || '').trim().split(/\s+/).join(' ');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const a = await fetch('/api/auth/session', {signal: controller.signal});
-        if (!a.ok) {
-          if (a.status < 500 && a.status !== 429) return '';
-        } else {
-          const auth = await a.json();
-          if (auth.accessToken) {
-            const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers: {Authorization: 'Bearer ' + auth.accessToken}, signal: controller.signal});
-            if (r.ok) {
-              const mapping = (await r.json()).mapping;
-              const node = mapping?.[id], m = node?.message;
-              if (!node || m?.id !== id || m.author?.role !== 'assistant' || m.channel !== 'final' ||
-                  m.recipient !== 'all' || m.status !== 'finished_successfully' || m.end_turn !== true ||
-                  m.metadata?.is_complete !== true || m.content?.content_type !== 'text' ||
-                  m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return '';
-              let parent = node.parent;
-              for (let hop = 0; parent && hop < 64; hop++) {
-                const p = mapping[parent];
-                if (!p || p.message?.id !== parent) return '';
-                if (p.message.author?.role === 'user') {
-                  const parts = p.message.content?.parts;
-                  const text = Array.isArray(parts) && parts.every(x => typeof x === 'string') ? parts.join('') : '';
-                  return collapse(text) === key ? m.content.parts[0].trim() : '';
-                }
-                parent = p.parent;
-              }
-              return '';
-            }
-            if (r.status < 500 && r.status !== 429 && r.status !== 404) return '';
-          }
-        }
-      } catch (_) {}
-      if (controller.signal.aborted) return '';
-      await new Promise(res => setTimeout(res, 250));
-    }
-    return '';
-  } finally { clearTimeout(timer); }
-})()
-`
-
-// readTurnSource returns the finished answer text for a stream-confirmed turn,
-// or "" when anything about it cannot be proven. It never invents text.
-func readTurnSource(tab context.Context, thread, msgID, promptKey string) string {
-	if thread == "" || msgID == "" {
-		return ""
-	}
-	expr := fmt.Sprintf(sourceByIDJS, strconv.Quote(thread), strconv.Quote(msgID), strconv.Quote(promptKey))
-	ctx, cancel := context.WithTimeout(tab, 20*time.Second)
-	defer cancel()
-	var text string
-	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		p := runtime.Evaluate(expr)
-		p.AwaitPromise = true
-		p.ReturnByValue = true
-		res, exception, err := p.Do(ctx)
-		if err != nil {
-			return err
-		}
-		if exception != nil || res == nil || len(res.Value) == 0 {
-			return nil
-		}
-		if err := json.Unmarshal(res.Value, &text); err != nil {
-			return nil
-		}
-		return nil
-	}))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(text)
 }
 
 // The DOM path refuses to deliver a final message that carries no bridge call
