@@ -1344,6 +1344,80 @@ func TestShadowStreamLineageAndLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("composer whitespace reshape still anchors", func(t *testing.T) {
+		// The typed prompt used blank lines and indentation; the server stores
+		// one line. Same words, same order, so the turn still correlates.
+		s := newShadowCapture("P1\n\n   P2")
+		shadowFeed(t, s, shadowStream(shadowFixture("P1 P2", "A")), 64)
+		if ok, text, reason := s.result(); !ok || text != "A" {
+			t.Fatalf("reshape broke the anchor: ok=%v reason=%q", ok, reason)
+		}
+	})
+
+	t.Run("a changed word does not anchor", func(t *testing.T) {
+		s := newShadowCapture("P1\n\nP2")
+		shadowFeed(t, s, shadowStream(shadowFixture("P1 P3", "A")), 64)
+		if ok, _, reason := s.result(); ok || reason != "no matching user message" {
+			t.Fatalf("ok=%v reason=%q, want no matching user message", ok, reason)
+		}
+	})
+
+	t.Run("separate words never merge", func(t *testing.T) {
+		if samePromptKey("a b") == samePromptKey("ab") {
+			t.Fatal("whitespace normalization must not merge separate words")
+		}
+	})
+
+	t.Run("late transport failure cannot downgrade a completed capture", func(t *testing.T) {
+		// The browser aborts the SSE connection at teardown, after the server
+		// has declared the stream complete.
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(shadowFixture("P", "A")), 64)
+		s.fail("stream aborted")
+		if ok, text, reason := s.result(); !ok || text != "A" {
+			t.Fatalf("completed capture was downgraded: ok=%v reason=%q", ok, reason)
+		}
+	})
+
+	t.Run("answer comparison ignores only surrounding whitespace", func(t *testing.T) {
+		if !sameAnswerText("code()\n", "code()") {
+			t.Fatal("a trailing newline must not break the comparison")
+		}
+		if sameAnswerText("a  b", "a b") {
+			t.Fatal("inner whitespace is part of the answer")
+		}
+		if sameAnswerText("A", "B") {
+			t.Fatal("different answers compared equal")
+		}
+		if p, s := sharedEdges("SHADOW_OK", "SHADOW_OK\n"); p != 9 || s != 0 {
+			t.Fatalf("prefix=%d suffix=%d, want 9/0", p, s)
+		}
+		if p, s := sharedEdges("xAB", "yAB"); p != 0 || s != 2 {
+			t.Fatalf("prefix=%d suffix=%d, want 0/2", p, s)
+		}
+		if countNonASCII("aé") != 2 {
+			t.Fatalf("nonascii count = %d, want 2 bytes", countNonASCII("aé"))
+		}
+	})
+
+	t.Run("conversation falls back to the reconstructed root", func(t *testing.T) {
+		// Live assistant messages do not always repeat conversation_id, so the
+		// binding falls back to this turn's own messages and then the root.
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(shadowFixture("P", "A")), 64)
+		for _, m := range s.messages {
+			delete(m, "conversation_id")
+		}
+		s.state["conversation_id"] = "conv-1"
+		if ok, text, reason := s.result(); !ok || text != "A" {
+			t.Fatalf("root fallback failed: ok=%v reason=%q", ok, reason)
+		}
+		s.state["conversation_id"] = "other"
+		if ok, _, reason := s.result(); ok || reason != "completion conversation mismatch" {
+			t.Fatalf("ok=%v reason=%q, want completion conversation mismatch", ok, reason)
+		}
+	})
+
 	t.Run("broken lineage is not correlated", func(t *testing.T) {
 		frames := shadowFixture("P", "A")
 		// Point the assistant at a message that never appears.

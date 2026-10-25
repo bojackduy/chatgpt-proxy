@@ -184,7 +184,10 @@ func (s *shadowCapture) onEvent(tab context.Context, ev any) {
 func (s *shadowCapture) fail(reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.reason == "" {
+	// Teardown aborts the SSE connection after the server has already declared
+	// the stream complete. A capture that holds an explicit completion is
+	// final and must not be downgraded by a late transport error.
+	if s.reason == "" && !s.done {
 		s.reason = reason
 	}
 }
@@ -221,7 +224,9 @@ func (s *shadowCapture) feed(chunk []byte) {
 			return
 		}
 	}
-	if len(s.buf) > 1<<16 {
+	if len(s.buf) > shadowMaxBytes {
+		// A single SSE frame can be large: the answer is written as one
+		// whole-mapping frame. Only the total byte budget bounds the capture.
 		s.reason = "frame limit"
 	}
 }
@@ -514,14 +519,39 @@ func (s *shadowCapture) result() (correlated bool, text string, reason string) {
 	}
 	userID := s.promptUser()
 	if userID == "" {
+		// Sizes only: the difference is either a missing message or a reshape
+		// between the typed prompt and the stored user message.
+		var lens []int
+		var keys []int
+		for _, id := range s.seen {
+			m := s.messages[id]
+			if roleOf(m) != "user" {
+				continue
+			}
+			if t, ok := partsText(m); ok {
+				lens = append(lens, len(t))
+				keys = append(keys, len(samePromptKey(t)))
+			}
+		}
+		log.Printf("[chatgpt-shadow] user_candidates=%d lens=%v keys=%v prompt_bytes=%d prompt_key_bytes=%d", len(lens), lens, keys, len(s.prompt), len(samePromptKey(s.prompt)))
 		return false, "", "no matching user message"
 	}
 	assistant := s.assistantFor(userID)
 	if assistant == nil {
 		return false, "", "assistant lineage"
 	}
+	// The streamed assistant message does not always carry conversation_id at
+	// the top level. Bind through whatever this turn's own messages do carry,
+	// then through the reconstructed root; an unknown conversation is refused.
 	conv, _ := assistant["conversation_id"].(string)
+	if conv == "" {
+		conv, _ = s.messages[userID]["conversation_id"].(string)
+	}
+	if conv == "" {
+		conv, _ = s.state["conversation_id"].(string)
+	}
 	if conv != s.completion {
+		log.Printf("[chatgpt-shadow] conversation unknown assistant=%t user=%t root=%t", assistant["conversation_id"] != nil, s.messages[userID]["conversation_id"] != nil, s.state["conversation_id"] != nil)
 		return false, "", "completion conversation mismatch"
 	}
 	if s.conversation != "" && conv != s.conversation {
@@ -534,19 +564,28 @@ func (s *shadowCapture) result() (correlated bool, text string, reason string) {
 	return true, body, ""
 }
 
-// promptUser returns the newest user message whose text is exactly the prompt.
+// promptUser returns the newest user message whose text is the prompt. The
+// composer reshapes line breaks and indentation on the way to the server, so
+// the comparison collapses whitespace runs; every word must still match.
 // A history replay carries older user messages too, so arrival order decides.
 func (s *shadowCapture) promptUser() string {
+	want := samePromptKey(s.prompt)
 	for i := len(s.seen) - 1; i >= 0; i-- {
 		m := s.messages[s.seen[i]]
 		if roleOf(m) != "user" {
 			continue
 		}
-		if t, ok := partsText(m); ok && t == s.prompt {
+		if t, ok := partsText(m); ok && samePromptKey(t) == want {
 			return s.seen[i]
 		}
 	}
 	return ""
+}
+
+// samePromptKey is the prompt identity a textarea round trip preserves: words
+// and their order, with whitespace runs treated as a single separator.
+func samePromptKey(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // assistantFor walks the parent chain from each assistant message back to the
@@ -600,10 +639,46 @@ func reportShadow(s *shadowCapture, id, answer string) {
 		return
 	}
 	correlated, text, reason := s.result()
-	matched := correlated && text == answer
+	matched := correlated && sameAnswerText(text, answer)
 	s.mu.Lock()
 	frames, bytes, completed, ignored := s.frames, s.bytes, s.done, s.ignoredPatches
 	s.mu.Unlock()
-	log.Printf("[chatgpt-shadow] id=%s frames=%d bytes=%d completed=%v correlated=%v match=%v ignored=%d reason=%q",
-		id, frames, bytes, completed, correlated, matched, ignored, reason)
+	prefix, suffix := sharedEdges(text, answer)
+	// Content-free shape only: sizes, shared edges and non-ASCII byte counts,
+	// which is enough to name the class of a difference without printing it.
+	log.Printf("[chatgpt-shadow] id=%s frames=%d bytes=%d completed=%v correlated=%v match=%v ignored=%d shadow_bytes=%d answer_bytes=%d trim_shadow_bytes=%d trim_answer_bytes=%d prefix=%d suffix=%d nonascii=%d/%d reason=%q",
+		id, frames, bytes, completed, correlated, matched, ignored,
+		len(text), len(answer), len(strings.TrimSpace(text)), len(strings.TrimSpace(answer)),
+		prefix, suffix, countNonASCII(text), countNonASCII(answer), reason)
+}
+
+// sharedEdges reports how many leading and trailing bytes two strings share.
+func sharedEdges(a, b string) (int, int) {
+	prefix := 0
+	for prefix < len(a) && prefix < len(b) && a[prefix] == b[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(a)-prefix && suffix < len(b)-prefix && a[len(a)-1-suffix] == b[len(b)-1-suffix] {
+		suffix++
+	}
+	return prefix, suffix
+}
+
+func countNonASCII(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			n++
+		}
+	}
+	return n
+}
+
+// sameAnswerText compares the reconstructed answer with the delivered one.
+// Only surrounding whitespace may differ: the renderer keeps a trailing
+// newline the stream does not. Inner text must match exactly, because the
+// callers that matter deliver code.
+func sameAnswerText(shadow, delivered string) bool {
+	return strings.TrimSpace(shadow) == strings.TrimSpace(delivered)
 }
