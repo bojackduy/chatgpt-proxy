@@ -1568,15 +1568,17 @@ func TestShadowStreamLineageAndLimits(t *testing.T) {
 	})
 }
 
-// TestShadowStreamIsOptIn pins the default: the shadow reader must not touch a
-// turn unless it was explicitly enabled.
-func TestShadowStreamIsOptIn(t *testing.T) {
+// TestStreamCaptureDefault pins the switch: the capture is the proof of a turn,
+// so it runs unless it was explicitly turned off.
+func TestStreamCaptureDefault(t *testing.T) {
 	t.Setenv("CHATGPT_BRIDGE_SHADOW_STREAM", "")
-	if shadowEnabled() {
-		t.Fatal("shadow reader must be off by default")
+	if !streamCaptureEnabled() {
+		t.Fatal("stream capture must be on by default")
 	}
-	t.Setenv("CHATGPT_BRIDGE_SHADOW_STREAM", "1")
-	if !shadowEnabled() {
-		t.Fatal("explicit opt-in was ignored")
+	for _, v := range []string{"0", "false", "off", "no", " OFF "} {
+		t.Setenv("CHATGPT_BRIDGE_SHADOW_STREAM", v)
+		if streamCaptureEnabled() {
+			t.Fatalf("%q did not turn the capture off", v)
+		}
 	}
 }

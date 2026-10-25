@@ -31,14 +31,17 @@ const (
 	shadowStreamTimeout = 15 * time.Second
 )
 
-// shadowEnabled reports whether the opt-in shadow reader is on. Off by
-// default; nothing in the answer path changes when it is off.
-func shadowEnabled() bool {
+// streamCaptureEnabled reports whether the adapter reads the generation
+// response stream. It is on by default: the capture is the only proof of a
+// turn that does not depend on the page settling, and "a previous reply could
+// not be confirmed" is exactly that dependency failing. Setting
+// CHATGPT_BRIDGE_SHADOW_STREAM to 0/false/off/no returns to the DOM-only path.
+func streamCaptureEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CHATGPT_BRIDGE_SHADOW_STREAM"))) {
-	case "1", "true", "on", "yes":
-		return true
+	case "0", "false", "off", "no":
+		return false
 	}
-	return false
+	return true
 }
 
 // shadowCapture decodes one stream. Fields are written under mu because CDP

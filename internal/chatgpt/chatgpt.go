@@ -954,7 +954,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	// click so the response stream is captured from its first frame, and its
 	// result is compared after the turn. It never influences what is returned.
 	var shadow *shadowCapture
-	if shadowEnabled() {
+	if streamCaptureEnabled() {
 		var stopShadow func()
 		shadow, stopShadow = startShadowCapture(tab, opt.Prompt)
 		defer stopShadow()
