@@ -247,6 +247,13 @@ func (s *shadowCapture) block(raw string) {
 	}
 	var frame map[string]any
 	if err := json.Unmarshal([]byte(text), &frame); err != nil {
+		// The first measured frame is `event: delta_encoding` with a bare
+		// string payload; it carries no protocol state. Skip any well-formed
+		// JSON that is not an object, and only call genuinely broken JSON a
+		// failure.
+		if json.Valid([]byte(text)) {
+			return
+		}
 		s.reason = "invalid frame"
 		return
 	}

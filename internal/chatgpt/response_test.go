@@ -1277,6 +1277,19 @@ func TestShadowStreamReconstruction(t *testing.T) {
 			wantText: answer,
 		},
 		{
+			name: "typed and scalar frames are skipped, not fatal",
+			// Measured live: the stream opens with `event: delta_encoding`
+			// carrying the bare string "v1", and typed event frames carry no
+			// p/o/v. Neither is protocol state, and neither may abort the read.
+			raw: `event: delta_encoding` + "\n" +
+				`data: "v1"` + "\n\n" +
+				`event: message` + "\n" +
+				`data: {"type":"resume_conversation_token","conversation_id":"conv-1"}` + "\n\n" +
+				shadowStream(shadowFixture(prompt, answer)),
+			wantOK:   true,
+			wantText: answer,
+		},
+		{
 			name:     "UTF-8 and frames split across chunks",
 			raw:      shadowStream(shadowFixture(prompt, answer)),
 			wantOK:   true,
