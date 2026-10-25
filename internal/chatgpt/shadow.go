@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -502,22 +505,36 @@ func parentOf(m map[string]any) string {
 	return ""
 }
 
-// result reports what this capture established. Correlation requires an exact
+// result reports what this capture established. Correlation requires a
 // prompt-anchored user message, an assistant message that reaches it through
 // the parent chain, and an explicit completion for the same conversation.
 func (s *shadowCapture) result() (correlated bool, text string, reason string) {
+	_, _, _, text, reason = s.resolve()
+	return reason == "", text, reason
+}
+
+// turn reports the server-assigned identity of a completed, correlated turn:
+// the conversation and the assistant message that answered this prompt. It is
+// the only thing delivery may take from this capture, and only when the stream
+// itself declared completion.
+func (s *shadowCapture) turn() (thread, assistantID string, ok bool) {
+	thread, _, assistantID, _, reason := s.resolve()
+	return thread, assistantID, reason == ""
+}
+
+func (s *shadowCapture) resolve() (thread, userID, assistantID, text, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reason != "" {
-		return false, "", s.reason
+		return "", "", "", "", s.reason
 	}
 	if s.unsupported {
-		return false, "", "unsupported patch"
+		return "", "", "", "", "unsupported patch"
 	}
 	if s.completion == "" {
-		return false, "", "no explicit completion"
+		return "", "", "", "", "no explicit completion"
 	}
-	userID := s.promptUser()
+	userID = s.promptUser()
 	if userID == "" {
 		// Sizes only: the difference is either a missing message or a reshape
 		// between the typed prompt and the stored user message.
@@ -534,11 +551,11 @@ func (s *shadowCapture) result() (correlated bool, text string, reason string) {
 			}
 		}
 		log.Printf("[chatgpt-shadow] user_candidates=%d lens=%v keys=%v prompt_bytes=%d prompt_key_bytes=%d", len(lens), lens, keys, len(s.prompt), len(samePromptKey(s.prompt)))
-		return false, "", "no matching user message"
+		return "", "", "", "", "no matching user message"
 	}
 	assistant := s.assistantFor(userID)
 	if assistant == nil {
-		return false, "", "assistant lineage"
+		return "", "", "", "", "assistant lineage"
 	}
 	// The streamed assistant message does not always carry conversation_id at
 	// the top level. Bind through whatever this turn's own messages do carry,
@@ -552,16 +569,16 @@ func (s *shadowCapture) result() (correlated bool, text string, reason string) {
 	}
 	if conv != s.completion {
 		log.Printf("[chatgpt-shadow] conversation unknown assistant=%t user=%t root=%t", assistant["conversation_id"] != nil, s.messages[userID]["conversation_id"] != nil, s.state["conversation_id"] != nil)
-		return false, "", "completion conversation mismatch"
+		return "", "", "", "", "completion conversation mismatch"
 	}
 	if s.conversation != "" && conv != s.conversation {
-		return false, "", "conversation mismatch"
+		return "", "", "", "", "conversation mismatch"
 	}
 	body, ok := partsText(assistant)
 	if !ok || body == "" {
-		return false, "", "answer not text"
+		return "", "", "", "", "answer not text"
 	}
-	return true, body, ""
+	return conv, userID, idOf(assistant), body, ""
 }
 
 // promptUser returns the newest user message whose text is the prompt. The
@@ -681,4 +698,105 @@ func countNonASCII(s string) int {
 // callers that matter deliver code.
 func sameAnswerText(shadow, delivered string) bool {
 	return strings.TrimSpace(shadow) == strings.TrimSpace(delivered)
+}
+
+// sourceByIDJS reads one finished answer from the authenticated conversation
+// mapping. It is bound to the conversation and message the stream declared,
+// and to a user message whose collapsed text is the prompt — never to the DOM,
+// to a sibling, or to "latest". Every schema and ancestry check the DOM path
+// relies on is repeated here, minus the DOM settle that fails on recovery.
+const sourceByIDJS = `
+(async () => {
+  const thread = %s, id = %s, key = %s;
+  const collapse = s => (s || '').trim().split(/\s+/).join(' ');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const a = await fetch('/api/auth/session', {signal: controller.signal});
+        if (!a.ok) {
+          if (a.status < 500 && a.status !== 429) return '';
+        } else {
+          const auth = await a.json();
+          if (auth.accessToken) {
+            const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers: {Authorization: 'Bearer ' + auth.accessToken}, signal: controller.signal});
+            if (r.ok) {
+              const mapping = (await r.json()).mapping;
+              const node = mapping?.[id], m = node?.message;
+              if (!node || m?.id !== id || m.author?.role !== 'assistant' || m.channel !== 'final' ||
+                  m.recipient !== 'all' || m.status !== 'finished_successfully' || m.end_turn !== true ||
+                  m.metadata?.is_complete !== true || m.content?.content_type !== 'text' ||
+                  m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return '';
+              let parent = node.parent;
+              for (let hop = 0; parent && hop < 64; hop++) {
+                const p = mapping[parent];
+                if (!p || p.message?.id !== parent) return '';
+                if (p.message.author?.role === 'user') {
+                  const parts = p.message.content?.parts;
+                  const text = Array.isArray(parts) && parts.every(x => typeof x === 'string') ? parts.join('') : '';
+                  return collapse(text) === key ? m.content.parts[0].trim() : '';
+                }
+                parent = p.parent;
+              }
+              return '';
+            }
+            if (r.status < 500 && r.status !== 429 && r.status !== 404) return '';
+          }
+        }
+      } catch (_) {}
+      if (controller.signal.aborted) return '';
+      await new Promise(res => setTimeout(res, 250));
+    }
+    return '';
+  } finally { clearTimeout(timer); }
+})()
+`
+
+// readTurnSource returns the finished answer text for a stream-confirmed turn,
+// or "" when anything about it cannot be proven. It never invents text.
+func readTurnSource(tab context.Context, thread, msgID, promptKey string) string {
+	if thread == "" || msgID == "" {
+		return ""
+	}
+	expr := fmt.Sprintf(sourceByIDJS, strconv.Quote(thread), strconv.Quote(msgID), strconv.Quote(promptKey))
+	ctx, cancel := context.WithTimeout(tab, 20*time.Second)
+	defer cancel()
+	var text string
+	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		p := runtime.Evaluate(expr)
+		p.AwaitPromise = true
+		p.ReturnByValue = true
+		res, exception, err := p.Do(ctx)
+		if err != nil {
+			return err
+		}
+		if exception != nil || res == nil || len(res.Value) == 0 {
+			return nil
+		}
+		if err := json.Unmarshal(res.Value, &text); err != nil {
+			return nil
+		}
+		return nil
+	}))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+// The DOM path refuses to deliver a final message that carries no bridge call
+// envelope, and refuses standalone escape artifacts. The stream path delivers
+// the same server text, so it applies the same rules rather than accepting any
+// final prose.
+var (
+	bridgeCallRE     = regexp.MustCompile(`<opencode(?:\\)?_bridge(?:\\)?_call\b`)
+	escapeArtifactRE = regexp.MustCompile(`(?m)^[ \t]*(?:<escape>\s*</escape>[ \t]*)+[ \t]*$`)
+)
+
+func streamAnswerAcceptable(text string) bool {
+	if text == "" || escapeArtifactRE.MatchString(text) {
+		return false
+	}
+	return bridgeCallRE.MatchString(text)
 }

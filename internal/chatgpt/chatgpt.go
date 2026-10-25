@@ -972,7 +972,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 
 	// 5. Wait for the answer.
 	log.Printf("[chatgpt] waiting for answer (timeout: %v)...", timeout)
-	answer, reasoning, err := c.waitForAnswer(ctx, tab, timeout, pollInterval, onProgress, beforeIDs)
+	answer, reasoning, err := c.waitForAnswer(ctx, tab, timeout, pollInterval, onProgress, beforeIDs, shadow, opt.Prompt, opt.Thinking)
 	out.Answer, out.Reasoning = answer, reasoning
 	if err == nil {
 		// Rasterize substantive answer SVGs to PNG bridge-side: the TUI
@@ -1901,13 +1901,14 @@ func (c *Client) turnSubmitted(tab context.Context) (bool, error) {
 // waitForAnswer polls the page until the assistant reply is stable (or the
 // stop button disappears), handling the "Continue generating" button.
 // onProgress (may be nil) receives the full answer-so-far whenever it grows.
-func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout, pollInterval time.Duration, onProgress func(string), before []string) (string, string, error) {
+func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout, pollInterval time.Duration, onProgress func(string), before []string, shadow *shadowCapture, prompt string, thinking bool) (string, string, error) {
 	id := flowID(ctx)
 	log.Printf("[chatgpt-flow] id=%s stage=stream_wait start poll_interval=%s", id, pollInterval)
 	deadline := time.Now().Add(timeout)
 	lastText := ""
 	stablePolls := 0
 	continues := 0
+	sourceTries := 0
 
 	empty := emptyAnswerWatch{Started: time.Now()}
 
@@ -1918,6 +1919,21 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 		}
 		log.Printf("[chatgpt] target=%s poll: stop=%v, cont=%v, err=%v, len=%d reasoning=%d", chromedp.FromContext(tab).Target.TargetID, st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning))
 		log.Printf("[chatgpt-flow] id=%s stage=stream_poll stop=%v continue=%v page_error=%v answer_bytes=%d reasoning_bytes=%d complete=%v", id, st.StopBtn, st.ContinueBtn, st.ErrorText, len(st.Last), len(st.Reasoning), st.Complete)
+
+		// A completed stream is proof the reply exists even when the DOM has
+		// not settled. Only the identity comes from the stream; the text is
+		// read back from the authenticated mapping under the same schema and
+		// ancestry checks. Reasoning is only available from the page, so a
+		// thinking turn keeps the ordinary path.
+		if shadow != nil && !thinking && sourceTries < 3 {
+			if thread, msgID, ok := shadow.turn(); ok {
+				sourceTries++
+				if text := readTurnSource(tab, thread, msgID, samePromptKey(prompt)); streamAnswerAcceptable(text) {
+					log.Printf("[chatgpt-flow] id=%s stage=stream_confirmed answer_bytes=%d try=%d", id, len(text), sourceTries)
+					return text, "", nil
+				}
+			}
+		}
 
 		if st.ErrorText {
 			return "", "", errors.New("ChatGPT reported a page error; inspect the stored thread before recovery; no automatic resubmission")

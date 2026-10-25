@@ -498,7 +498,7 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackFetch=window.fetch;window.__ackReads=0;window.fetch=(...a)=>{if(String(a[0]).includes('/backend-api/conversation/'))window.__ackReads++;return window.__ackFetch(...a)}`, nil)); err != nil {
 			t.Fatal(err)
 		}
-		text, _, waitErr := (&Client{}).waitForAnswer(context.Background(), tab, time.Second, time.Millisecond, nil, before.IDs)
+		text, _, waitErr := (&Client{}).waitForAnswer(context.Background(), tab, time.Second, time.Millisecond, nil, before.IDs, nil, "", false)
 		var reads int
 		if err := chromedp.Run(tab, chromedp.Evaluate(`window.__ackReads`, &reads), chromedp.Evaluate(`window.fetch=window.__ackFetch;delete window.__ackFetch;delete window.__ackReads`, nil)); err != nil {
 			t.Fatal(err)
@@ -1376,6 +1376,44 @@ func TestShadowStreamLineageAndLimits(t *testing.T) {
 		s.fail("stream aborted")
 		if ok, text, reason := s.result(); !ok || text != "A" {
 			t.Fatalf("completed capture was downgraded: ok=%v reason=%q", ok, reason)
+		}
+	})
+
+	t.Run("turn exposes identity only for a confirmed turn", func(t *testing.T) {
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(shadowFixture("P", "A")), 64)
+		thread, id, ok := s.turn()
+		if !ok || thread != "conv-1" || id != "m-answer" {
+			t.Fatalf("thread=%q id=%q ok=%v, want conv-1/m-answer", thread, id, ok)
+		}
+		other := newShadowCapture("SOMETHING-ELSE")
+		shadowFeed(t, other, shadowStream(shadowFixture("P", "A")), 64)
+		if _, _, ok := other.turn(); ok {
+			t.Fatal("an uncorrelated capture must expose no identity")
+		}
+	})
+
+	t.Run("source read refuses an empty identity", func(t *testing.T) {
+		if got := readTurnSource(context.Background(), "", "m-answer", "P"); got != "" {
+			t.Fatalf("read with an empty thread returned %q", got)
+		}
+		if got := readTurnSource(context.Background(), "conv-1", "", "P"); got != "" {
+			t.Fatalf("read with an empty message id returned %q", got)
+		}
+	})
+
+	t.Run("stream delivery keeps the protocol gates", func(t *testing.T) {
+		if streamAnswerAcceptable("just prose, no envelope") {
+			t.Fatal("prose must never satisfy the stream delivery gate")
+		}
+		if !streamAnswerAcceptable("<opencode_bridge_call>{\"name\":\"x\"}</opencode_bridge_call>") {
+			t.Fatal("a bridge call envelope must pass")
+		}
+		if !streamAnswerAcceptable("prefix\n<opencode\\_bridge\\_call>{}") {
+			t.Fatal("the escaped envelope spelling must pass")
+		}
+		if streamAnswerAcceptable("ok\n<escape></escape>\n") {
+			t.Fatal("standalone escape artifacts must be refused")
 		}
 	})
 
