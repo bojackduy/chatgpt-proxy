@@ -660,6 +660,94 @@ func TestDirtyRewriteReseedAbandonsUncertainPending(t *testing.T) {
 	}
 }
 
+func TestDirtyContinuationReseedsInsteadOfBricking(t *testing.T) {
+	// Turn1 commits a weather call; turn2 is interrupted at submit and stays
+	// Dirty/final. The client then reverts that uncertain turn and continues.
+	// Its history is a canonical PREFIX-EXTENSION of the committed journal —
+	// the exact shape opencode sends after a revert, a model switch or a
+	// retry. It used to classify as append-only ("not a rewrite"), so no plan
+	// existed, adoption and auto-resync had nothing to bind, and every retry
+	// got the permanent uncertainty refusal. It must seed a fresh thread and
+	// deliver the new message instead.
+	f := &fakeBackend{answers: []string{weatherAnswer, "", "reseeded answer"}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	a := assistant(t, request(h, "rdirty2", req))
+	callID := a.ToolCalls[0].ID
+	oldURL := h.sessions["rdirty2"].URL
+	committed := append([]message{}, h.sessions["rdirty2"].Messages...)
+	req.Messages = append(append([]message{}, req.Messages...), a, message{Role: "tool", ToolCallID: callID, Content: "25 C"}, message{Role: "user", Content: "and tomorrow?"})
+	req.ToolChoice = "none"
+	f.err, f.errorURL = context.Canceled, oldURL
+	if w := request(h, "rdirty2", req); w.Code != 502 || !h.sessions["rdirty2"].Dirty || h.sessions["rdirty2"].Phase != "final" {
+		t.Fatalf("interrupted turn did not stay uncertain: %d %s", w.Code, w.Body.String())
+	}
+	next := completionsRequest{Messages: append(append([]message{}, committed...),
+		message{Role: "tool", ToolCallID: callID, Content: "25 C"},
+		message{Role: "user", Content: "what about Saigon?"}), ToolChoice: "none"}
+	if !prefix(next.Messages, committed) || len(next.Messages) <= len(committed) {
+		t.Fatal("test setup is not a canonical prefix-extension")
+	}
+	f.err = nil
+	got := assistant(t, request(h, "rdirty2", next))
+	if contentText(got) != "reseeded answer" {
+		t.Fatalf("dirty continuation was not reseeded: %+v", got)
+	}
+	s := h.sessions["rdirty2"]
+	if s.Dirty || s.Phase != "" || s.PendingRequest != nil || s.PendingPrompt != "" || s.URL == "" || s.URL == oldURL {
+		t.Fatalf("continuation reseed left uncertainty behind or reused the thread: %+v", s)
+	}
+	for _, want := range []string{"rewrite-continuation", "old=" + oldURL, "new=" + s.URL, "pending:", "outcome unknown"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
+	}
+	if s.ReseedFrom != oldURL {
+		t.Fatalf("linkage lost: %q", s.ReseedFrom)
+	}
+	if len(f.prompts) != 3 || f.urls[2] != "" {
+		t.Fatalf("continuation reseed did not mint a fresh thread: urls=%v", f.urls)
+	}
+	if final := f.prompts[2]; !strings.Contains(final, "what about Saigon?") {
+		t.Fatal("new user message was dropped")
+	} else if strings.Contains(final, "and tomorrow?") {
+		t.Fatal("abandoned uncertain turn was resubmitted")
+	}
+	if request(h, "rdirty2", next); len(f.prompts) != 3 {
+		t.Fatal("retry after continuation reseed resubmitted")
+	}
+}
+
+func TestDirtyContinuationLoadBearingKeepsUncertainty(t *testing.T) {
+	// Same canonical prefix-extension shape, but the sent log holds a
+	// COMPLETED answer for the pending prompt on the old thread: abandoning
+	// it would lose real work, so the continuation still refuses.
+	h1 := "first submission prompt H1 with full context"
+	req := weatherReq()
+	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer, latestErr: errors.New("stored thread holds no complete assistant answer to transplant")}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	saved := []message{{Role: "user", Content: "first"}, {Role: "assistant", Content: "ok"}}
+	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: saved}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	next := completionsRequest{Messages: append(append([]message{}, saved...), message{Role: "user", Content: "next"}), ToolChoice: "none"}
+	if !prefix(next.Messages, saved) {
+		t.Fatal("test setup is not a canonical prefix-extension")
+	}
+	if w := request(h, "recover", next); w.Code != 422 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
+		t.Fatalf("load-bearing continuation abandoned uncertainty: %d %s", w.Code, w.Body.String())
+	}
+	s := h.sessions["recover"]
+	if !s.Dirty || s.Phase != "final" || s.PendingPrompt != h1 || s.ReseedEvidence != "" || s.ReseedFrom != "" {
+		t.Fatalf("load-bearing continuation changed the journal: %+v", s)
+	}
+	if w := recoveryRequest(h, nil); w.Code != 409 || !h.sessions["recover"].Dirty {
+		t.Fatalf("load-bearing continuation recover lost diagnosis or Dirty: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestDirtyRewriteReseedLoadBearingKeepsUncertainty(t *testing.T) {
 	// A verifiable completed answer for the still-pending prompt exists on
 	// the old thread, but adoption fails structurally and auto-resync

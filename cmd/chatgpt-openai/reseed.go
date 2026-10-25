@@ -22,14 +22,23 @@ import (
 // adoption comparison against it, no resync of it — and the turn continues
 // on a fresh thread as a normal submission (chunked and boundary-aware like
 // any fresh history).
+//
+// A dirty session also lands here when the incoming history is a canonical
+// PREFIX-EXTENSION of the committed journal with a tail that is NOT the pending
+// request (revert, fork, model switch or any continuation past the uncertain
+// turn): nothing was rewritten — the client moved on and dropped that turn —
+// and that shape is seeded fresh too, instead of being refused forever by the
+// "not a rewrite" branch. An identical retry of the pending request is never
+// resubmitted.
 
 // Rewrite classifications. "ambiguous" is not a rewrite: the incoming
 // history is internally incoherent, so no reseed is attempted.
 const (
-	rewriteTruncation = "rewrite-truncation" // revert/truncation: shorter, prefix-equal
-	rewriteDivergence = "rewrite-divergence" // fork/regeneration: same-length-but-diverged content
-	rewriteCompaction = "rewrite-compaction" // compaction: summarized system prefix
-	rewriteAmbiguous = "ambiguous"           // incoherent: dangling/duplicate/unmatched tool results
+	rewriteTruncation   = "rewrite-truncation"   // revert/truncation: shorter, prefix-equal
+	rewriteDivergence   = "rewrite-divergence"   // fork/regeneration: same-length-but-diverged content
+	rewriteCompaction   = "rewrite-compaction"   // compaction: summarized system prefix
+	rewriteContinuation = "rewrite-continuation" // client moved past the uncertain turn: committed journal is a canonical prefix of incoming
+	rewriteAmbiguous    = "ambiguous"            // incoherent: dangling/duplicate/unmatched tool results
 )
 
 // rewritePlan is a validated fresh-thread reseed. carried holds committed
@@ -270,7 +279,38 @@ func (h *handler) planDirtyReseed(id string, s *session, req completionsRequest)
 		return nil
 	}
 	kind, mm := classifyHistoryRewrite(req.Messages, s.Messages)
-	if kind == "" || kind == rewriteAmbiguous {
+	if kind == "" {
+		// The committed journal is a canonical prefix of the incoming
+		// history. On a clean session that is ordinary append-only
+		// continuation, but this session is dirty: the client's timeline
+		// still holds every committed message and continues past it, so the
+		// uncertain turn was dropped rather than rewritten. That is exactly
+		// what opencode sends after a revert, a fork or a model switch, and
+		// it is the one shape with no plan at all: adoption and auto-resync
+		// have nothing to bind, the incoming history is not a rewrite, and
+		// every repeat has the same shape — so refusing would brick the chat
+		// permanently. Abandon the uncertain thread without delivery and
+		// seed fresh from the client's own timeline. Nothing is resent, no
+		// tool turn is re-run, and the new message is delivered.
+		if mm != nil || len(s.Messages) == 0 || len(req.Messages) <= len(s.Messages) {
+			if mm != nil {
+				log.Printf("[openai] session=%s rewrite-reseed refused: dirty session has no committed journal to continue from; keeping uncertainty", id)
+			}
+			return nil
+		}
+		// A retry of the SAME unanswered request is not a continuation: the
+		// client is asking again for a turn that may already have been
+		// submitted, and that turn is never resent. Only a request that
+		// departs from the pending one (revert + new message, or a rebuilt
+		// timeline) proves the client moved past the uncertain turn.
+		if pm := s.PendingRequest; pm != nil && len(req.Messages) == len(pm.Messages) && prefix(req.Messages, pm.Messages) {
+			log.Printf("[openai] session=%s rewrite-reseed refused: retry of the same uncertain request; never resubmitted", id)
+			return nil
+		}
+		log.Printf("[openai] session=%s rewrite-reseed continuation: committed journal is a prefix of the client history added=%d; uncertain turn abandoned without resubmission", id, len(req.Messages)-len(s.Messages))
+		kind = rewriteContinuation
+		mm = &prefixMismatch{Index: len(s.Messages), Field: "history.extension", ContentOff: -1}
+	} else if kind == rewriteAmbiguous {
 		if mm != nil {
 			log.Printf("[openai] session=%s rewrite-reseed refused: not a coherent rewrite (append or ambiguous); keeping uncertainty", id)
 		}

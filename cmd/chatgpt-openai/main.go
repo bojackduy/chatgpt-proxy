@@ -1430,7 +1430,23 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	}
 	url := s.URL
 	decision := "fresh"
-	if url != "" {
+	// An armed dirty reseed always abandons the old thread. When the client
+	// history is a canonical prefix-extension of the committed journal
+	// (revert/retry of the uncertain turn), the prefix test below would
+	// otherwise call it a delta and append to a thread that holds an
+	// abandoned turn. Rotate or seed fresh instead.
+	switch {
+	case reseedPlan != nil && !resync && prefix(req.Messages, s.Messages):
+		url = ""
+		if projectPerSessionEnabled() && id != "" {
+			if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
+				return
+			}
+			log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
+		}
+		decision = "rewrite-reseed"
+		log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+	case url != "":
 		if prefix(req.Messages, s.Messages) {
 			decision = "delta"
 			start = len(s.Messages)
