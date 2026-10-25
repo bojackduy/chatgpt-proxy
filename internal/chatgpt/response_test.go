@@ -1,6 +1,7 @@
 package chatgpt
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1213,5 +1214,226 @@ func TestBubbleOnlyDivergenceWaitsForExactSource(t *testing.T) {
 				t.Fatalf("bubbleOnlyDivergence(%q, %q) = %v, want %v", tc.srcPath, tc.userText, got, tc.want)
 			}
 		})
+	}
+}
+
+// shadowFixture builds the measured /backend-api/f/conversation frame shapes
+// with fabricated values. Field paths and operations mirror the live capture;
+// only the scalars are invented.
+func shadowFixture(prompt, answer string) []string {
+	msg := func(id, role, parent, text string) string {
+		return fmt.Sprintf(`{"p":"","o":"add","v":{"message":{"id":%q,"author":{"role":%q},"content":{"content_type":"text","parts":[%q]},"status":"finished_successfully","conversation_id":"conv-1","metadata":{"parent_id":%q}},"conversation_id":"conv-1","error":null}}`,
+			id, role, text, parent)
+	}
+	return []string{
+		msg("m-user", "user", "root", prompt),
+		// Continuation frames omit p/o and re-send the whole mapping.
+		fmt.Sprintf(`{"v":{"message":{"id":"m-rebase","author":{"role":"system"},"content":{"content_type":"text","parts":[""]},"conversation_id":"conv-1","metadata":{"parent_id":"m-user"}}},"c":1}`),
+		msg("m-rebase2", "system", "m-rebase", ""),
+		msg("m-answer", "assistant", "m-rebase2", answer),
+		// The measured completion patch is a grouped list of operations.
+		`{"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/metadata/is_complete","o":"replace","v":true},{"p":"/message/content/parts/0","o":"append","v":""}]}`,
+		`{"type":"message_stream_complete","conversation_id":"conv-1"}`,
+	}
+}
+
+func shadowStream(frames []string) string {
+	blocks := make([]string, 0, len(frames))
+	for _, f := range frames {
+		blocks = append(blocks, "event: delta\ndata: "+f+"\n\n")
+	}
+	return strings.Join(blocks, "") + "data: [DONE]\n\n"
+}
+
+func shadowFeed(t *testing.T, s *shadowCapture, raw string, chunk int) {
+	t.Helper()
+	for i := 0; i < len(raw); i += chunk {
+		end := i + chunk
+		if end > len(raw) {
+			end = len(raw)
+		}
+		s.feed([]byte(raw[i:end]))
+	}
+}
+
+// TestShadowStreamReconstruction pins the measured protocol: the answer is
+// rebuilt from whole-mapping frames plus grouped patches, and correlation
+// accepts only a prompt-anchored user message whose lineage reaches the
+// assistant. Off by default, and never a tool source.
+func TestShadowStreamReconstruction(t *testing.T) {
+	const prompt = "PROMPT-TEXT"
+	const answer = "exact answer \u00e9\u4e16"
+	cases := []struct {
+		name       string
+		raw        string
+		wantOK     bool
+		wantText   string
+		wantReason string
+	}{
+		{
+			name:     "full reconstruction matches byte for byte",
+			raw:      shadowStream(shadowFixture(prompt, answer)),
+			wantOK:   true,
+			wantText: answer,
+		},
+		{
+			name:     "UTF-8 and frames split across chunks",
+			raw:      shadowStream(shadowFixture(prompt, answer)),
+			wantOK:   true,
+			wantText: answer,
+		},
+		{
+			name:       "no explicit completion is inconclusive even at EOF",
+			raw:        strings.Join(strings.Split(shadowStream(shadowFixture(prompt, answer)), "message_stream_complete"), "x"),
+			wantReason: "no explicit completion",
+		},
+		{
+			name:       "different prompt cannot anchor",
+			raw:        shadowStream(shadowFixture("SOMETHING-ELSE", answer)),
+			wantReason: "no matching user message",
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Alternate one-byte feeding to exercise rune and frame splits.
+			chunk := 1
+			if i%2 == 1 {
+				chunk = 7
+			}
+			s := newShadowCapture(prompt)
+			shadowFeed(t, s, tc.raw, chunk)
+			ok, text, reason := s.result()
+			if ok != tc.wantOK {
+				t.Fatalf("correlated=%v reason=%q, want %v", ok, reason, tc.wantOK)
+			}
+			if tc.wantOK {
+				if text != tc.wantText {
+					t.Fatalf("reconstructed %q, want %q", text, tc.wantText)
+				}
+				return
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reason=%q, want %q", reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestShadowStreamLineageAndLimits proves a single-hop parent check is not
+// enough, that an unknown patch operation is refused rather than guessed, and
+// that the capture stays bounded.
+func TestShadowStreamLineageAndLimits(t *testing.T) {
+	t.Run("lineage crosses rebase messages", func(t *testing.T) {
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(shadowFixture("P", "A")), 64)
+		if ok, text, reason := s.result(); !ok || text != "A" {
+			t.Fatalf("expected lineage through rebase messages, got ok=%v reason=%q", ok, reason)
+		}
+	})
+
+	t.Run("broken lineage is not correlated", func(t *testing.T) {
+		frames := shadowFixture("P", "A")
+		// Point the assistant at a message that never appears.
+		frames[3] = strings.Replace(frames[3], `"parent_id":"m-rebase2"`, `"parent_id":"missing"`, 1)
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(frames), 64)
+		if ok, _, reason := s.result(); ok || reason != "assistant lineage" {
+			t.Fatalf("ok=%v reason=%q, want assistant lineage refusal", ok, reason)
+		}
+	})
+
+	t.Run("unknown operation on the answer is unsupported", func(t *testing.T) {
+		frames := shadowFixture("P", "A")
+		frames = append(frames[:len(frames)-1],
+			`{"p":"/message/content/parts/0","o":"move","v":"finished_successfully"}`,
+			frames[len(frames)-1])
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(frames), 64)
+		if ok, _, reason := s.result(); ok || reason != "unsupported patch" {
+			t.Fatalf("ok=%v reason=%q, want unsupported patch", ok, reason)
+		}
+	})
+
+	// One measured patch appends an object onto /message/metadata. That cannot
+	// change the answer or its lineage, so it is skipped and counted rather
+	// than refusing an otherwise exact reconstruction.
+	t.Run("inert metadata patch is skipped", func(t *testing.T) {
+		frames := shadowFixture("P", "A")
+		frames = append(frames[:len(frames)-1],
+			`{"p":"/message/metadata","o":"append","v":{"search_result_groups":[]}}`,
+			frames[len(frames)-1])
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(frames), 64)
+		ok, text, reason := s.result()
+		if !ok || text != "A" {
+			t.Fatalf("ok=%v text=%q reason=%q, want clean reconstruction", ok, text, reason)
+		}
+		if s.ignoredPatches != 1 {
+			t.Fatalf("ignoredPatches=%d, want 1", s.ignoredPatches)
+		}
+	})
+
+	t.Run("oversized stream stops at the byte limit", func(t *testing.T) {
+		s := newShadowCapture("P")
+		s.feed(bytes.Repeat([]byte("x"), shadowMaxBytes+1))
+		if ok, _, reason := s.result(); ok || reason != "byte limit" {
+			t.Fatalf("ok=%v reason=%q, want byte limit", ok, reason)
+		}
+	})
+
+	t.Run("invalid frame is refused", func(t *testing.T) {
+		s := newShadowCapture("P")
+		s.feed([]byte("data: not-json\n\n"))
+		if ok, _, reason := s.result(); ok || reason != "invalid frame" {
+			t.Fatalf("ok=%v reason=%q, want invalid frame", ok, reason)
+		}
+	})
+
+	t.Run("append grows the streamed part", func(t *testing.T) {
+		frames := shadowFixture("P", "first")
+		// Replace the no-op append with a real continuation of the same part.
+		frames[len(frames)-2] = `{"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":" second"}]}`
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(frames), 5)
+		ok, text, reason := s.result()
+		if !ok || text != "first second" {
+			t.Fatalf("ok=%v text=%q reason=%q, want appended text", ok, text, reason)
+		}
+	})
+
+	t.Run("concurrent captures stay isolated", func(t *testing.T) {
+		a := newShadowCapture("PROMPT-A")
+		b := newShadowCapture("PROMPT-B")
+		ra := shadowStream(shadowFixture("PROMPT-A", "answer-a"))
+		rb := shadowStream(shadowFixture("PROMPT-B", "answer-b"))
+		for i := 0; i < len(ra) || i < len(rb); i += 3 {
+			if i < len(ra) {
+				end := min(i+3, len(ra))
+				a.feed([]byte(ra[i:end]))
+			}
+			if i < len(rb) {
+				end := min(i+3, len(rb))
+				b.feed([]byte(rb[i:end]))
+			}
+		}
+		if ok, text, _ := a.result(); !ok || text != "answer-a" {
+			t.Fatalf("capture A got ok=%v text=%q", ok, text)
+		}
+		if ok, text, _ := b.result(); !ok || text != "answer-b" {
+			t.Fatalf("capture B got ok=%v text=%q", ok, text)
+		}
+	})
+}
+
+// TestShadowStreamIsOptIn pins the default: the shadow reader must not touch a
+// turn unless it was explicitly enabled.
+func TestShadowStreamIsOptIn(t *testing.T) {
+	t.Setenv("CHATGPT_BRIDGE_SHADOW_STREAM", "")
+	if shadowEnabled() {
+		t.Fatal("shadow reader must be off by default")
+	}
+	t.Setenv("CHATGPT_BRIDGE_SHADOW_STREAM", "1")
+	if !shadowEnabled() {
+		t.Fatal("explicit opt-in was ignored")
 	}
 }

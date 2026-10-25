@@ -950,6 +950,17 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	if err != nil {
 		return out, err
 	}
+	// The shadow reader is opt-in measurement only. It subscribes before the
+	// click so the response stream is captured from its first frame, and its
+	// result is compared after the turn. It never influences what is returned.
+	var shadow *shadowCapture
+	if shadowEnabled() {
+		var stopShadow func()
+		shadow, stopShadow = startShadowCapture(tab, opt.Prompt)
+		defer stopShadow()
+		// Registered as a closure: the comparison must see the final answer.
+		defer func() { reportShadow(shadow, id, out.Answer) }()
+	}
 	log.Printf("[chatgpt] target=%s submitting prompt...", chromedp.FromContext(tab).Target.TargetID)
 	// A click whose outcome is unknown must stay uncertain, so mark the attempt
 	// up front. submit still downgrades this to ErrNotSubmitted when the DOM

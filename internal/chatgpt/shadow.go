@@ -1,0 +1,602 @@
+package chatgpt
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
+)
+
+// The shadow reader is a measurement tool, not an answer source. It passively
+// decodes the browser's own SSE response for one generation request and
+// compares that reconstruction with the answer the DOM reader already
+// produced. It never decides what is delivered, never submits, never retries,
+// and never touches recovery state. Every log line is content-free.
+const (
+	shadowMaxFrames = 1000
+	shadowMaxBytes  = 2 << 20
+	shadowMaxHops   = 64
+	// streamResourceContent is required: an SSE response never reports
+	// loadingFinished here, and without it Chrome withholds the body.
+	shadowStreamTimeout = 15 * time.Second
+)
+
+// shadowEnabled reports whether the opt-in shadow reader is on. Off by
+// default; nothing in the answer path changes when it is off.
+func shadowEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CHATGPT_BRIDGE_SHADOW_STREAM"))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// shadowCapture decodes one stream. Fields are written under mu because CDP
+// events arrive on the tab's event loop while the request goroutine feeds data.
+type shadowCapture struct {
+	mu           sync.Mutex
+	prompt       string
+	conversation string
+	requestID    network.RequestID
+
+	buf    []byte
+	frames int
+	bytes  int
+
+	// Sticky patch cursor: the capture's frames omit p/o on continuation
+	// frames, exactly like the measured protocol.
+	lastOp   string
+	lastPath string
+
+	state   map[string]any
+	message map[string]any
+	// messages indexes every message object seen, and seen preserves arrival
+	// order so "newest matching message" is deterministic.
+	messages map[string]map[string]any
+	seen     []string
+
+	userID      string
+	userMatched bool
+	completion  string
+	done        bool
+
+	unsupported    bool
+	ignoredPatches int
+	reason         string
+}
+
+func newShadowCapture(prompt string) *shadowCapture {
+	return &shadowCapture{
+		prompt:   prompt,
+		state:    map[string]any{},
+		messages: map[string]map[string]any{},
+	}
+}
+
+// startShadowCapture subscribes to network events on the tab and returns a
+// capture already listening. It must run before the Send click.
+func startShadowCapture(tab context.Context, prompt string) (*shadowCapture, func()) {
+	s := newShadowCapture(prompt)
+	if err := chromedp.Run(tab, network.Enable()); err != nil {
+		log.Printf("[chatgpt-shadow] network enable failed; shadow disabled")
+		return nil, func() {}
+	}
+	// A listener is unregistered by cancelling the context it was bound to.
+	lctx, lcancel := context.WithCancel(tab)
+	chromedp.ListenTarget(lctx, func(ev any) { s.onEvent(tab, ev) })
+	return s, lcancel
+}
+
+func (s *shadowCapture) onEvent(tab context.Context, ev any) {
+	// A listener runs on the CDP event loop: a panic here would take the whole
+	// adapter down, so an opt-in measurement path fails closed instead.
+	defer func() {
+		if r := recover(); r != nil {
+			s.fail("listener panic")
+		}
+	}()
+	switch e := ev.(type) {
+	case *network.EventRequestWillBeSent:
+		if e.Request == nil || e.Request.Method != "POST" {
+			return
+		}
+		u := e.Request.URL
+		if !strings.HasPrefix(u, "https://chatgpt.com/backend-api/f/conversation") {
+			return
+		}
+		s.mu.Lock()
+		if s.requestID == "" {
+			s.requestID = e.RequestID
+		}
+		s.mu.Unlock()
+	case *network.EventResponseReceived:
+		s.mu.Lock()
+		match := s.requestID != "" && e.RequestID == s.requestID
+		s.mu.Unlock()
+		if !match || !strings.Contains(e.Response.MimeType, "text/event-stream") {
+			return
+		}
+		// The body is buffered until it is streamed; fetch the prefix off the
+		// event goroutine so CDP delivery is never blocked.
+		go func(id network.RequestID) {
+			ctx, cancel := context.WithTimeout(tab, shadowStreamTimeout)
+			defer cancel()
+			// The request body carries the conversation this turn continues.
+			// Only that one field is read; the prompt text is never logged.
+			_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+				post, err := network.GetRequestPostData(id).Do(ctx)
+				if err != nil {
+					return nil
+				}
+				var body struct {
+					ConversationID string `json:"conversation_id"`
+				}
+				if json.Unmarshal([]byte(post), &body) == nil && body.ConversationID != "" {
+					s.mu.Lock()
+					s.conversation = body.ConversationID
+					s.mu.Unlock()
+				}
+				return nil
+			}))
+			var buf []byte
+			if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+				var err error
+				buf, err = network.StreamResourceContent(id).Do(ctx)
+				return err
+			})); err != nil {
+				s.fail("stream unavailable")
+				return
+			}
+			s.feed(buf)
+		}(e.RequestID)
+	case *network.EventDataReceived:
+		s.mu.Lock()
+		match := s.requestID != "" && e.RequestID == s.requestID
+		s.mu.Unlock()
+		if !match {
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(e.Data)
+		if err != nil {
+			s.fail("invalid chunk")
+			return
+		}
+		s.feed(raw)
+	case *network.EventLoadingFailed:
+		s.mu.Lock()
+		match := s.requestID != "" && e.RequestID == s.requestID
+		s.mu.Unlock()
+		if match {
+			s.fail("stream aborted")
+		}
+	}
+}
+
+func (s *shadowCapture) fail(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason == "" {
+		s.reason = reason
+	}
+}
+
+// feed appends raw bytes and decodes every complete frame. Byte-level
+// accumulation is deliberate: a UTF-8 rune split across chunks must not be
+// decoded early, and frame boundaries are byte boundaries.
+func (s *shadowCapture) feed(chunk []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != "" || s.done {
+		return
+	}
+	s.bytes += len(chunk)
+	if s.bytes > shadowMaxBytes {
+		s.reason = "byte limit"
+		return
+	}
+	s.buf = append(s.buf, chunk...)
+	for {
+		i := bytes.Index(s.buf, []byte("\n\n"))
+		if i < 0 {
+			// Tolerate CRLF separators as well.
+			if j := bytes.Index(s.buf, []byte("\r\n\r\n")); j >= 0 {
+				s.block(string(s.buf[:j]))
+				s.buf = s.buf[j+4:]
+				continue
+			}
+			break
+		}
+		s.block(string(s.buf[:i]))
+		s.buf = s.buf[i+2:]
+		if s.done || s.reason != "" {
+			return
+		}
+	}
+	if len(s.buf) > 1<<16 {
+		s.reason = "frame limit"
+	}
+}
+
+func (s *shadowCapture) block(raw string) {
+	if s.frames++; s.frames > shadowMaxFrames {
+		s.reason = "frame limit"
+		return
+	}
+	var data []string
+	for _, line := range strings.Split(raw, "\n") {
+		if v, ok := strings.CutPrefix(line, "data:"); ok {
+			data = append(data, strings.TrimSpace(v))
+		}
+	}
+	if len(data) == 0 {
+		return
+	}
+	text := strings.Join(data, "\n")
+	if text == "[DONE]" {
+		s.done = true
+		return
+	}
+	var frame map[string]any
+	if err := json.Unmarshal([]byte(text), &frame); err != nil {
+		s.reason = "invalid frame"
+		return
+	}
+	s.frame(frame)
+}
+
+// frame mirrors the measured protocol: a frame either patches the message map
+// (p/o/v, with p and o sticky across frames) or carries a typed event.
+func (s *shadowCapture) frame(frame map[string]any) {
+	if _, ok := frame["o"].(string); ok {
+		s.lastOp, _ = frame["o"].(string)
+	}
+	if _, ok := frame["p"].(string); ok {
+		s.lastPath, _ = frame["p"].(string)
+	}
+	if _, hasV := frame["v"]; hasV {
+		s.patch(frame["v"])
+		s.index()
+		return
+	}
+	s.inspect(frame)
+}
+
+func (s *shadowCapture) patch(v any) {
+	// A grouped patch carries an ordered list of operations.
+	if s.lastOp == "patch" {
+		if list, ok := v.([]any); ok {
+			savedOp, savedPath := s.lastOp, s.lastPath
+			for _, item := range list {
+				op, ok := item.(map[string]any)
+				if !ok {
+					s.unsupported = true
+					continue
+				}
+				if o, ok := op["o"].(string); ok {
+					s.lastOp = o
+				}
+				if p, ok := op["p"].(string); ok {
+					s.lastPath = p
+				}
+				s.patchValue(s.lastPath, s.lastOp, op["v"])
+			}
+			s.lastOp, s.lastPath = savedOp, savedPath
+			return
+		}
+		s.unsupported = true
+		return
+	}
+	s.patchValue(s.lastPath, s.lastOp, v)
+}
+
+func (s *shadowCapture) patchValue(path, op string, v any) {
+	// The measured full-mapping frame replaces the whole state.
+	if path == "" || path == "/" {
+		switch op {
+		case "add", "replace":
+			if obj, ok := v.(map[string]any); ok {
+				s.state = obj
+				return
+			}
+		}
+		s.unsupported = true
+		return
+	}
+	keys := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if !setPath(s.state, keys, op, v) {
+		// One measured patch appends an object onto /message/metadata, which
+		// this reconstructor does not merge. That is safe to skip only when the
+		// path cannot change the answer body, the author, the message ID, or
+		// the parent link the lineage check depends on.
+		if patchIsInert(path) {
+			s.ignoredPatches++
+			return
+		}
+		s.unsupported = true
+	}
+}
+
+// patchIsInert reports whether an unapplied patch is unable to affect the
+// answer text or the identity chain used to verify it.
+func patchIsInert(path string) bool {
+	p := strings.TrimPrefix(path, "/")
+	switch {
+	case p == "message", p == "conversation_id":
+		return false
+	case strings.HasPrefix(p, "message/content"),
+		strings.HasPrefix(p, "message/author"),
+		strings.HasPrefix(p, "message/metadata/parent_id"),
+		strings.HasPrefix(p, "message/metadata/streaming_parent"),
+		strings.HasPrefix(p, "message/id"):
+		return false
+	}
+	return strings.HasPrefix(p, "message/")
+}
+
+// setPath applies one patch to the reconstructed state. Only the operations
+// actually observed are accepted; anything else is reported as unsupported
+// rather than guessed at.
+func setPath(root map[string]any, keys []string, op string, val any) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	var node any = root
+	for _, key := range keys[:len(keys)-1] {
+		next, ok := childOf(node, key)
+		if !ok {
+			return false
+		}
+		node = next
+	}
+	last := keys[len(keys)-1]
+	switch op {
+	case "append":
+		cur, ok := childOf(node, last)
+		if !ok {
+			return false
+		}
+		cs, ok1 := cur.(string)
+		vs, ok2 := val.(string)
+		if !ok1 || !ok2 {
+			return false
+		}
+		return setChild(node, last, cs+vs)
+	case "replace", "add":
+		return setChild(node, last, val)
+	}
+	return false
+}
+
+func childOf(node any, key string) (any, bool) {
+	switch t := node.(type) {
+	case map[string]any:
+		v, ok := t[key]
+		return v, ok
+	case []any:
+		i, err := strconv.Atoi(key)
+		if err != nil || i < 0 || i >= len(t) {
+			return nil, false
+		}
+		return t[i], true
+	}
+	return nil, false
+}
+
+func setChild(node any, key string, val any) bool {
+	switch t := node.(type) {
+	case map[string]any:
+		t[key] = val
+		return true
+	case []any:
+		i, err := strconv.Atoi(key)
+		if err != nil || i < 0 || i >= len(t) {
+			return false
+		}
+		t[i] = val
+		return true
+	}
+	return false
+}
+
+// index records the reconstructed mapping and the typed frames the correlation
+// depends on.
+func (s *shadowCapture) index() {
+	if m, ok := s.state["message"].(map[string]any); ok {
+		s.message = m
+	}
+	s.inspect(s.state)
+}
+
+func (s *shadowCapture) inspect(v map[string]any) {
+	if m, ok := v["message"].(map[string]any); ok {
+		s.remember(m)
+		s.message = m
+	}
+	if m, ok := v["input_message"].(map[string]any); ok {
+		s.remember(m)
+	}
+	if v["type"] == "message_stream_complete" {
+		if cid, ok := v["conversation_id"].(string); ok {
+			s.completion = cid
+		}
+		s.done = true
+	}
+}
+
+func (s *shadowCapture) remember(m map[string]any) {
+	id := idOf(m)
+	if id == "" {
+		return
+	}
+	if _, ok := s.messages[id]; !ok {
+		s.seen = append(s.seen, id)
+	}
+	s.messages[id] = m
+}
+
+func idOf(m map[string]any) string {
+	id, _ := m["id"].(string)
+	return id
+}
+
+func roleOf(m map[string]any) string {
+	author, ok := m["author"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	role, _ := author["role"].(string)
+	return role
+}
+
+// partsText returns the message body only when every part is a string and the
+// content is a text content type. Any other shape is not comparable.
+func partsText(m map[string]any) (string, bool) {
+	content, ok := m["content"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	parts, ok := content["parts"].([]any)
+	if !ok || len(parts) == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		str, ok := p.(string)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(str)
+	}
+	return b.String(), true
+}
+
+func parentOf(m map[string]any) string {
+	meta, ok := m["metadata"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if p, ok := meta["parent_id"].(string); ok {
+		return p
+	}
+	return ""
+}
+
+// result reports what this capture established. Correlation requires an exact
+// prompt-anchored user message, an assistant message that reaches it through
+// the parent chain, and an explicit completion for the same conversation.
+func (s *shadowCapture) result() (correlated bool, text string, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != "" {
+		return false, "", s.reason
+	}
+	if s.unsupported {
+		return false, "", "unsupported patch"
+	}
+	if s.completion == "" {
+		return false, "", "no explicit completion"
+	}
+	userID := s.promptUser()
+	if userID == "" {
+		return false, "", "no matching user message"
+	}
+	assistant := s.assistantFor(userID)
+	if assistant == nil {
+		return false, "", "assistant lineage"
+	}
+	conv, _ := assistant["conversation_id"].(string)
+	if conv != s.completion {
+		return false, "", "completion conversation mismatch"
+	}
+	if s.conversation != "" && conv != s.conversation {
+		return false, "", "conversation mismatch"
+	}
+	body, ok := partsText(assistant)
+	if !ok || body == "" {
+		return false, "", "answer not text"
+	}
+	return true, body, ""
+}
+
+// promptUser returns the newest user message whose text is exactly the prompt.
+// A history replay carries older user messages too, so arrival order decides.
+func (s *shadowCapture) promptUser() string {
+	for i := len(s.seen) - 1; i >= 0; i-- {
+		m := s.messages[s.seen[i]]
+		if roleOf(m) != "user" {
+			continue
+		}
+		if t, ok := partsText(m); ok && t == s.prompt {
+			return s.seen[i]
+		}
+	}
+	return ""
+}
+
+// assistantFor walks the parent chain from each assistant message back to the
+// prompt-anchored user message. Single-hop equality does not hold: rebase
+// system messages sit between them. Newest wins.
+func (s *shadowCapture) assistantFor(userID string) map[string]any {
+	for i := len(s.seen) - 1; i >= 0; i-- {
+		m := s.messages[s.seen[i]]
+		if roleOf(m) != "assistant" {
+			continue
+		}
+		if text, ok := partsText(m); !ok || text == "" {
+			continue
+		}
+		if s.reaches(m, userID) {
+			return m
+		}
+	}
+	return nil
+}
+
+func (s *shadowCapture) reaches(m map[string]any, userID string) bool {
+	seen := map[string]bool{}
+	cur := m
+	for hop := 0; hop < shadowMaxHops; hop++ {
+		parent := parentOf(cur)
+		if parent == "" {
+			return false
+		}
+		if parent == userID {
+			return true
+		}
+		if seen[parent] {
+			return false
+		}
+		seen[parent] = true
+		next, ok := s.messages[parent]
+		if !ok {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+// reportShadow emits one content-free line. It runs after the turn either way,
+// so a disabled, failed or unsupported capture is visible without affecting
+// the result.
+func reportShadow(s *shadowCapture, id, answer string) {
+	if s == nil {
+		return
+	}
+	correlated, text, reason := s.result()
+	matched := correlated && text == answer
+	s.mu.Lock()
+	frames, bytes, completed, ignored := s.frames, s.bytes, s.done, s.ignoredPatches
+	s.mu.Unlock()
+	log.Printf("[chatgpt-shadow] id=%s frames=%d bytes=%d completed=%v correlated=%v match=%v ignored=%d reason=%q",
+		id, frames, bytes, completed, correlated, matched, ignored, reason)
+}
