@@ -78,3 +78,23 @@ func TestRenderedMarkdownProtocolAndPersistence(t *testing.T) {
 		t.Fatalf("recovery/persisted cache Markdown mismatch: %#v", got)
 	}
 }
+
+func TestRenderPreambleMermaidSubset(t *testing.T) {
+	for _, want := range []string{
+		"```mermaid", "flowchart", "sequenceDiagram", "stateDiagram-v2",
+		"gantt", "gitGraph", "timeline", "classDiagram", "mindmap",
+		"markdown table or bullet list", "ASCII/Unicode art",
+	} {
+		if !strings.Contains(renderPreamble, want) {
+			t.Fatalf("preamble missing %q", want)
+		}
+	}
+	for _, banned := range []string{"SVG", "HTML", "CSS", "canvas"} {
+		if !strings.Contains(renderPreamble, banned) {
+			t.Fatalf("preamble must still ban %q", banned)
+		}
+	}
+	if strings.Contains(renderPreamble, "Never output") && strings.Contains(renderPreamble, "Mermaid markup") {
+		t.Fatal("preamble still bans Mermaid outright")
+	}
+}

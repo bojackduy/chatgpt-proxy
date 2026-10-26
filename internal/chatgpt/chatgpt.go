@@ -977,8 +977,12 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	if err == nil {
 		// Rasterize substantive answer SVGs to PNG bridge-side: the TUI
 		// demotes SVG to plain text while raster image parts preview.
-		// Best-effort; a nil result keeps the text fallback.
-		out.Images = c.rasterizeAnswerSVG(tab, answer, beforeIDs)
+		// Best-effort; a nil result keeps the text fallback. Skipped when
+		// the answer carries Mermaid source: the client renders the code
+		// itself, so a screenshot would only duplicate the diagram.
+		if !hasMermaidFence(answer) {
+			out.Images = c.rasterizeAnswerSVG(tab, answer, beforeIDs)
+		}
 	}
 	var url string
 	// Capture an uncertain submitted turn's URL even after request cancellation.

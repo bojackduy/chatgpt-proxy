@@ -1615,3 +1615,22 @@ func TestStreamCaptureDefault(t *testing.T) {
 		}
 	}
 }
+
+func TestHasMermaidFence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+		want  bool
+	}{
+		{"flowchart block", "Here:\n```mermaid\nflowchart TD\nA --> B\n```", true},
+		{"sequence block", "```mermaid\nsequenceDiagram\nA->>B: hi\n```\nDone.", true},
+		{"other fence", "```go\nfmt.Println(1)\n```", false},
+		{"inline ticks", "use `mermaid` inline", false},
+		{"indented fence", "  ```mermaid\nflowchart TD\n```", false},
+		{"plain prose", "no code here", false},
+	} {
+		if got := hasMermaidFence(tc.reply); got != tc.want {
+			t.Fatalf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}

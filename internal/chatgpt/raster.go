@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,17 @@ const (
 	maxRasterImages  = 4
 	maxRasterDataURL = 6 << 20 // ~4.5MB decoded PNG; diagrams land in the KBs
 )
+
+// mermaidFence matches a fenced Mermaid source block. The client renders
+// this subset itself, so the bridge returns the code as text and skips the
+// raster screenshot for the turn.
+var mermaidFence = regexp.MustCompile("(?m)^```mermaid")
+
+// hasMermaidFence reports whether the answer carries Mermaid source the
+// client can render, making a raster screenshot redundant.
+func hasMermaidFence(answer string) bool {
+	return mermaidFence.MatchString(answer)
+}
 
 // ValidRasterImage rejects anything that is not a bounded PNG data URL:
 // wrong media type, oversized payloads, undecodable base64, or bytes without

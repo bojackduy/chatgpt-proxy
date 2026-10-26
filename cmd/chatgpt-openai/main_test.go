@@ -838,7 +838,7 @@ func TestNavigateFailureDoesNotWedgeFreshSession(t *testing.T) {
 			h.statePath = filepath.Join(t.TempDir(), "state.json")
 			req := completionsRequest{Messages: []message{{Role: "user", Content: "first"}}}
 			if replay {
-				h.maxChars = 1200
+				h.maxChars = 1800
 				req.Messages = append(req.Messages, message{Role: "assistant", Content: strings.Repeat("already answered ", 300)}, message{Role: "user", Content: "new"})
 			}
 			f.turn = func(_ context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
@@ -1354,7 +1354,7 @@ func TestFreshLongHistoryReplaysInChunkedTurns(t *testing.T) {
 	// The budget must leave room for the per-turn head (tool/rendering preamble)
 	// plus the chunk envelope; otherwise pieces split mid-message and the
 	// codeword fragments instead of landing in the first replay chunk.
-	h.maxChars = 1200
+	h.maxChars = 1800
 	var msgs []message
 	for i := range 24 {
 		msgs = append(msgs, message{Role: "user", Content: fmt.Sprintf("turn %02d %s", i, strings.Repeat("x", 90))})
@@ -1404,7 +1404,7 @@ func TestFreshLongHistoryReplaysInChunkedTurns(t *testing.T) {
 func TestOversizedSingleMessageSplitToChunkBudget(t *testing.T) {
 	f := &fakeBackend{}
 	h := testHandler(f)
-	h.maxChars = 1000
+	h.maxChars = 1600
 	msgs := []message{
 		{Role: "user", Content: strings.Repeat("Z", 8000)},
 		{Role: "user", Content: "final question"},
@@ -1547,7 +1547,7 @@ func TestLargeCatchupAckAndDirtyResume(t *testing.T) {
 		t.Run(fmt.Sprint(badAck), func(t *testing.T) {
 			f := &fakeBackend{}
 			h := testHandler(f)
-			h.maxChars = 1100
+			h.maxChars = 1700
 			h.statePath = filepath.Join(t.TempDir(), "state.json")
 			req := completionsRequest{Messages: []message{{Role: "user", Content: "known"}}}
 			a := assistant(t, request(h, "large", req))
@@ -1665,7 +1665,7 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			f := &fakeBackend{}
 			h := testHandler(f)
-			h.maxChars = 2400
+			h.maxChars = 3000
 			h.statePath = filepath.Join(t.TempDir(), "sessions.json")
 			req := completionsRequest{Messages: []message{{Role: "user", Content: "known"}}}
 			a := assistant(t, request(h, "tools-gap", req))
