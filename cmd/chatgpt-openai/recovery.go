@@ -316,6 +316,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 500, serr)
 			return
 		}
+		log.Printf("[openai] session=%s bound completed empty final rejected class=%s; no calls delivered", id, rejectEmptyFinal)
 		apiError(w, 422, err)
 		return
 	}

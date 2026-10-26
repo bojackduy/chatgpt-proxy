@@ -870,7 +870,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 			probe, done := context.WithTimeout(c.tab, 2*time.Second)
 			defer done()
 			var url string
-			if chromedp.Run(probe, chromedp.Location(&url)) == nil && threadPattern.MatchString(url) {
+			if chromedp.Run(probe, chromedp.Location(&url)) == nil && ThreadPattern.MatchString(url) {
 				out.URL = url
 			}
 		}
@@ -1019,7 +1019,7 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (out TurnRe
 	if err := ctx.Err(); err != nil {
 		return TurnResult{}, err
 	}
-	if opt.URL != "" && !threadPattern.MatchString(opt.URL) {
+	if opt.URL != "" && !ThreadPattern.MatchString(opt.URL) {
 		return TurnResult{}, errors.New("invalid ChatGPT thread URL")
 	}
 	c.mu.Lock()
@@ -1066,13 +1066,13 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (out TurnRe
 		return TurnResult{URL: res.URL}, err
 	}
 	res.ProjectURL = projectURL
-	if !threadPattern.MatchString(res.URL) {
+	if !ThreadPattern.MatchString(res.URL) {
 		return TurnResult{}, errors.New("answer completed but no persistent thread URL; turn cannot be safely continued")
 	}
 	return res, nil
 }
 
-var threadPattern = regexp.MustCompile(`^https://chatgpt\.com/(?:g/g-p-[a-zA-Z0-9-]+/)?c/[a-zA-Z0-9-]+$`)
+var ThreadPattern = regexp.MustCompile(`^https://chatgpt\.com/(?:g/g-p-[a-zA-Z0-9-]+/)?c/[a-zA-Z0-9-]+$`)
 
 func (c *Client) waitPageReady(ctx context.Context, tab context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

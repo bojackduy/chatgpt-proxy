@@ -1260,6 +1260,23 @@ func shadowFeed(t *testing.T, s *shadowCapture, raw string, chunk int) {
 // rebuilt from whole-mapping frames plus grouped patches, and correlation
 // accepts only a prompt-anchored user message whose lineage reaches the
 // assistant. Off by default, and never a tool source.
+func TestShadowCombinedPromptCorrelation(t *testing.T) {
+	const prompt = "External client instructions\n{\"role\":\"system\",\"content\":\"context\"}\n{\"role\":\"user\",\"content\":\"latest question\"}\nProduce the next reply."
+	const answer = `<opencode_bridge_call>{"name":"run","arguments":{"command":"pwd"}}</opencode_bridge_call>`
+	s := newShadowCapture(prompt)
+	shadowFeed(t, s, shadowStream(shadowFixture(prompt, answer)), 17)
+	if ok, text, reason := s.result(); !ok || text != answer {
+		t.Fatalf("submitted combined prompt did not correlate: ok=%v bytes=%d reason=%q", ok, len(text), reason)
+	}
+	// An identical final user line in a different submitted transcript is
+	// not proof that this response belongs to the current browser turn.
+	other := newShadowCapture(strings.Replace(prompt, "context", "different context", 1))
+	shadowFeed(t, other, shadowStream(shadowFixture(prompt, answer)), 17)
+	if ok, _, _ := other.result(); ok {
+		t.Fatal("answer from a different combined prompt accepted")
+	}
+}
+
 func TestShadowStreamReconstruction(t *testing.T) {
 	const prompt = "PROMPT-TEXT"
 	const answer = "exact answer \u00e9\u4e16"

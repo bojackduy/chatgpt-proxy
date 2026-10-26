@@ -265,7 +265,7 @@ func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
 // preserving adoption error order.
 func (c *Client) snapshotThread(ctx context.Context, url string, expected ...string) (threadSnapshot, error) {
 	var snap threadSnapshot
-	if !threadPattern.MatchString(url) {
+	if !ThreadPattern.MatchString(url) {
 		return snap, errors.New("recovery requires a stored thread and exact original prompt")
 	}
 	ctx, cancelRead := context.WithTimeout(ctx, 90*time.Second)

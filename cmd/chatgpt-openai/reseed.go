@@ -215,28 +215,6 @@ func carryExecuted(s *session, pending []message, incoming []message) (carried [
 	return carried, carriedIDs, incomplete
 }
 
-// sentCompletedFor reports whether the sent-log records a completed
-// submission of the given prompt hash to the given thread by this session
-// (memory ring first, durable file tail on a miss). A completed-but-unbound
-// answer is load-bearing: the old thread holds a real answer that neither
-// adoption nor auto-resync could bind, so abandoning it silently would lose
-// work — fail closed to 409/422, never guess.
-func (h *handler) sentCompletedFor(session, url, promptHash string) bool {
-	entries := h.sentEntries()
-	for i := len(entries) - 1; i >= 0; i-- {
-		e := entries[i]
-		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
-			return true
-		}
-	}
-	for _, ln := range h.sentLogTail(300) {
-		if ln.Session == session && ln.URL == url && ln.Event == "completed" && ln.PromptHash == promptHash {
-			return true
-		}
-	}
-	return false
-}
-
 // planCleanReseed validates a rewrite reseed for a non-dirty session: the
 // incoming history is a coherent rewrite of committed state, so reseeding
 // fresh with carried executed results is safe. It returns nil for
@@ -263,22 +241,30 @@ func (h *handler) planCleanReseed(s *session, req completionsRequest) *rewritePl
 	}
 }
 
-// planDirtyReseed validates a rewrite reseed for a dirty session, after
-// tryAutoResync has already refused the interrupt shape. Unknown-state
-// items (the still-pending turn) are listed as NOT carried and the old
-// thread is abandoned without delivery — safe because an undelivered
-// answer caused no external execution. It returns nil (caller keeps
-// 409/422 with sent-log diagnosis) when the shape is not a coherent
-// rewrite, or when the unknown item is load-bearing: a verifiable
-// completed answer for the pending prompt exists on the old thread.
+// planDirtyReseed records the abandonment of an uncertain remote branch for a
+// dirty session. Unknown-state items (the still-pending turn) are listed as NOT
+// carried and the old thread is abandoned without delivery — safe because an
+// undelivered answer caused no external execution. Context continuity is best
+// effort, so this plan never gates the request: it returns nil when the shape
+// cannot be classified (retry of the same uncertain request, or a missing
+// journal) and the caller still proceeds from the client's own history.
 func (h *handler) planDirtyReseed(id string, s *session, req completionsRequest) *rewritePlan {
-	if s == nil || s.URL == "" {
+	if s == nil {
 		return nil
 	}
 	if s.incompleteJournal() {
 		return nil
 	}
-	kind, mm := classifyHistoryRewrite(req.Messages, s.Messages)
+	var kind string
+	var mm *prefixMismatch
+	if len(s.Messages) == 0 {
+		// No committed journal to rewrite: every incoming message is client
+		// history, so the fresh thread is a continuation, not a rewrite.
+		kind = rewriteContinuation
+		mm = &prefixMismatch{Index: 0, Field: "history.none", ContentOff: -1}
+	} else {
+		kind, mm = classifyHistoryRewrite(req.Messages, s.Messages)
+	}
 	if kind == "" {
 		// The committed journal is a canonical prefix of the incoming
 		// history. On a clean session that is ordinary append-only
@@ -292,9 +278,9 @@ func (h *handler) planDirtyReseed(id string, s *session, req completionsRequest)
 		// permanently. Abandon the uncertain thread without delivery and
 		// seed fresh from the client's own timeline. Nothing is resent, no
 		// tool turn is re-run, and the new message is delivered.
-		if mm != nil || len(s.Messages) == 0 || len(req.Messages) <= len(s.Messages) {
+		if mm != nil || len(req.Messages) <= len(s.Messages) {
 			if mm != nil {
-				log.Printf("[openai] session=%s rewrite-reseed refused: dirty session has no committed journal to continue from; keeping uncertainty", id)
+				log.Printf("[openai] session=%s continuation plan skipped: committed journal is not a prefix; proceeding from client history", id)
 			}
 			return nil
 		}
@@ -314,10 +300,6 @@ func (h *handler) planDirtyReseed(id string, s *session, req completionsRequest)
 		if mm != nil {
 			log.Printf("[openai] session=%s rewrite-reseed refused: not a coherent rewrite (append or ambiguous); keeping uncertainty", id)
 		}
-		return nil
-	}
-	if s.PendingPrompt != "" && h.sentCompletedFor(id, s.URL, promptHash(s.PendingPrompt)) {
-		log.Printf("[openai] session=%s rewrite-reseed refused: sent-log holds a completed answer for the pending prompt on thread %s that recovery could not bind (load-bearing); keeping uncertainty", id, s.URL)
 		return nil
 	}
 	var pendingMsgs []message

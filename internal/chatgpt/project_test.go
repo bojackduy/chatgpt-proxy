@@ -28,7 +28,7 @@ func TestProjectURLCacheAndValidation(t *testing.T) {
 
 func TestThreadURLValidation(t *testing.T) {
 	for _, url := range []string{"https://chatgpt.com/c/abc-123", "https://chatgpt.com/g/g-p-abc123/c/thread-123"} {
-		if !threadPattern.MatchString(url) {
+		if !ThreadPattern.MatchString(url) {
 			t.Fatalf("valid thread rejected: %s", url)
 		}
 	}

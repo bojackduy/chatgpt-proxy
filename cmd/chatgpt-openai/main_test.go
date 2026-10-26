@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -19,6 +21,11 @@ import (
 
 	"chatgpt-proxy/internal/chatgpt"
 )
+
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
 
 type fakeBackend struct {
 	prompts, urls []string
@@ -83,6 +90,58 @@ func (f *fakeBackend) LoginState(context.Context) (*chatgpt.Status, error) {
 func testHandler(f *fakeBackend) *handler {
 	return &handler{client: f, model: "chatgpt-web", maxChars: 512000, gate: make(chan struct{}, 1), sessions: map[string]*session{}}
 }
+
+// A distinct client request supersedes an uncertain remote branch. It must
+// start fresh without trying to recover a response the client never received.
+func TestBestEffortDirtyContinuationWithoutReadback(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("committed=%v", committed), func(t *testing.T) {
+			old := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "old unanswered request"}}}
+			next := old
+			next.Messages = append(append([]message(nil), old.Messages...), message{Role: "user", Content: "new request must continue"})
+			f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch()}
+			h := testHandler(f.fakeBackend)
+			h.client = f
+			s := &session{Dirty: true, Phase: "final", URL: "https://chatgpt.com/c/uncertain", PendingRequest: &old, PendingPrompt: "old prompt"}
+			if committed {
+				s.Messages = []message{{Role: "user", Content: "committed question"}, {Role: "assistant", Content: "committed answer"}}
+				next.Messages = append(append([]message(nil), s.Messages...), next.Messages...)
+			}
+			h.sessions["continuation"] = s
+			w := request(h, "continuation", next)
+			if f.reads != 0 || f.latests != 0 {
+				t.Fatalf("new request performed mandatory readback: exact=%d latest=%d", f.reads, f.latests)
+			}
+			if w.Code != 200 {
+				t.Fatalf("new request did not continue: status=%d", w.Code)
+			}
+			if len(f.urls) == 0 || f.urls[0] != "" {
+				t.Fatalf("uncertain remote thread reused: submissions=%d", len(f.urls))
+			}
+			if !strings.Contains(strings.Join(f.prompts, "\n"), "new request must continue") {
+				t.Fatal("new user message was lost")
+			}
+		})
+	}
+}
+
+func TestBestEffortIdenticalUncertainRetryNeverSubmits(t *testing.T) {
+	old := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "uncertain request"}}}
+	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch()}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.sessions["retry"] = &session{Dirty: true, Phase: "final", URL: "https://chatgpt.com/c/uncertain", PendingRequest: &old, PendingPrompt: "original prompt"}
+	// Changing only the model cannot make an uncertain submission safe to send.
+	retry := old
+	retry.Model = "another-model"
+	w := request(h, "retry", retry)
+	if len(f.prompts) != 0 || w.Code == 200 {
+		t.Fatalf("identical uncertain retry submitted: count=%d status=%d", len(f.prompts), w.Code)
+	}
+	if f.reads != 0 || f.latests != 0 {
+		t.Fatalf("ordinary retry performed implicit recovery: exact=%d latest=%d", f.reads, f.latests)
+	}
+}
 func request(h *handler, id string, req completionsRequest) *httptest.ResponseRecorder {
 	b, _ := json.Marshal(req)
 	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b))
@@ -102,7 +161,7 @@ const weatherAnswer = "<opencode_bridge_call>\n{\"name\":\"get_weather\",\"argum
 func assistant(t *testing.T, w *httptest.ResponseRecorder) message {
 	t.Helper()
 	if w.Code != 200 {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		t.Fatalf("status %d: %.100s", w.Code, w.Body.String())
 	}
 	var v struct {
 		Choices []struct {
@@ -321,6 +380,9 @@ func TestMalformedCalls(t *testing.T) {
 			}
 			reader := &inspectBackend{fakeBackend: f, answer: weatherAnswer, expected: s.PendingPrompt}
 			loaded.client = reader
+			if w := recoveryRequest(loaded, &req, "repair-uncertain"); w.Code != 200 {
+				t.Fatal("explicit repair recovery failed", w.Code)
+			}
 			a := assistant(t, request(loaded, "repair-uncertain", req))
 			dup := assistant(t, request(loaded, "repair-uncertain", req))
 			if reader.reads != 1 || len(f.prompts) != 2 || a.ToolCalls[0].ID != dup.ToolCalls[0].ID || loaded.sessions["repair-uncertain"].RepairFingerprint != requestFingerprint(req) {

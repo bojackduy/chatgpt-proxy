@@ -31,13 +31,16 @@ func (f *inspectBackend) ReadThreadTurn(ctx context.Context, url, prompt string)
 	}
 	return chatgpt.TurnResult{Answer: f.answer, Images: f.images, URL: url}, f.readErr
 }
-func recoveryRequest(h *handler, req *completionsRequest) *httptest.ResponseRecorder {
+func recoveryRequest(h *handler, req *completionsRequest, ids ...string) *httptest.ResponseRecorder {
 	var b []byte
 	if req != nil {
 		b, _ = json.Marshal(req)
 	}
 	r := httptest.NewRequest("POST", "/v1/sessions/recover", bytes.NewReader(b))
 	r.Header.Set("X-Session-Id", "recover")
+	if len(ids) > 0 {
+		r.Header.Set("X-Session-Id", ids[0])
+	}
 	w := httptest.NewRecorder()
 	h.routes().ServeHTTP(w, r)
 	return w
@@ -127,12 +130,18 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 	if err := loaded.load(); err != nil || loaded.sessions["recover"].Dirty {
 		t.Fatal("recovery not durable", err)
 	}
-	// Normal completions also adopt the exact interrupted turn once and cache
+	// Explicit recovery adopts the exact interrupted turn once and caches
 	// stable call IDs; the subsequent consumer tool result is a delta, not replay.
 	f2 := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{"weather observed"}}, answer: weatherAnswer, expected: "exact pending prompt"}
 	h2 := testHandler(f2.fakeBackend)
 	h2.client = f2
 	h2.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f2.expected}
+	if w := request(h2, "auto", req); w.Code != 422 || f2.reads != 0 || len(f2.prompts) != 0 {
+		t.Fatal("identical uncertain retry read or submitted")
+	}
+	if w := recoveryRequest(h2, &req, "auto"); w.Code != 200 {
+		t.Fatal("explicit recovery failed", w.Code)
+	}
 	a := assistant(t, request(h2, "auto", req))
 	b := assistant(t, request(h2, "auto", req))
 	if f2.reads != 1 || len(f2.prompts) != 0 || len(a.ToolCalls) != 1 || a.ToolCalls[0].ID != b.ToolCalls[0].ID || h2.sessions["auto"].Dirty {
@@ -194,14 +203,14 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 			w := httptest.NewRecorder()
 			h.routes().ServeHTTP(w, r)
 			got := assistant(t, w)
-			if contentText(got) != "continue after Muse" || len(got.ToolCalls) != 0 || f.reads != 1 || len(f.prompts) != 1 || f.urls[0] != "https://chatgpt.com/c/stored" {
+			if contentText(got) != "continue after Muse" || len(got.ToolCalls) != 0 || f.reads != 0 || len(f.prompts) != 1 || f.urls[0] != "" {
 				t.Fatal("switch-back returned original calls or failed catchup", w.Body.String())
 			}
 			p := f.prompts[0]
-			if strings.Contains(p, renderMsg(pending.Messages[len(pending.Messages)-1])) || strings.Contains(p, out.Calls[0].ID+`","type":"function"`) || strings.Count(p, "Muse completed") != 1 || strings.Count(p, "muse-call") != 2 || !strings.Contains(p, toolPrompt(current)) || strings.Index(p, "what now?") < strings.Index(p, historyEnd) {
+			if strings.Count(p, "Muse completed") != 1 || strings.Count(p, "muse-call") != 2 || !strings.Contains(p, toolPrompt(current)) || strings.Index(p, "what now?") < strings.Index(p, historyEnd) {
 				t.Fatal("switch gap duplicated or schema/current request misplaced", p)
 			}
-			if retry := request(h, "switch-back", current); retry.Body.String() != w.Body.String() || len(f.prompts) != 1 || f.reads != 1 {
+			if retry := request(h, "switch-back", current); retry.Body.String() != w.Body.String() || len(f.prompts) != 1 || f.reads != 0 {
 				t.Fatal("switch-back retry resubmitted")
 			}
 			loaded := testHandler(&fakeBackend{})
@@ -354,6 +363,9 @@ func TestAutoResyncRecognizedShape(t *testing.T) {
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
 	h.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
 	h.appendSent(sentEntry{Event: "completed", Session: "auto", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	if recovered := recoveryRequest(h, &req, "auto"); recovered.Code != 200 {
+		t.Fatal("explicit resync recovery failed", recovered.Code)
+	}
 	w := request(h, "auto", req)
 	got := assistant(t, w)
 	if len(got.ToolCalls) != 1 || f.latests != 1 || len(f.prompts) != 0 {
@@ -399,6 +411,9 @@ func TestAutoResyncTransplantsRasterImages(t *testing.T) {
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
 	h.sessions["auto"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: "newer retry prompt H3", Messages: req.Messages[:1]}
 	h.appendSent(sentEntry{Event: "completed", Session: "auto", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	if recovered := recoveryRequest(h, &req, "auto"); recovered.Code != 200 {
+		t.Fatal("explicit raster recovery failed", recovered.Code)
+	}
 	w := request(h, "auto", req)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "data:image/png;base64,") {
 		t.Fatalf("auto-resync transplant dropped raster images: %d %s", w.Code, w.Body.String())
@@ -488,6 +503,10 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 			var w *httptest.ResponseRecorder
 			if automatic {
 				w = request(h, "recover", req)
+				if w.Code != 422 || f.reads != 0 || len(f.prompts) != 0 || !s.Dirty {
+					t.Fatal("uncertain retry performed implicit recovery")
+				}
+				w = recoveryRequest(h, nil)
 			} else {
 				w = recoveryRequest(h, nil)
 			}
@@ -527,8 +546,8 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 		s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected, Fingerprint: "previous-delivered"}
 		h.sessions["auto-save-failure"] = s
 		for range 2 {
-			w := request(h, "auto-save-failure", req)
-			if w.Code != 422 || !s.Dirty || s.Phase != "final" || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Fingerprint != "previous-delivered" || len(s.Messages) != 0 || len(s.Result.Calls) != 0 || len(f.prompts) != 0 {
+			w := recoveryRequest(h, &req, "auto-save-failure")
+			if w.Code == 200 || !s.Dirty || s.Phase != "final" || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Fingerprint != "previous-delivered" || len(s.Messages) != 0 || len(s.Result.Calls) != 0 || len(f.prompts) != 0 {
 				t.Fatal("failed adoption lost original binding or submitted", w.Code)
 			}
 		}
@@ -536,12 +555,12 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 			t.Fatal("failed save prevented a subsequent read-only recovery")
 		}
 		f.readErr = chatgpt.ErrCompletedEmpty
-		if w := request(h, "auto-save-failure", req); w.Code != 422 || !s.Dirty || s.Phase != "final" || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Fingerprint != "previous-delivered" || len(f.prompts) != 0 {
+		if w := recoveryRequest(h, &req, "auto-save-failure"); w.Code == 200 || !s.Dirty || s.Phase != "final" || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Fingerprint != "previous-delivered" || len(f.prompts) != 0 {
 			t.Fatal("failed empty rejection discarded pending binding")
 		}
 	})
-	// A completed alternative-model transcript cannot prove the browser turn
-	// finished. Mismatch is terminal, bounded, and leaves the ORIGINAL journal.
+	// Alternative-model history is authoritative for a new branch, without
+	// claiming the unknown browser turn finished or reading it back.
 	for _, reason := range []string{"stored user prompt does not exactly match original request", "ambiguous multiple assistant responses after stored user prompt"} {
 		req := weatherReq()
 		f := &inspectBackend{fakeBackend: &fakeBackend{}, expected: "original pending prompt", readErr: errors.New(reason)}
@@ -553,8 +572,8 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 		current.Tools, current.ToolChoice = nil, "auto"
 		current.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: "Muse completed"}, message{Role: "user", Content: "what now?"})
 		w := request(h, "switch-unknown", current)
-		if w.Code != 422 || f.reads != 1 || len(f.prompts) != 0 || !s.Dirty || s.PendingRequest != &req || s.PendingPrompt != f.expected || s.Phase != "final" || !strings.Contains(w.Body.String(), "/v1/sessions/resync") {
-			t.Fatal("unverified switch-back cleared/replaced pending or resubmitted", w.Code, w.Body.String())
+		if w.Code != 200 || f.reads != 0 || len(f.prompts) != 1 || f.urls[0] != "" || h.sessions["switch-unknown"].Dirty || !strings.Contains(f.prompts[0], "what now?") || !s.Dirty || s.PendingRequest != &req {
+			t.Fatal("distinct switch-back did not fresh-seed without reading unknown turn", w.Code)
 		}
 	}
 	for _, mode := range []string{"mismatch", "invalid-tools", "invalid-answer", "unavailable", "save-failure"} {
@@ -719,63 +738,81 @@ func TestDirtyContinuationReseedsInsteadOfBricking(t *testing.T) {
 	}
 }
 
-func TestDirtyContinuationLoadBearingKeepsUncertainty(t *testing.T) {
-	// Same canonical prefix-extension shape, but the sent log holds a
-	// COMPLETED answer for the pending prompt on the old thread: abandoning
-	// it would lose real work, so the continuation still refuses.
+func TestDirtyContinuationAbandonsLoadBearingUncertainty(t *testing.T) {
+	// Same canonical prefix-extension shape, and the sent log holds a
+	// COMPLETED answer for the pending prompt. Continuity is still best
+	// effort: the client's history is authoritative, that unknown answer is
+	// never adopted, read back or read-latest, and the new message must be
+	// delivered on a fresh thread.
 	h1 := "first submission prompt H1 with full context"
 	req := weatherReq()
 	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer, latestErr: errors.New("stored thread holds no complete assistant answer to transplant")}
 	h := testHandler(f.fakeBackend)
 	h.client = f
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	oldURL := "https://chatgpt.com/c/stored"
 	saved := []message{{Role: "user", Content: "first"}, {Role: "assistant", Content: "ok"}}
-	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: saved}
-	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	h.sessions["recover"] = &session{URL: oldURL, Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: saved}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: oldURL, PromptHash: promptHash(h1), Bytes: len(h1)})
 	next := completionsRequest{Messages: append(append([]message{}, saved...), message{Role: "user", Content: "next"}), ToolChoice: "none"}
 	if !prefix(next.Messages, saved) {
 		t.Fatal("test setup is not a canonical prefix-extension")
 	}
-	if w := request(h, "recover", next); w.Code != 422 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
-		t.Fatalf("load-bearing continuation abandoned uncertainty: %d %s", w.Code, w.Body.String())
+	got := assistant(t, request(h, "recover", next))
+	if contentText(got) != "OK" || len(got.ToolCalls) != 0 {
+		t.Fatalf("uncertain answer was adopted: %+v", got)
+	}
+	if f.reads != 0 || f.latests != 0 {
+		t.Fatalf("continuation performed a readback: exact=%d latest=%d", f.reads, f.latests)
 	}
 	s := h.sessions["recover"]
-	if !s.Dirty || s.Phase != "final" || s.PendingPrompt != h1 || s.ReseedEvidence != "" || s.ReseedFrom != "" {
-		t.Fatalf("load-bearing continuation changed the journal: %+v", s)
+	if s.Dirty || s.Phase != "" || s.PendingPrompt != "" || s.ReseedFrom != oldURL {
+		t.Fatalf("continuation left uncertainty behind: %+v", s)
 	}
-	if w := recoveryRequest(h, nil); w.Code != 409 || !h.sessions["recover"].Dirty {
-		t.Fatalf("load-bearing continuation recover lost diagnosis or Dirty: %d %s", w.Code, w.Body.String())
+	for _, want := range []string{"rewrite-continuation", "old=" + oldURL, "new=" + s.URL, "pending:", "outcome unknown"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
+	}
+	if len(f.prompts) != 1 || !strings.Contains(f.prompts[0], "next") {
+		t.Fatalf("new message not delivered on a fresh thread: prompts=%d", len(f.prompts))
 	}
 }
 
-func TestDirtyRewriteReseedLoadBearingKeepsUncertainty(t *testing.T) {
+func TestDirtyRewriteReseedAbandonsLoadBearingUncertainty(t *testing.T) {
 	// A verifiable completed answer for the still-pending prompt exists on
-	// the old thread, but adoption fails structurally and auto-resync
-	// cannot transplant it. That unknown is load-bearing: a coherent
-	// rewrite must NOT abandon it silently — completions keeps terminal
-	// 422 and recover keeps 409, both with the sent-log diagnosis, Dirty
-	// untouched, nothing submitted.
+	// the old thread. A coherent rewrite is distinct client history, so it
+	// must NOT be refused: the old thread is abandoned (never read, never
+	// adopted), the pending turn is listed as not-carried, and the rewritten
+	// transcript is delivered on a fresh thread.
 	const h1 = "first submission prompt H1 with full context"
 	req := weatherReq()
 	f := &resyncBackend{fakeBackend: &fakeBackend{}, mismatch: structuralMismatch(), latestUser: h1, latestAnswer: weatherAnswer, latestErr: errors.New("stored thread holds no complete assistant answer to transplant")}
 	h := testHandler(f.fakeBackend)
 	h.client = f
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
-	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: req.Messages[:1]}
-	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: "https://chatgpt.com/c/stored", PromptHash: promptHash(h1), Bytes: len(h1)})
+	oldURL := "https://chatgpt.com/c/stored"
+	h.sessions["recover"] = &session{URL: oldURL, Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: h1, Messages: req.Messages[:1]}
+	h.appendSent(sentEntry{Event: "completed", Session: "recover", URL: oldURL, PromptHash: promptHash(h1), Bytes: len(h1)})
 	rewritten := completionsRequest{Messages: []message{{Role: "user", Content: "something else entirely"}}, ToolChoice: "none"}
-	if w := request(h, "recover", rewritten); w.Code != 422 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
-		t.Fatalf("load-bearing rewrite abandoned uncertainty: %d %s", w.Code, w.Body.String())
+	got := assistant(t, request(h, "recover", rewritten))
+	if contentText(got) != "OK" || len(got.ToolCalls) != 0 {
+		t.Fatalf("load-bearing answer was adopted: %+v", got)
+	}
+	if f.reads != 0 || f.latests != 0 {
+		t.Fatalf("rewrite performed a readback: exact=%d latest=%d", f.reads, f.latests)
 	}
 	s := h.sessions["recover"]
-	if !s.Dirty || s.Phase != "final" || s.PendingPrompt != h1 || s.ReseedEvidence != "" || s.ReseedFrom != "" {
-		t.Fatalf("load-bearing 422 changed the journal: %+v", s)
+	if s.Dirty || s.Phase != "" || s.PendingPrompt != "" || s.ReseedFrom != oldURL {
+		t.Fatalf("rewrite left uncertainty behind: %+v", s)
 	}
-	if w := recoveryRequest(h, nil); w.Code != 409 || !strings.Contains(w.Body.String(), "sent-log:") || len(f.prompts) != 0 {
-		t.Fatalf("load-bearing recover lost diagnosis: %d %s", w.Code, w.Body.String())
+	for _, want := range []string{"rewrite-divergence", "old=" + oldURL, "new=" + s.URL, "pending:", "outcome unknown"} {
+		if !strings.Contains(s.ReseedEvidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, s.ReseedEvidence)
+		}
 	}
-	if !h.sessions["recover"].Dirty {
-		t.Fatal("load-bearing 409 cleared Dirty")
+	if len(f.prompts) != 1 || !strings.Contains(f.prompts[0], "something else entirely") {
+		t.Fatalf("rewritten transcript not delivered: prompts=%d", len(f.prompts))
 	}
 }
 
@@ -870,12 +907,12 @@ func TestCompletedEmptyFinalIsReportedAsEmptyNotRefused(t *testing.T) {
 	log.SetOutput(&logs)
 	defer log.SetOutput(prev)
 
-	w := request(h, "recover", req)
+	w := recoveryRequest(h, &req)
 	if w.Code != 422 || s.Dirty || s.Phase != "invalid" || len(f.prompts) != 0 || len(s.Result.Calls) != 0 {
 		t.Fatalf("completed empty final not durably rejected: %d %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "finished without producing an answer") {
+	if !strings.Contains(body, "completed empty final response") {
 		t.Fatalf("empty final misreported: %s", body)
 	}
 	if strings.Contains(body, "could not be used") {

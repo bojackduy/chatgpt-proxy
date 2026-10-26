@@ -798,7 +798,7 @@ func (h *handler) requestFormatRepair(r *http.Request, id, lane, url string, req
 		// The repair itself went uncertain. Leave the journal bound to the
 		// repair prompt: the next client retry adopts it read-only, exactly
 		// as for any other interrupted turn. Never resubmit blindly.
-		if res.URL != "" && strings.Contains(res.URL, "/c/") {
+		if res.URL != "" && chatgpt.ThreadPattern.MatchString(res.URL) {
 			s.URL = res.URL
 			_ = h.save()
 		}
@@ -1332,45 +1332,58 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var reseedPlan *rewritePlan
-	if s.Dirty && !resync {
+	// An interrupted replay turn is inert ACK history import on the same
+	// thread, so it resumes as an ordinary delta: nothing executed, nothing
+	// uncertain. Continuity planning applies only to an uncertain final turn.
+	if s.Dirty && !resync && s.Phase != "replay" {
+		pending := s.PendingRequest
 		if s.incompleteJournal() {
 			incompleteJournalError(w)
 			return
 		}
-		if s.Phase == "replay" {
-			// The final answer-seeking turn was never submitted and replay
-			// chunks are inert history imports: the request can proceed and
-			// the normal delta machinery resumes the import. Duplicating an
-			// inert chunk is harmless; no tool turn can execute twice.
-			log.Printf("[openai] session=%s resuming interrupted replay without 409; final turn never submitted", id)
-		} else if adopted, mismatch := h.tryAdoptInterrupted(r, id, s); adopted {
-			// Adopted the completed answer above; fall through to normal
-			// processing (exact retries hit the duplicate cache below).
-			log.Printf("[openai] session=%s adopted interrupted final turn; continuing request", id)
-		} else if h.tryAutoResync(r, id, s, mismatch) {
-			// Transplanted the thread's real answer for the recognized
-			// pending-overwritten-by-retry shape; fall through to normal
-			// processing (exact retries hit the duplicate cache below).
-			log.Printf("[openai] session=%s auto-resynced recognized desync shape; continuing request", id)
-		} else if plan := h.planDirtyReseed(id, s, req); plan != nil {
-			// Coherent history rewrite over uncertainty: the client's
-			// current timeline supersedes the pending turn, whose answer
-			// was never delivered (so it caused no external execution).
-			// Abandon the old thread without adoption and continue below
-			// as a fresh reseed; the commit records the linkage. A
-			// load-bearing unknown (a verifiable completed answer for the
-			// pending prompt) refuses above and keeps terminal 422.
-			reseedPlan = plan
-			log.Printf("[openai] session=%s rewrite-reseed armed classification=%s carried=%d not_carried=%d; abandoning uncertain thread without adoption", id, plan.classification, len(plan.carriedIDs), len(plan.notCarried))
-		} else {
-			// Installed v2 retries HTTP409 as provider.internal. This request
-			// cannot safely progress without recovery, so return terminal422
-			// while retaining the exact same uncertainty/adoption protections.
-			// The chat-visible sentence stays actionable; the operator runbook
-			// lives in error.details and the log, never in the message.
+		if pending == nil && s.Phase != "replay" {
+			incompleteJournalError(w)
+			return
+		}
+		// A different model or tool schema is not a new user request. Never
+		// send an identical uncertain transcript again. Missing provenance
+		// also cannot establish that a submission is distinct.
+		same := pending == nil || (len(req.Messages) == len(pending.Messages) && prefix(req.Messages, pending.Messages))
+		if !same && pending != nil {
+			withoutSystem := func(messages []message) []message {
+				var out []message
+				for _, m := range messages {
+					if m.Role != "system" {
+						out = append(out, m)
+					}
+				}
+				return out
+			}
+			incoming, original := withoutSystem(req.Messages), withoutSystem(pending.Messages)
+			same = len(incoming) == len(original) && prefix(incoming, original)
+		}
+		if same && s.Phase != "replay" {
 			h.uncertainFailure(w, id, s)
 			return
 		}
+		if !coherentTranscript(req.Messages) {
+			h.uncertainFailure(w, id, s)
+			return
+		}
+		// Context continuity is best effort: the client's history is
+		// authoritative, so a distinct request proceeds immediately and the
+		// old branch is never read back. The plan records what is abandoned
+		// (executed exchanges are carried inertly; the undelivered turn is
+		// listed, never resent), but a missing or unverifiable old answer is
+		// not a reason to refuse the new request.
+		reseedPlan = h.planDirtyReseed(id, s, req)
+		next := *s
+		next.URL, next.Messages, next.ToolsFP = "", nil, ""
+		next.Fingerprint, next.Result = "", result{}
+		next.Dirty, next.Phase = false, ""
+		next.PendingRequest, next.PendingPrompt = nil, ""
+		s = &next
+		log.Printf("[openai] continuation reason=uncertain_branch incoming_messages=%d planned=%v", len(req.Messages), reseedPlan != nil)
 	}
 	if s.RejectedFingerprint == fingerprint || (s.Phase == "invalid" && s.Fingerprint == fingerprint) {
 		apiError(w, 422, errors.New(rejectionAdvice(s.RejectReason)))
