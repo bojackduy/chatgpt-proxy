@@ -2606,3 +2606,24 @@ func TestParallelDraftIsolationAndHandoff(t *testing.T) {
 		t.Fatal("handoff request was not isolated")
 	}
 }
+
+func TestProtocolReasonCodeIsContentFree(t *testing.T) {
+	for msg, want := range map[string]string{
+		"malformed tool JSON: unexpected end":                    "malformed_json",
+		"tool arguments must be a JSON object":                   "bad_arguments",
+		`tool name "evil" is not allowed by tools/tool_choice`:   "disallowed_tool",
+		"tool run arguments: missing required":                   "schema_violation",
+		"incomplete opencode_bridge_call wrapper":                "incomplete_wrapper",
+		"bridge calls must not appear in Markdown code examples": "fenced_calls",
+		"backend did not honor required tool_choice":             "ignored_tool_choice",
+		"completed model output contains no actionable answer":   "empty_answer",
+		"something else entirely":                                "protocol_error",
+	} {
+		if got := protocolReasonCode(errors.New(msg)); got != want {
+			t.Fatalf("protocolReasonCode(%q) = %q, want %q", msg, got, want)
+		}
+	}
+	if got := protocolReasonCode(nil); got != "ok" {
+		t.Fatalf("protocolReasonCode(nil) = %q, want ok", got)
+	}
+}

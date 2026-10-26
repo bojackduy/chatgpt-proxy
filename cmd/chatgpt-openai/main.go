@@ -817,6 +817,38 @@ func (h *handler) requestFormatRepair(r *http.Request, id, lane, url string, req
 	return res, repairCompleted
 }
 
+// protocolReasonCode classifies a parseAnswer failure into a content-free
+// reason code for the log. The rejected text itself is never logged; the
+// code names only which validation branch fired so the next "why was my
+// turn refused" has an answer without re-running anything.
+func protocolReasonCode(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "malformed tool JSON"):
+		return "malformed_json"
+	case strings.Contains(msg, "tool arguments must be a JSON object"):
+		return "bad_arguments"
+	case strings.Contains(msg, "is not allowed by tools/tool_choice"),
+		strings.Contains(msg, "tool name"):
+		return "disallowed_tool"
+	case strings.Contains(msg, "arguments:"):
+		return "schema_violation"
+	case strings.Contains(msg, "incomplete opencode_bridge_call"):
+		return "incomplete_wrapper"
+	case strings.Contains(msg, "must not appear in Markdown"):
+		return "fenced_calls"
+	case strings.Contains(msg, "did not honor"):
+		return "ignored_tool_choice"
+	case strings.Contains(msg, "no actionable answer"):
+		return "empty_answer"
+	default:
+		return "protocol_error"
+	}
+}
+
 func answerInstruction(req completionsRequest) string {
 	return "\nNow produce the next assistant reply for the external client. Tool choice: " + toolChoiceText(req.ToolChoice) + ". A required/named tool means output the opencode_bridge_call JSON wrapper now, as TEXT for external execution.\n"
 }
@@ -1691,7 +1723,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		log.Printf("[openai] invalid tool protocol session=%s thread=%s", id, url)
+		log.Printf("[openai] invalid tool protocol session=%s thread=%s reason=%s", id, url, protocolReasonCode(err))
 		apiError(w, 422, errors.New(failureText(rejectionUnknown(rejectToolProtocol), nextNewMessage)))
 		return
 	}
