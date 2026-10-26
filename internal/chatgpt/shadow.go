@@ -387,7 +387,15 @@ func setPath(root map[string]any, keys []string, op string, val any) bool {
 		}
 		return setChild(node, last, cs+vs)
 	case "replace", "add":
+		// A trailing "-" addresses the end of an array. The reconstructor
+		// holds slices by value, so an append would not persist into the
+		// parent without a larger refactor; report it rather than guess.
+		if last == "-" {
+			return false
+		}
 		return setChild(node, last, val)
+	case "remove":
+		return removeChild(node, last)
 	}
 	return false
 }
@@ -418,6 +426,20 @@ func setChild(node any, key string, val any) bool {
 			return false
 		}
 		t[i] = val
+		return true
+	}
+	return false
+}
+
+// removeChild deletes one patch target. Map keys persist because maps are
+// references; array reslicing would not persist into the parent through the
+// value-held traversal, so only map removal is accepted.
+func removeChild(node any, key string) bool {
+	if m, ok := node.(map[string]any); ok {
+		if _, ok := m[key]; !ok {
+			return false
+		}
+		delete(m, key)
 		return true
 	}
 	return false

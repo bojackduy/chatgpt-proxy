@@ -1514,6 +1514,22 @@ func TestShadowStreamLineageAndLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("remove of an inert metadata key is accepted", func(t *testing.T) {
+		// Measured live: the server removes a metadata field that carries
+		// no answer text, author, message ID or parent link. The
+		// reconstruction accepts the removal and still correlates.
+		frames := shadowFixture("P", "A")
+		frames = append(frames[:len(frames)-1],
+			`{"o":"patch","v":[{"p":"/message/metadata/tmp_flag","o":"add","v":true},{"p":"/message/metadata/tmp_flag","o":"remove"}]}`,
+			frames[len(frames)-1])
+		s := newShadowCapture("P")
+		shadowFeed(t, s, shadowStream(frames), 64)
+		ok, text, reason := s.result()
+		if !ok || text != "A" {
+			t.Fatalf("ok=%v text=%q reason=%q, want clean reconstruction", ok, text, reason)
+		}
+	})
+
 	// One measured patch appends an object onto /message/metadata. That cannot
 	// change the answer or its lineage, so it is skipped and counted rather
 	// than refusing an otherwise exact reconstruction.
