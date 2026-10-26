@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//		chatgpt-recover [-addr 127.0.0.1:8788] [-reason "..."] <inspect|recover|abandon> <session-id>
+//		chatgpt-recover [-bridge chatgpt|gemini] [-addr ...] [-reason "..."] <inspect|recover|abandon> <session-id>
 //
 //	  - inspect (default): read-only state, counts and available actions.
 //	  - recover: read-only adoption of the pending turn. Never submits.
@@ -31,7 +31,11 @@ import (
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: chatgpt-recover [-addr 127.0.0.1:8788] [-reason "..."] <inspect|recover|abandon> <session-id>
+	fmt.Fprintf(os.Stderr, `usage: chatgpt-recover [-bridge chatgpt|gemini] [-addr ...] [-reason "..."] <inspect|recover|abandon> <session-id>
+
+  bridges: chatgpt (default addr 127.0.0.1:8788), gemini (default addr 127.0.0.1:8789)
+  gemini has no read-only adoption endpoint: recover reports that and
+  names the real moves (a distinct request, or abandon).
 
   inspect  read-only state: what is unknown, what was kept, what you can do
   recover  read-only adoption of the pending turn; never submits anything
@@ -105,7 +109,8 @@ func num(m map[string]any, key string) int {
 }
 
 func run() int {
-	addr := flag.String("addr", "127.0.0.1:8788", "bridge adapter listen address")
+	addr := flag.String("addr", "", "bridge adapter listen address (default depends on -bridge)")
+	bridge := flag.String("bridge", "chatgpt", "bridge: chatgpt or gemini")
 	reason := flag.String("reason", "", "reason recorded with abandon")
 	flag.Usage = usage
 	flag.Parse()
@@ -125,6 +130,17 @@ func run() int {
 	if bad := refusedSession(session); bad != "" {
 		fmt.Fprintf(os.Stderr, "chatgpt-recover: %s\n", bad)
 		return 2
+	}
+	if *bridge != "chatgpt" && *bridge != "gemini" {
+		fmt.Fprintf(os.Stderr, "chatgpt-recover: unknown bridge %q (want chatgpt|gemini)\n", *bridge)
+		return 2
+	}
+	if *addr == "" {
+		if *bridge == "gemini" {
+			*addr = "127.0.0.1:8789"
+		} else {
+			*addr = "127.0.0.1:8788"
+		}
 	}
 	base := "http://" + strings.TrimPrefix(*addr, "http://")
 
@@ -155,6 +171,11 @@ func run() int {
 		}
 		return 0
 	case "recover":
+		if *bridge == "gemini" {
+			fmt.Printf("session %s: the Gemini bridge has no read-only adoption endpoint.\n", session)
+			fmt.Printf("moves: send a distinct request (the adapter reseeds a fresh thread and abandons the old one, never resending it), or run: chatgpt-recover -bridge gemini abandon %s\n", session)
+			return 1
+		}
 		client := &http.Client{Timeout: 120 * time.Second}
 		_, out, err := doJSON(client, http.MethodPost, base+"/v1/sessions/recover", session, nil)
 		if err != nil {
