@@ -342,13 +342,13 @@ func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, err)
 			return
 		}
-		ready := st.LoggedIn && st.Composer
+		ready, reason, repair := readinessReason(st)
 		code := 200
 		if !ready {
 			code = 503
 		}
 		capacity, available := cap(h.parallel.clients), len(h.parallel.clients)
-		writeJSON(w, code, map[string]any{"ready": ready, "status": st, "max_parallel": capacity, "active": capacity - available, "available": available})
+		writeJSON(w, code, map[string]any{"ready": ready, "reason": reason, "repair": repair, "status": st, "max_parallel": capacity, "active": capacity - available, "available": available})
 		return
 	}
 	if !h.acquire(ctx) {
@@ -362,13 +362,38 @@ func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 503, err)
 		return
 	}
-	ready := st.LoggedIn && st.Composer
+	ready, reason, repair := readinessReason(st)
 	status := 200
 	if !ready {
 		status = 503
-		log.Printf("[openai] NOT READY login=%v composer=%v url=%s; REPAIR login/DOM", st.LoggedIn, st.Composer, st.URL)
+		log.Printf("[openai] NOT READY login=%v composer=%v challenge=%v url=%s reason=%s; REPAIR %s", st.LoggedIn, st.Composer, st.Challenge, st.URL, reason, repair)
 	}
-	writeJSON(w, status, map[string]any{"ready": ready, "status": st})
+	writeJSON(w, status, map[string]any{"ready": ready, "reason": reason, "repair": repair, "status": st})
+}
+
+// readinessReason names one probe state so /readyz, status and doctor tell a
+// human-verification gate apart from logged-out, blank and generic
+// not-ready. Pure: asserted without a browser.
+func readinessReason(st *chatgpt.Status) (ready bool, reason, repair string) {
+	if st == nil {
+		return false, "unknown", "Re-probe readiness; the adapter returned no page state."
+	}
+	switch {
+	case st.Challenge:
+		return false, "challenge",
+			"ChatGPT shows a human-verification page in the bridge profile. Nothing was sent. Solve the checkbox in the profile Chrome window yourself, wait for the message box, then retry."
+	case st.LoginBtn && !st.LoggedIn:
+		return false, "logged-out",
+			"Log into ChatGPT once in the profile Chrome window, then re-run status."
+	case !st.Composer && st.BodyLen == 0:
+		return false, "blank",
+			"The page loaded without a message box and without a login control. Wait a few seconds and retry; nothing was sent."
+	case st.LoggedIn && st.Composer:
+		return true, "ready", ""
+	default:
+		return false, "not-ready",
+			"The bridge page is not ready. Re-run status after the page settles; nothing was sent."
+	}
 }
 func contentText(m message) string {
 	switch c := m.Content.(type) {
@@ -943,6 +968,21 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 					break
 				}
 			}
+		}
+	}
+	// A fresh dump (system/skill context followed by the question) must not
+	// land whole in the current request: everything before the final
+	// contiguous user-message run is replayable history, so only the new
+	// question counts against the single-paste budget. Never retreats an
+	// existing cut, and never applies to a trailing non-user turn (a tool
+	// loop in flight keeps its calls and results together in current).
+	if len(delta) > 1 {
+		run := len(delta)
+		for run > 0 && delta[run-1].Role == "user" {
+			run--
+		}
+		if run > cut {
+			cut = run
 		}
 	}
 	currentIntro := "CURRENT REQUEST\n" + turnIntro
@@ -1585,6 +1625,20 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		} else {
 			mismatch := firstMismatch(req.Messages, s.Messages)
 			log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s confoff=%d incoming_messages=%d saved_messages=%d incoming_encoding=%s saved_encoding=%s incoming_shape=%s saved_shape=%s", id, mismatch.Index, mismatch.Field, mismatch.ContentOff, len(req.Messages), len(s.Messages), mismatch.IncomingEncoding, mismatch.SavedEncoding, mismatch.IncomingShape, mismatch.SavedShape)
+			// Near-tail tail-edit: only the last few messages diverged and the
+			// sent-log proves this session drove the stored thread, so the
+			// thread already holds ~everything before the divergence. Continue
+			// on the SAME thread from the mismatch instead of minting a new
+			// one: ~8 messages submitted, not the whole history. Never on a
+			// dirty session (the thread may hold an abandoned turn), never
+			// for incoherent input, and never for a non-string or large
+			// rewrite — those keep the reseed/rotation path below.
+			if !s.Dirty && len(s.Messages) >= 8 && mismatch.Index >= len(s.Messages)-8 &&
+				mismatch.ContentOff >= 0 && mismatch.ContentOff <= 1024 &&
+				coherentTranscript(req.Messages) && h.sentEntryForThread(id, s.URL) != nil {
+				decision, start = "delta-continue", mismatch.Index
+				log.Printf("[openai] session=%s lane=%s decision=delta-continue mismatch=%d:%s confoff=%d saved=%d", id, lane, mismatch.Index, mismatch.Field, mismatch.ContentOff, len(s.Messages))
+			} else {
 			// The client history no longer matches the stored thread (client
 			// compaction or a reused session ID). Re-establish context by
 			// replaying the full client history into a new thread instead of
@@ -1620,6 +1674,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				decision = "rewrite-reseed"
 				log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
 			}
+			}
 		}
 	}
 	if resync {
@@ -1635,7 +1690,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	// server-side and a compact reminder suffices — resending the whole dump
 	// every turn is what blew the per-turn paste budget.
 	toolsFP := toolsFingerprint(req.Tools)
-	teachFull := decision != "delta" || s.ToolsFP == "" || s.ToolsFP != toolsFP
+	teachFull := (decision != "delta" && decision != "delta-continue") || s.ToolsFP == "" || s.ToolsFP != toolsFP
 	head := toolReminder(req)
 	if teachFull {
 		head = toolPrompt(req)
@@ -1892,6 +1947,14 @@ func (h *handler) backendError(w http.ResponseWriter, err error) {
 	log.Printf("[openai] BACKEND FAILURE: %v; REPAIR: check CDP port/profile login, composer/send/assistant DOM selectors, ChatGPT page alerts; uncertain completion requests require read-only recovery", err)
 	if errors.Is(err, chatgpt.ErrNoComposer) || errors.Is(err, chatgpt.ErrNotLoggedIn) {
 		apiError(w, 422, errors.New(failureText("ChatGPT's message box is unavailable or the browser needs you to sign in; nothing was submitted.", "Next: open the dedicated ChatGPT Web window, sign in if needed, and return to the message box before trying again.")))
+		return
+	}
+	if errors.Is(err, chatgpt.ErrPageChallenge) {
+		// Pre-submit by construction (IsPreSubmit): the journal stays clean
+		// and nothing is uncertain. A content-free reason code goes to the
+		// log so the flow log can name this refusal without reproducing it.
+		log.Printf("[openai] page challenge reason=challenge; no submission, journal clean")
+		apiError(w, 422, errors.New(failureText("ChatGPT is showing a human-verification page in the dedicated browser profile; nothing was submitted.", "Next: open the profile Chrome window, complete the verification yourself, wait for the message box, then send a new message.")))
 		return
 	}
 	if errors.Is(err, chatgpt.ErrForeignDraft) || errors.Is(err, chatgpt.ErrDraftOwned) {

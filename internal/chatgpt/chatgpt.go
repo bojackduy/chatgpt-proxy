@@ -91,6 +91,8 @@ func IsNavigateError(err error) bool {
 type Status struct {
 	LoggedIn   bool   `json:"logged_in"`
 	Composer   bool   `json:"composer"`
+	Challenge  bool   `json:"challenge"`
+	BodyLen    int    `json:"body_len"`
 	NewChat    bool   `json:"new_chat_button"`
 	LoginBtn   bool   `json:"login_button"`
 	URL        string `json:"url"`
@@ -755,11 +757,14 @@ func (c *Client) probeState(ctx context.Context, tab context.Context) (*Status, 
 	  const composer = () => !!(document.querySelector('#prompt-textarea')
 	    || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]')
 	    || document.querySelector('.ProseMirror[contenteditable="true"]'));
+	  const bodyText = (document.body && typeof document.body.innerText === 'string') ? document.body.innerText : '';
 	  return {
 	    composer: composer(),
 	    sidebar: q('#sidebar'),
 	    loginBtn: q('[data-testid="login-button"]'),
 	    newChat: q('a[aria-label="New chat"], button[aria-label="New chat"], a[href="/"]'),
+	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human/i.test(bodyText.slice(0, 4000)),
+	    bodyLen: Math.min(bodyText.length, 1048576),
 	    url: location.href,
 	    title: document.title,
 	  };
@@ -769,17 +774,21 @@ func (c *Client) probeState(ctx context.Context, tab context.Context) (*Status, 
 		return nil, fmt.Errorf("probe: %w", err)
 	}
 	var p struct {
-		Composer bool   `json:"composer"`
-		Sidebar  bool   `json:"sidebar"`
-		LoginBtn bool   `json:"loginBtn"`
-		NewChat  bool   `json:"newChat"`
-		URL      string `json:"url"`
-		Title    string `json:"title"`
+		Composer  bool   `json:"composer"`
+		Sidebar   bool   `json:"sidebar"`
+		LoginBtn  bool   `json:"loginBtn"`
+		NewChat   bool   `json:"newChat"`
+		Challenge bool   `json:"challenge"`
+		BodyLen   int    `json:"bodyLen"`
+		URL       string `json:"url"`
+		Title     string `json:"title"`
 	}
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
 		return nil, fmt.Errorf("probe decode: %w", err)
 	}
 	s.Composer = p.Composer
+	s.Challenge = p.Challenge
+	s.BodyLen = p.BodyLen
 	s.NewChat = p.NewChat
 	s.LoginBtn = p.LoginBtn
 	s.URL = p.URL

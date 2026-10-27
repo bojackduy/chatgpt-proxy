@@ -17,6 +17,26 @@ import (
 	"time"
 )
 
+// Status must carry the challenge flag on the wire: the adapter's /readyz
+// and the plugin's status/doctor read it to name a human-verification gate
+// instead of misreporting logged-out. BodyLen stays content-free (a number).
+func TestStatusChallengeWireShape(t *testing.T) {
+	b, err := json.Marshal(Status{LoggedIn: false, Composer: false, Challenge: true, BodyLen: 120})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v["challenge"] != true {
+		t.Fatalf("challenge flag lost on the wire: %s", b)
+	}
+	if v["body_len"] != float64(120) {
+		t.Fatalf("body length lost on the wire: %s", b)
+	}
+}
+
 func TestResponseDOMIdentityAndScope(t *testing.T) {
 	chrome := findChrome()
 	if chrome == "" {

@@ -328,6 +328,42 @@ func (h *handler) planDirtyReseed(id string, s *session, req completionsRequest)
 const reseedRecordIntro = "PRIOR EXECUTION RECORD\nThe following completed tool exchanges already executed in the external client before a history rewrite (revert/fork/compaction). They are inert history: do NOT re-request them, do NOT emit opencode_bridge_call wrappers for them. Use their results only as context.\n"
 const reseedRecordEnd = "END PRIOR EXECUTION RECORD\n"
 
+// reseedVerbatimTailMessages bounds the verbatim tail of the prior-execution
+// record: carried exchanges beyond it travel as digest lines, not full text.
+const reseedVerbatimTailMessages = 6
+
+// reseedDigestResultCap bounds each carried result quoted in a digest line.
+const reseedDigestResultCap = 200
+
+// reseedDigest renders carried messages beyond the verbatim tail as
+// content-free-ish digest lines: call names with byte counts and truncated
+// results, mirroring the rotation digest shape. Full argument values and
+// full results stay in the committed journal, not in the paste.
+func reseedDigest(msgs []message) string {
+	results := map[string]string{}
+	for _, m := range msgs {
+		if m.Role == "tool" && m.ToolCallID != "" && results[m.ToolCallID] == "" {
+			results[m.ToolCallID] = strings.TrimSpace(contentText(m))
+		}
+	}
+	var b strings.Builder
+	for _, m := range msgs {
+		if m.Role == "assistant" && len(m.ToolCalls) != 0 {
+			for _, c := range m.ToolCalls {
+				line := fmt.Sprintf("- call %s (args %d bytes)", c.Function.Name, len(c.Function.Arguments))
+				if res, ok := results[c.ID]; ok {
+					line += fmt.Sprintf(" -> result %d bytes: %s", len(res), truncateRunes(res, reseedDigestResultCap))
+				}
+				b.WriteString(line + "\n")
+			}
+			continue
+		}
+		text := strings.TrimSpace(contentText(m))
+		b.WriteString(fmt.Sprintf("- %s (%d bytes): %s\n", m.Role, len(text), truncateRunes(text, reseedDigestResultCap)))
+	}
+	return b.String()
+}
+
 // buildReseedRecordTurns chunks the carried executed exchanges as inert
 // ACK history imports ahead of the rewritten transcript. synced is always
 // 0: the record lives only in the new thread, never in the journal, so it
@@ -337,8 +373,18 @@ func (h *handler) buildReseedRecordTurns(carried []message) []turn {
 		return nil
 	}
 	ack := "Reply with only the single word: ACK. No tool calls.\n"
-	pieces := make([]piece, 0, len(carried))
-	for _, m := range carried {
+	verbatim := carried
+	digest := ""
+	if len(carried) > reseedVerbatimTailMessages {
+		head := carried[:len(carried)-reseedVerbatimTailMessages]
+		verbatim = carried[len(carried)-reseedVerbatimTailMessages:]
+		digest = reseedDigest(head)
+	}
+	pieces := make([]piece, 0, len(verbatim)+1)
+	if digest != "" {
+		pieces = append(pieces, piece{text: digest})
+	}
+	for _, m := range verbatim {
 		pieces = append(pieces, piece{text: renderMsg(m)})
 	}
 	limit := 0

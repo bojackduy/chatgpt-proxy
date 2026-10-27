@@ -2764,15 +2764,180 @@ func TestAnswerlessTurnOnlyMatchesMissingAnswer(t *testing.T) {
 	}
 }
 
+func TestReadinessReasonDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		st     *chatgpt.Status
+		ready  bool
+		reason string
+	}{
+		{"nil state is unknown", nil, false, "unknown"},
+		{"challenge beats everything", &chatgpt.Status{Challenge: true, LoginBtn: true}, false, "challenge"},
+		{"logged out", &chatgpt.Status{LoginBtn: true}, false, "logged-out"},
+		{"blank loaded page", &chatgpt.Status{}, false, "blank"},
+		{"ready", &chatgpt.Status{LoggedIn: true, Composer: true}, true, "ready"},
+		{"rendered body without composer is not ready", &chatgpt.Status{LoggedIn: true, BodyLen: 500}, false, "not-ready"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ready, reason, repair := readinessReason(tc.st)
+			if ready != tc.ready || reason != tc.reason {
+				t.Fatalf("got (%v,%q) want (%v,%q)", ready, reason, tc.ready, tc.reason)
+			}
+			if !ready && repair == "" {
+				t.Fatal("unready state must name a repair")
+			}
+			if ready && repair != "" {
+				t.Fatal("ready state must not carry a repair")
+			}
+		})
+	}
+}
+
+func TestChallengeRefusalKeepsJournalClean(t *testing.T) {
+	f := &fakeBackend{err: chatgpt.ErrPageChallenge}
+	h := testHandler(f)
+	w := request(h, "challenge", weatherReq())
+	if w.Code != 422 || !strings.Contains(w.Body.String(), "human-verification") {
+		t.Fatalf("challenge refusal: %d %s", w.Code, w.Body.String())
+	}
+	s := h.sessions["challenge"]
+	if s == nil || s.Dirty || s.PendingPrompt != "" || s.Phase != "" {
+		t.Fatalf("challenge must journal nothing: %+v", s)
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("challenge attempted %d submits, want exactly the refused one", len(f.prompts))
+	}
+}
+
+func TestNearTailMismatchContinuesSameThread(t *testing.T) {
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	const threadURL = "https://chatgpt.com/c/thread-same"
+	saved := make([]message, 0, 10)
+	for i := 0; i < 5; i++ {
+		saved = append(saved, message{Role: "user", Content: fmt.Sprintf("question %d", i)})
+		saved = append(saved, message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)})
+	}
+	incoming := append([]message{}, saved...)
+	incoming[9] = message{Role: "assistant", Content: "answer 4!"}
+	incoming = append(incoming, message{Role: "user", Content: "follow up"})
+	h.sessions["near-tail"] = &session{URL: threadURL, Messages: saved}
+	h.sentLog = append(h.sentLog, sentEntry{Session: "near-tail", URL: threadURL, Event: "completed", PromptHash: "seed"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: incoming}
+	w := request(h, "near-tail", req)
+	if w.Code != 200 {
+		t.Fatalf("near-tail continue: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 1 || f.urls[0] != threadURL {
+		t.Fatalf("must continue on the same thread once, got urls=%v", f.urls)
+	}
+	if got := h.sessions["near-tail"].URL; got != threadURL {
+		t.Fatalf("thread moved: %s", got)
+	}
+	if len(h.sessions["near-tail"].Messages) != len(incoming)+1 {
+		t.Fatalf("transcript not committed: %d", len(h.sessions["near-tail"].Messages))
+	}
+}
+
+func TestToolsFPPinnedOnRetry(t *testing.T) {
+	f := &fakeBackend{answers: []string{weatherAnswer, weatherAnswer}}
+	h := testHandler(f)
+	req := weatherReq()
+	if w := request(h, "pin", req); w.Code != 200 {
+		t.Fatalf("first turn: %d %s", w.Code, w.Body.String())
+	}
+	committed := append([]message{}, h.sessions["pin"].Messages...)
+	req2 := weatherReq()
+	req2.Messages = append(committed, message{Role: "user", Content: "another city"})
+	if w := request(h, "pin", req2); w.Code != 200 {
+		t.Fatalf("retry: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 2 {
+		t.Fatalf("prompts=%d", len(f.prompts))
+	}
+	if strings.Contains(f.prompts[1], "You are the text-generation backend") {
+		t.Fatal("retry resent the full tool schemas for an unchanged tool set")
+	}
+	if !strings.Contains(f.prompts[1], "already taught") {
+		t.Fatal("retry did not use the compact reminder")
+	}
+}
+
+func TestFreshSystemDumpReplaysAsHistory(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxPaste = 60000
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{
+		{Role: "system", Content: strings.Repeat("S", 70000)},
+		{Role: "user", Content: "answer this now"},
+	}}
+	turns, err := h.buildTurns(req, req.Messages, toolReminder(req))
+	if err != nil {
+		t.Fatalf("fresh dump refused: %v", err)
+	}
+	if len(turns) < 2 {
+		t.Fatalf("dump landed whole in %d turn(s)", len(turns))
+	}
+	last := turns[len(turns)-1]
+	if last.replay || !strings.Contains(last.prompt, "answer this now") {
+		t.Fatal("last turn must be the question, not a replay")
+	}
+	for _, tr := range turns[:len(turns)-1] {
+		if !tr.replay {
+			t.Fatal("leading context must replay as history")
+		}
+	}
+}
+
+func TestReseedRecordCarriesDigestBeyondRecent(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	var carried []message
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("call-%d", i)
+		carried = append(carried, message{Role: "assistant", ToolCalls: []toolCall{{ID: id, Type: "function", Function: callFunction{Name: "fetch", Arguments: fmt.Sprintf(`{"n":%d}`, i)}}}})
+		carried = append(carried, message{Role: "tool", ToolCallID: id, Content: strings.Repeat(fmt.Sprintf("R%d-", i), 1500)})
+	}
+	verbatimAll := 0
+	for _, m := range carried {
+		verbatimAll += len(renderMsg(m))
+	}
+	turns := h.buildReseedRecordTurns(carried)
+	if len(turns) == 0 {
+		t.Fatal("no record turns")
+	}
+	var joined string
+	total := 0
+	for _, tr := range turns {
+		if !tr.replay {
+			t.Fatal("record turns must be inert replays")
+		}
+		joined += tr.prompt
+		total += len(tr.prompt)
+	}
+	if total*2 >= verbatimAll {
+		t.Fatalf("digest did not shrink the record: %d vs verbatim %d", total, verbatimAll)
+	}
+	if !strings.Contains(joined, "R9-") {
+		t.Fatal("verbatim tail lost the most recent result")
+	}
+	if full := strings.Repeat("R0-", 1500); strings.Contains(joined, full) {
+		t.Fatal("oldest result traveled verbatim instead of as a digest")
+	}
+	if !strings.Contains(joined, "-> result") {
+		t.Fatal("digest lines missing")
+	}
+}
+
 func TestRotationCardOverPasteBudgetFallsBackBeforeSubmit(t *testing.T) {
 	f := &fakeBackend{err: errors.New("must not submit")}
 	h := testHandler(f)
 	h.maxPaste = 60000
+	// Even the capped shrink rung (last 2 turns verbatim) exceeds the paste
+	// budget here, so the rotation must fall back without submitting.
 	msgs := make([]message, 0, 31)
-	for i := 0; i < 30; i++ {
-		msgs = append(msgs, message{Role: "user", Content: strings.Repeat("x", 5000)})
+	for i := 0; i < 31; i++ {
+		msgs = append(msgs, message{Role: "user", Content: strings.Repeat("x", 40000)})
 	}
-	msgs = append(msgs, message{Role: "user", Content: "answer this now"})
 	req := completionsRequest{Model: "chatgpt-web", Messages: msgs}
 	s := &session{URL: "https://chatgpt.com/c/old", Messages: msgs[:len(msgs)-1]}
 	w := httptest.NewRecorder()
@@ -2784,5 +2949,38 @@ func TestRotationCardOverPasteBudgetFallsBackBeforeSubmit(t *testing.T) {
 	}
 	if s.Dirty || s.PendingPrompt != "" || s.URL != "https://chatgpt.com/c/old" {
 		t.Fatal("oversized rotation card dirtied the journal", s.Dirty, len(s.PendingPrompt))
+	}
+}
+
+func TestRotationCappedCardShrinksInsteadOfFullReplay(t *testing.T) {
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	// The richest ladder rung exceeds the paste budget, but the capped shrink
+	// rung (last 2 turns verbatim) fits: rotation submits one pasteable card
+	// instead of falling back to a full chunked replay.
+	msgs := make([]message, 0, 31)
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, message{Role: "user", Content: strings.Repeat("x", 5000)})
+	}
+	msgs = append(msgs, message{Role: "user", Content: "answer this now"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: msgs}
+	s := &session{URL: "https://chatgpt.com/c/old", Messages: msgs[:len(msgs)-1]}
+	w := httptest.NewRecorder()
+	if !h.serveRotation(w, httptest.NewRequest("POST", "/v1/chat/completions", nil), "rotate-capped", "main", req, s, nil) {
+		t.Fatalf("capped rotation card must submit, status=%d", w.Code)
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("capped rotation must submit exactly one card, got %d", len(f.prompts))
+	}
+	head := toolPrompt(req)
+	if len(f.prompts[0])-len(head) > h.pasteLimit() {
+		t.Fatalf("capped card content %dB exceeds paste limit %d", len(f.prompts[0])-len(head), h.pasteLimit())
+	}
+	if !strings.Contains(f.prompts[0], "RECENT TURNS") || !strings.Contains(f.prompts[0], "answer this now") {
+		t.Fatal("capped card lost the verbatim tail")
+	}
+	if w.Code != 200 {
+		t.Fatalf("capped rotation did not complete: status=%d %s", w.Code, w.Body.String())
 	}
 }

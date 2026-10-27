@@ -150,6 +150,12 @@ var rotationLadder = []rotationLevel{
 	{rotationRecentN, 200, 3000, 5, 300},
 }
 
+// rotationCapped is the shrink rung used when the ladder's pick exceeds the
+// single-paste budget: goal plus a short digest and only the last 2 turns
+// verbatim. It is tried before falling back to a full chunked replay, so an
+// over-budget card shrinks instead of re-sending the whole history.
+var rotationCapped = rotationLevel{recentN: 2, resultCap: 500, digestMax: 1500, notesN: 3, noteCap: 200}
+
 const rotationIntro = "BRIDGE SESSION ROTATION\nThis turn starts a fresh working chat inside this session's dedicated project. What follows is a compact context card written locally from stored adapter state (no model was consulted) plus the most recent turns verbatim. Older history remains in this project's retired chats and may be referenced from there. Reply to the current request below; do not replay history.\n"
 
 // buildRotationPrompt composes the single first-turn prompt for a rotated
@@ -281,16 +287,22 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=card_over_budget bytes=%d budget=%d", id, lane, lastLen, h.maxChars)
 		return false
 	}
-	// The rotation card is ONE composer paste: refuse it here when its new
-	// content alone exceeds the paste budget, before the journal is dirtied
-	// or anything reaches the composer. Oversized pastes stall the page for
-	// ~10 minutes with zero answer bytes, so submitting anyway only buys an
-	// uncertain turn. The caller falls back to the capped chunked
-	// reset-replay/reseed path. The fixed head cannot be chunked, so only
-	// content beyond it counts — same rule as the main choke point.
+	// The rotation card is ONE composer paste: shrink it to the capped rung
+	// when its new content alone exceeds the paste budget, before the journal
+	// is dirtied or anything reaches the composer. Oversized pastes stall the
+	// page for ~10 minutes with zero answer bytes, so submitting anyway only
+	// buys an uncertain turn. Only when even the capped card does not fit
+	// does the caller fall back to the capped chunked reset-replay/reseed
+	// path. The fixed head cannot be chunked, so only content beyond it
+	// counts — same rule as the main choke point.
 	if cap := h.pasteLimit(); cap > 0 && len(prompt)-len(head) > cap {
-		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=paste_over_budget bytes=%d paste_limit=%d", id, lane, len(prompt), cap)
-		return false
+		if p, r := buildRotationPromptLevel(req, s, head, rotationCapped); len(p)-len(head) <= cap {
+			log.Printf("[openai] session=%s lane=%s rotation_capped bytes=%d paste_limit=%d", id, lane, len(p), cap)
+			prompt, recent = p, r
+		} else {
+			log.Printf("[openai] session=%s lane=%s rotation_fallback reason=paste_over_budget bytes=%d paste_limit=%d", id, lane, len(prompt), cap)
+			return false
+		}
 	}
 	var atts []chatgpt.Attachment
 	for _, m := range recent {
