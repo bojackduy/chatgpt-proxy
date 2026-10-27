@@ -996,6 +996,23 @@ func TestProbePageLoadStateReadsOnlyShape(t *testing.T) {
 	if cause, ok := classifyMissingComposer(ps); cause != missingComposerAuth || ok {
 		t.Fatalf("login fixture must be auth without recovery: %v %v", cause, ok)
 	}
+	// In-thread verification error label (observed live as an error bubble
+	// reading "reason: verify_challenge" instead of an assistant reply).
+	// The mid-turn empty-poll probe must recognize it as a challenge.
+	set = `<div>Something went wrong<br>reason: verify_challenge<br>Retry</div>`
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = `+quoteJS(set), nil)); err != nil {
+		t.Fatal(err)
+	}
+	ps, err = c.probePageLoadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ps.Challenge {
+		t.Fatalf("verify_challenge label fixture misread: %+v", ps)
+	}
+	if cause, ok := classifyMissingComposer(ps); cause != missingComposerChallenge || ok {
+		t.Fatalf("challenge-label fixture must be challenge without recovery: %v %v", cause, ok)
+	}
 }
 
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
