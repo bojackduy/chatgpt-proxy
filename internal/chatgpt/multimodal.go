@@ -46,6 +46,12 @@ type TurnResult struct {
 	// ProjectURL echoes the project a new chat was started in (empty when an
 	// existing thread was continued or the shared project was used).
 	ProjectURL string
+	// BubbleID is the DOM id of the user bubble this submitted turn became,
+	// captured at send observation. Empty when the turn never reached the
+	// thread or capture failed. Recovery journals it as PendingBubbleID so
+	// read-back verifies against the recorded bubble instead of assuming
+	// pending == last bubble.
+	BubbleID string
 }
 
 func mimeExt(mime string) string {

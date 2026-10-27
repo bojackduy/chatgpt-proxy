@@ -24,7 +24,7 @@ type inspectBackend struct {
 	reads            int
 }
 
-func (f *inspectBackend) ReadThreadTurn(ctx context.Context, url, prompt string) (chatgpt.TurnResult, error) {
+func (f *inspectBackend) ReadThreadTurn(ctx context.Context, url, prompt, bubbleID string) (chatgpt.TurnResult, error) {
 	f.reads++
 	if prompt != f.expected {
 		return chatgpt.TurnResult{}, errors.New("original prompt mismatch")
@@ -324,7 +324,7 @@ type resyncBackend struct {
 	reads, latests int
 }
 
-func (f *resyncBackend) ReadThreadTurn(ctx context.Context, url, prompt string) (chatgpt.TurnResult, error) {
+func (f *resyncBackend) ReadThreadTurn(ctx context.Context, url, prompt, bubbleID string) (chatgpt.TurnResult, error) {
 	f.reads++
 	if f.mismatch != nil {
 		return chatgpt.TurnResult{}, f.mismatch

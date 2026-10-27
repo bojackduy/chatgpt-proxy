@@ -3022,3 +3022,40 @@ func TestTitleCtxBoundsOnlyTitleLane(t *testing.T) {
 		t.Fatalf("title deadline out of range: %v", time.Until(dl))
 	}
 }
+
+func TestPendingBubbleIDJournaledAndCleared(t *testing.T) {
+	f := &fakeBackend{}
+	f.turn = func(ctx context.Context, opt chatgpt.TurnOptions) (chatgpt.TurnResult, error) {
+		f.prompts = append(f.prompts, opt.Prompt)
+		return chatgpt.TurnResult{URL: "https://chatgpt.com/c/bound", BubbleID: "bubble-1"}, errors.New("answer never arrived")
+	}
+	h := testHandler(f)
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "name this chat about lunch"}}}
+	if w := request(h, "bubb", req); w.Code == 200 {
+		t.Fatal("failing final turn must not succeed")
+	}
+	s := h.sessions["bubb"]
+	if s == nil || !s.Dirty {
+		t.Fatal("post-submit failure must stay uncertain")
+	}
+	if s.PendingBubbleID != "bubble-1" {
+		t.Fatalf("submit linkage not journaled: %q", s.PendingBubbleID)
+	}
+	if w := abandonPost(h, `{"sessions":["bubb"],"reason":"test clear"}`, ""); w.Code != 200 {
+		t.Fatalf("abandon %d: %s", w.Code, w.Body.String())
+	}
+	if h.sessions["bubb"].PendingBubbleID != "" {
+		t.Fatal("abandon must clear the submit linkage with the pending binding")
+	}
+}
+
+func TestBoundBubbleErrorsAreNeverPreSubmit(t *testing.T) {
+	for _, err := range []error{chatgpt.ErrBubbleGone, chatgpt.ErrPendingNeverStored} {
+		if chatgpt.IsPreSubmit(err) {
+			t.Fatalf("%v must not be pre-submit", err)
+		}
+		if errors.Is(err, chatgpt.ErrNotSubmitted) {
+			t.Fatalf("%v must not look like a safe retry", err)
+		}
+	}
+}

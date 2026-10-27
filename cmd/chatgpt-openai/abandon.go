@@ -57,6 +57,7 @@ func clearUncertaintyBinding(s *session) {
 	s.Phase = ""
 	s.PendingRequest = nil
 	s.PendingPrompt = ""
+	s.PendingBubbleID = ""
 	s.RepairPendingPrompt = ""
 	s.ResyncMessages = nil
 	s.ResyncFrom = ""

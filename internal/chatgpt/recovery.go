@@ -165,6 +165,12 @@ type threadSnapshot struct {
 	probeErr    error
 	emptyProved bool
 	emptyErr    error
+	// boundRequested marks verification against a journaled submit bubble
+	// (not last-bubble correlation). boundIsLast reports that bubble is
+	// still the thread's last user bubble: the thread is unchanged since
+	// submit, so a text difference proves the send never landed.
+	boundRequested bool
+	boundIsLast    bool
 }
 
 // matchUserSource decides an exact adoption against the whole normalized
@@ -188,11 +194,19 @@ func matchUserSource(raw, decoded, want string) (bool, string) {
 // equal the full normalized pending prompt. Never walk the backend mapping to
 // guess the latest branch; only decode declared serialization for that DOM ID.
 // A completed assistant body must follow it. Anything else fails closed.
-func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnResult, error) {
+//
+// bubbleID is the journaled submit linkage: the DOM id the pending turn
+// became, captured at send observation. When present, the pending is verified
+// against that recorded bubble instead of assuming pending == last bubble.
+// When the thread is unchanged yet holds no such bubble, the precise
+// ErrPendingNeverStored reports the send never landed; when the recorded
+// bubble is gone, ErrBubbleGone reports the thread changed. Empty bubbleID
+// keeps the legacy last-bubble correlation (legacy journals).
+func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt, bubbleID string) (TurnResult, error) {
 	if prompt == "" {
 		return TurnResult{}, errors.New("recovery requires a stored thread and exact original prompt")
 	}
-	snap, err := c.snapshotThread(ctx, url, prompt)
+	snap, err := c.snapshotThread(ctx, url, bubbleID, prompt)
 	if err != nil {
 		return TurnResult{}, err
 	}
@@ -204,6 +218,15 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	// whitespace collapsing. The decoded rendering provably drops one \n per
 	// extra blank line, so the raw bytes are the binding ground truth.
 	if ok, provenance := matchUserSource(snap.userRaw, snap.userText, want); !ok {
+		// Bound verification against a journaled submit bubble: when the
+		// thread is unchanged since submit (recorded bubble is still last)
+		// yet its text is not the pending, the send never landed — report
+		// that precisely instead of a generic mismatch. A moved-on thread
+		// keeps the legacy mismatch (fail closed, no adoption either way).
+		if snap.boundRequested && snap.boundIsLast {
+			log.Printf("[chatgpt] adoption pending never stored rendered=%dB want=%dB", len(snap.userText), len(want))
+			return TurnResult{}, ErrPendingNeverStored
+		}
 		off := firstDiffByte(snap.userText, want)
 		spans := diffSpans(snap.userText, want)
 		log.Printf("[chatgpt] adoption user-bubble mismatch path=%s rendered=%dB want=%dB diffoff=%d spans=%s", snap.srcPath, len(snap.userText), len(want), off, spans)
@@ -238,7 +261,7 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 // failure is a plain error that fails closed — never a mismatch or
 // completed-empty adoption signal.
 func (c *Client) ReadLatestThreadTurn(ctx context.Context, url string) (string, TurnResult, error) {
-	snap, err := c.snapshotThread(ctx, url)
+	snap, err := c.snapshotThread(ctx, url, "")
 	if err != nil {
 		return "", TurnResult{}, err
 	}
@@ -286,7 +309,12 @@ func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
 // active adapter tab. Probe-phase failures are captured in the snapshot (not
 // returned) so ReadThreadTurn still reports a prompt mismatch first,
 // preserving adoption error order.
-func (c *Client) snapshotThread(ctx context.Context, url string, expected ...string) (threadSnapshot, error) {
+//
+// boundID is the journaled submit linkage: when non-empty, the source is
+// fetched for that recorded bubble instead of the correlated last bubble.
+// The current-last correlation still runs for the answer finishedness probe
+// and to detect a moved-on thread.
+func (c *Client) snapshotThread(ctx context.Context, url, boundID string, expected ...string) (threadSnapshot, error) {
 	var snap threadSnapshot
 	if !ThreadPattern.MatchString(url) {
 		return snap, errors.New("recovery requires a stored thread and exact original prompt")
@@ -376,15 +404,36 @@ func (c *Client) snapshotThread(ctx context.Context, url string, expected ...str
 		return snap, fmt.Errorf("recovery user boundary: %w", err)
 	}
 	snap.answerNext, snap.answers = corr.AnswerNext, corr.Answers
-	snap.userID = corr.UserID
+	// Journaled submit linkage overrides last-bubble correlation for the
+	// source fetch: verify the pending against the bubble it became, not
+	// whatever happens to be last. When the thread moved on (recorded
+	// bubble is no longer last), keep exact legacy last-bubble semantics.
+	fetchID := corr.UserID
+	if boundID != "" {
+		if corr.UserID == "" {
+			// Nothing rendered to correlate: page not ready, not a
+			// verdict. Same retryable shape as the bubble path below.
+			return snap, errors.New("recovery user boundary not fully rendered yet; retry")
+		}
+		if corr.UserID == boundID {
+			fetchID = boundID
+		}
+	}
+	snap.userID = fetchID
+	snap.boundRequested = boundID != ""
+	snap.boundIsLast = boundID != "" && corr.UserID != "" && boundID == corr.UserID
 	// The actual DOM-bound node, never a latest/branch mapping walk. The
 	// composer stores plain paragraphs as escaped CommonMark. Decode that
 	// declared format with a real parser, not guessed slash/prefix stripping.
 	userText := normalizeRecoveryPrompt(corr.User)
 	snap.srcPath = "bubble"
-	if corr.UserID != "" {
-		raw, markdown, err := fetchUserSource(tab, corr.UserID)
+	if fetchID != "" {
+		raw, markdown, err := fetchUserSource(tab, fetchID)
 		if err != nil {
+			var srcErr *UserSourceError
+			if boundID != "" && errors.As(err, &srcErr) && srcErr.Reason == "message-missing" {
+				return snap, ErrBubbleGone
+			}
 			return snap, fmt.Errorf("recovery user source: %w", err)
 		}
 		// The stored serialization is the binding ground truth: the Markdown
@@ -545,6 +594,40 @@ type UserSourceError struct{ Reason string }
 
 func (e *UserSourceError) Error() string {
 	return fmt.Sprintf("stored user message unreadable (source=%s)", e.Reason)
+}
+
+// ErrBubbleGone reports a journaled submit bubble that is no longer in the
+// thread: the turn landed, then the thread changed (edit/branch/regenerate)
+// before read-back. Fail closed; nothing is adopted. Deliberately absent
+// from IsPreSubmit — the turn may have executed.
+var ErrBubbleGone = errors.New("submitted turn is no longer stored in the thread (thread changed since submit); nothing was adopted")
+
+// ErrPendingNeverStored reports a thread unchanged since submit that holds
+// no bubble for the pending turn: the send never landed. Fail closed.
+// Deliberately absent from IsPreSubmit — abandon, never blind-resend, is
+// the honest next step (a resend of a landed-but-unseen turn would
+// duplicate execution).
+var ErrPendingNeverStored = errors.New("submitted turn never landed in the thread (no new message stored); nothing was adopted")
+
+// lastUserBubbleID reads the DOM id of the thread's last rendered user
+// bubble. Read-only, content-free (an id only, never text). Used at submit
+// time to journal which bubble a pending turn became, so read-back verifies
+// against that recorded bubble instead of assuming pending == last bubble.
+// Returns "" when no user bubble is rendered (nothing stored yet).
+func lastUserBubbleID(tab context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(tab, 10*time.Second)
+	defer cancel()
+	js := `(() => {
+	  const h = [...document.querySelectorAll('h4')].filter(e => (e.textContent || '').trim() === 'You said:').at(-1);
+	  if (!h) return '';
+	  const owner = h.nextElementSibling?.closest('[data-message-id], [data-chatgpt-search-message-ids]') || h.closest('[data-message-id], [data-chatgpt-search-message-ids], [data-turn-key]');
+	  return (owner?.getAttribute('data-message-id') || owner?.getAttribute('data-chatgpt-search-message-ids') || owner?.getAttribute('data-turn-key') || '').trim().split(/\s+/).at(-1) || '';
+	})()`
+	var id string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &id)); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // fetchUserSource returns the backend mapping's declared serialization of one

@@ -417,6 +417,11 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	h.appendSent(sentEntry{Event: "submitted", Session: id, URL: threadURL, PromptHash: promptHash(prompt), Bytes: len(prompt), Chunk: len(recordTurns) + 1, Chunks: len(recordTurns) + 1, Note: "rotation-final intent"})
 	res, err := h.client.AskThreadTurn(r.Context(), cardOpt)
 	h.recordTurnOutcome(id, prompt, threadURL, res, err, len(recordTurns)+1, len(recordTurns)+1)
+	// Journal linkage for the rotation final, like the normal loop: the
+	// pending prompt is verified against this bubble on read-back.
+	if res.BubbleID != "" {
+		s.PendingBubbleID = res.BubbleID
+	}
 	seedTurns++
 	seedBytes += len(prompt)
 	if err != nil {
@@ -502,7 +507,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 	}
 	s.Fingerprint, s.Result, s.Dirty = fingerprint, out, false
 	s.ToolsFP = toolsFP
-	s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
+	s.PendingRequest, s.PendingPrompt, s.Phase, s.PendingBubbleID = nil, "", "", ""
 	s.RepairPendingPrompt = ""
 	// The new thread URL is known only now: overwrite any previous event's
 	// entry with this rotation's linkage so evidence never goes stale.

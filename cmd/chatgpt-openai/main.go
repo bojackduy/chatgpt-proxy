@@ -183,11 +183,18 @@ type session struct {
 	// ToolsFP is the fingerprint of the tool set whose full schemas were last
 	// taught to this thread. The thread holds them server-side afterwards, so
 	// later turns only need a compact reminder (see toolReminder).
-	ToolsFP             string
-	PendingRequest      *completionsRequest `json:",omitempty"`
-	PendingPrompt       string              `json:",omitempty"`
-	RepairFingerprint   string              `json:",omitempty"`
-	RepairPendingPrompt string              `json:",omitempty"`
+	ToolsFP        string
+	PendingRequest *completionsRequest `json:",omitempty"`
+	PendingPrompt  string              `json:",omitempty"`
+	// PendingBubbleID is the DOM id of the user bubble the pending final
+	// prompt became, captured at send observation. Read-back verifies the
+	// pending against this recorded bubble instead of assuming pending ==
+	// last bubble. Empty on legacy journals and when capture failed, where
+	// read-back falls back to DOM correlation. Cleared together with the
+	// pending binding everywhere it is cleared.
+	PendingBubbleID     string `json:",omitempty"`
+	RepairFingerprint   string `json:",omitempty"`
+	RepairPendingPrompt string `json:",omitempty"`
 	// Phase records where an in-flight turn was when it failed, so recovery
 	// can distinguish "nothing executable happened" from genuine uncertainty:
 	// "replay" means only inert history-import (ACK) turns were in flight and
@@ -1540,7 +1547,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		next.URL, next.Messages, next.ToolsFP = "", nil, ""
 		next.Fingerprint, next.Result = "", result{}
 		next.Dirty, next.Phase = false, ""
-		next.PendingRequest, next.PendingPrompt = nil, ""
+		next.PendingRequest, next.PendingPrompt, next.PendingBubbleID = nil, "", ""
 		s = &next
 		log.Printf("[openai] continuation reason=uncertain_branch incoming_messages=%d planned=%v", len(req.Messages), reseedPlan != nil)
 	}
@@ -1598,7 +1605,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			s.RejectedFingerprint = s.Fingerprint // upgrade existing rejected journals
 		}
 		s.URL, s.Messages, s.ToolsFP, s.Fingerprint, s.Result = "", nil, "", "", result{}
-		s.PendingRequest, s.PendingPrompt, s.Phase = nil, "", ""
+		s.PendingRequest, s.PendingPrompt, s.Phase, s.PendingBubbleID = nil, "", "", ""
 	}
 	url := s.URL
 	decision := "fresh"
@@ -1775,10 +1782,11 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// adoption (or 409) on retry.
 			if t.replay {
 				s.Phase = "replay"
-				s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt = nil, "", ""
+				s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt, s.PendingBubbleID = nil, "", "", ""
 			} else {
 				s.Phase = "final"
 				s.PendingRequest, s.PendingPrompt = &req, t.prompt
+				s.PendingBubbleID = ""
 				s.RepairPendingPrompt = ""
 			}
 			if err := h.save(); err != nil {
@@ -1790,6 +1798,13 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			h.appendSent(sentEntry{Event: "submitted", Session: id, URL: url, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(turns)})
 		}
 		res, err := h.eagerThreadTurn(r, id, lane, req, s, t, url, thinking, decision, resync)
+		// Journal linkage: bind the pending final prompt to the bubble it
+		// became, so read-back verifies against the recorded bubble instead
+		// of assuming pending == last bubble. Replay imports never own the
+		// pending binding.
+		if !t.replay && res.BubbleID != "" {
+			s.PendingBubbleID = res.BubbleID
+		}
 		if t.replay && err != nil && answerlessTurn(err) {
 			// A replay turn plants history text; the model's acknowledgement is
 			// optional. Treating a missing ACK as a failed turn wedged chats
@@ -1816,7 +1831,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// chat behind the single lane proceeds.
 			if lane == "title" {
 				s.Dirty, s.Phase = false, ""
-				s.PendingRequest, s.PendingPrompt = nil, ""
+				s.PendingRequest, s.PendingPrompt, s.PendingBubbleID = nil, "", ""
 				if id != "" {
 					if serr := h.save(); serr != nil {
 						h.backendError(w, serr)
@@ -1831,7 +1846,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			if chatgpt.IsPreSubmit(err) || (res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err)) {
 				// Stage evidence concerns this turn, not whether an older thread exists.
 				s.Dirty, s.Phase = false, ""
-				s.PendingRequest, s.PendingPrompt = nil, ""
+				s.PendingRequest, s.PendingPrompt, s.PendingBubbleID = nil, "", ""
 				if id != "" {
 					if serr := h.save(); serr != nil {
 						h.backendError(w, serr)
@@ -1932,7 +1947,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	s.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	s.URL, s.Fingerprint, s.Result, s.Dirty = url, fingerprint, out, false
 	s.ToolsFP = toolsFP // this thread now knows exactly this tool set
-	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt, s.Phase = nil, "", "", ""
+	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt, s.Phase, s.PendingBubbleID = nil, "", "", "", ""
 	seedBytes := 0
 	if reseedPlan != nil {
 		// The new thread URL is known only now: record the old→new

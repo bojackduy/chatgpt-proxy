@@ -131,7 +131,7 @@ func (h *handler) tryAutoResync(r *http.Request, id string, s *session, mismatch
 	s.Messages = append(append([]message{}, pending.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	s.Fingerprint, s.Result, s.Dirty, s.Phase = fp, out, false, ""
 	s.ToolsFP = toolsFingerprint(pending.Tools)
-	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt = nil, "", ""
+	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt, s.PendingBubbleID = nil, "", "", ""
 	s.AutoResyncEvidence = fmt.Sprintf("auto-resync %s: transplanted %dB thread answer (hash %s) with %d tool call(s) [%s] from thread %s; thread submission hash %s == sent-log %s entry (%s); pending hash %s differed by structural spans %s, proving pending-overwritten-by-retry desync; deemed safe: thread holds this session's verifiably complete answer and every call validated against the pending schemas and recorded (never executed by recovery)",
 		time.Now().UTC().Format(time.RFC3339), len(res.Answer), shortHash12(chatgpt.PromptHash(res.Answer)), len(out.Calls), strings.Join(callIDs, ","), s.URL, shortHash12(entry.PromptHash), entry.Event, entry.At, shortHash12(pendingHash), mismatch.Spans)
 	if err := h.save(); err != nil {

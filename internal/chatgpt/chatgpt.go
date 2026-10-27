@@ -991,9 +991,11 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	// up front. submit still downgrades this to ErrNotSubmitted when the DOM
 	// proves the turn never reached the thread.
 	submissionAttempted = true
-	if err := c.submit(ctx, tab, opt.Prompt); err != nil {
+	bubbleID, err := c.submit(ctx, tab, opt.Prompt)
+	if err != nil {
 		return out, err
 	}
+	out.BubbleID = bubbleID
 
 	// 5. Wait for the answer.
 	log.Printf("[chatgpt] waiting for answer (timeout: %v)...", timeout)
@@ -1092,7 +1094,7 @@ func (c *Client) AskThreadTurn(ctx context.Context, opt TurnOptions) (out TurnRe
 	enteredTurn = true
 	res, err := c.askLocked(ctx, opt, page, DefaultTimeout, 3*time.Second, nil)
 	if err != nil {
-		return TurnResult{URL: res.URL}, err
+		return TurnResult{URL: res.URL, BubbleID: res.BubbleID}, err
 	}
 	res.ProjectURL = projectURL
 	if !ThreadPattern.MatchString(res.URL) {
@@ -1897,11 +1899,11 @@ const sendButtonExpr = `(document.querySelector('[data-testid="send-button"]')
 	    || document.querySelector('button[aria-label="Send prompt"]')
 	    || document.querySelector('button[aria-label="Send"]'))`
 
-func (c *Client) submit(ctx context.Context, tab context.Context, prompt string) error {
+func (c *Client) submit(ctx context.Context, tab context.Context, prompt string) (string, error) {
 	tab, cancelRequest := requestContext(ctx, tab)
 	defer cancelRequest()
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	readyJS := fmt.Sprintf("(() => { const btn = %s; return !!btn && !btn.disabled; })()", sendButtonExpr)
 	sendJS := fmt.Sprintf(`(() => {
@@ -1927,7 +1929,7 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	var lastRead error
 	for {
 		if err := tab.Err(); err != nil {
-			return err
+			return "", err
 		}
 		probe, cancel := context.WithTimeout(tab, 10*time.Second)
 		var enabled bool
@@ -1940,11 +1942,11 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 		lastRead = err
 		if time.Now().After(readyDeadline) {
 			log.Printf("[chatgpt-flow] id=%s stage=send_ready enabled=false waited=%s last_err=%v", id, time.Since(started).Round(time.Millisecond), lastRead)
-			return fmt.Errorf("%w: Send control never became enabled after %s with %d bytes inserted; nothing was submitted",
+			return "", fmt.Errorf("%w: Send control never became enabled after %s with %d bytes inserted; nothing was submitted",
 				ErrNotSubmitted, time.Since(started).Round(time.Millisecond), len(prompt))
 		}
 		if err := pause(tab, 500*time.Millisecond); err != nil {
-			return err
+			return "", err
 		}
 	}
 	// Phase 2: dispatch exactly once. Only a failure or an unprovable reply
@@ -1962,12 +1964,12 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	}
 	log.Printf("[chatgpt-flow] id=%s stage=send_click clicked=%v err=%v", id, clicked, err)
 	if err != nil {
-		return fmt.Errorf("send action outcome unknown: %w", err)
+		return "", fmt.Errorf("send action outcome unknown: %w", err)
 	}
 	if !clicked {
 		// The control went disabled between the read and the click. Nothing was
 		// dispatched, so this is still a proven pre-send outcome.
-		return fmt.Errorf("%w: Send control disabled again before the click; nothing was submitted", ErrNotSubmitted)
+		return "", fmt.Errorf("%w: Send control disabled again before the click; nothing was submitted", ErrNotSubmitted)
 	}
 	// Phase 3: observe only. A click whose turn never appears stays uncertain:
 	// the request may be in flight while React has not cleared the draft yet.
@@ -1976,17 +1978,26 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	for time.Now().Before(observeDeadline) {
 		retries++
 		if err := pause(tab, 700*time.Millisecond); err != nil {
-			return fmt.Errorf("send action outcome unknown: %w", err)
+			return "", fmt.Errorf("send action outcome unknown: %w", err)
 		}
 		if err := tab.Err(); err != nil {
-			return fmt.Errorf("send action outcome unknown: %w", err)
+			return "", fmt.Errorf("send action outcome unknown: %w", err)
 		}
 		if sent, err := c.turnSubmitted(tab); err == nil && sent {
 			// The turn reached the thread: its draft is no longer scratch
 			// space and there is nothing left to reconcile.
 			c.clearDraftOwnership()
 			log.Printf("[chatgpt-flow] id=%s stage=send_observed result=submitted retries=%d", id, retries)
-			return nil
+			// Journal linkage: record which bubble this submitted turn
+			// became, so read-back verifies against it instead of assuming
+			// pending == last bubble. Best-effort: a capture failure
+			// leaves "" and read-back falls back to DOM correlation.
+			bubbleID, berr := lastUserBubbleID(tab)
+			if berr != nil {
+				log.Printf("[chatgpt-flow] id=%s stage=bubble_capture failed: %v", id, berr)
+				return "", nil
+			}
+			return bubbleID, nil
 		}
 	}
 	proof, perr := c.turnUnsubmitted(tab, prompt)
@@ -1998,9 +2009,9 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 		// reached the thread, so this is a pre-send refusal and must not be
 		// recorded as an uncertain turn. A paste this large disables Send
 		// outright, which used to wedge the chat as "outcome unproven".
-		return fmt.Errorf("%w: the composer kept the exact text and its Send control stayed disabled; nothing was submitted", ErrNotSubmitted)
+		return "", fmt.Errorf("%w: the composer kept the exact text and its Send control stayed disabled; nothing was submitted", ErrNotSubmitted)
 	}
-	return errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM — outcome unproven")
+	return "", errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM — outcome unproven")
 }
 
 // provablyUnsubmitted is the strongest pre-send proof the DOM can give: the

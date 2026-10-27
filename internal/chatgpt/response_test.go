@@ -93,7 +93,7 @@ func TestResponseDOMIdentityAndScope(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(tab, 2200*time.Millisecond)
 		defer cancel()
-		if err := (&Client{}).submit(ctx, tab, "draft"); err == nil || errors.Is(err, ErrNotSubmitted) {
+		if _, err := (&Client{}).submit(ctx, tab, "draft"); err == nil || errors.Is(err, ErrNotSubmitted) {
 			t.Fatalf("in-flight/cancelled Send lost uncertainty: %v", err)
 		}
 		var clicks int

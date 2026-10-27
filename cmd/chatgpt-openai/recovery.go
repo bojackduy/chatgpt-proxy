@@ -15,7 +15,7 @@ import (
 )
 
 type recoveryBackend interface {
-	ReadThreadTurn(context.Context, string, string) (chatgpt.TurnResult, error)
+	ReadThreadTurn(context.Context, string, string, string) (chatgpt.TurnResult, error)
 }
 
 // An absent binding is not evidence that a turn was never submitted. Replay is
@@ -74,7 +74,7 @@ func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (chatg
 	var res chatgpt.TurnResult
 	for {
 		var err error
-		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt)
+		res, err = backend.ReadThreadTurn(ctx, s.URL, s.PendingPrompt, s.PendingBubbleID)
 		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
 			if err := h.rejectCompleted(s, requestFingerprint(*pending), rejectEmptyFinal); err != nil {
 				return chatgpt.TurnResult{}, nil, false, ""
@@ -362,7 +362,7 @@ func (h *handler) recheckRejectedReply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req, url, prompt := *s.PendingRequest, s.URL, s.PendingPrompt
-	res, err := backend.ReadThreadTurn(r.Context(), url, prompt)
+	res, err := backend.ReadThreadTurn(r.Context(), url, prompt, s.PendingBubbleID)
 	if err != nil {
 		reason := "source_unreadable"
 		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
@@ -464,7 +464,7 @@ func (h *handler) correctRejectedFormat(w http.ResponseWriter, r *http.Request) 
 			apiError(w, 503, errors.New("backend cannot inspect stored responses"))
 			return
 		}
-		res, err := backend.ReadThreadTurn(r.Context(), url, s.PendingPrompt)
+		res, err := backend.ReadThreadTurn(r.Context(), url, s.PendingPrompt, s.PendingBubbleID)
 		if err != nil || strings.TrimSpace(res.Answer) == "" {
 			log.Printf("[openai] session=%s format correction refused reason=no_rejected_sample", id)
 			apiErrorDetail(w, http.StatusConflict, errors.New("the rejected reply could not be read back exactly, so a correction cannot be prepared honestly; nothing was sent"), map[string]any{"reason": "no_rejected_sample"})
@@ -657,7 +657,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 503, errors.New("backend cannot inspect stored responses"))
 		return
 	}
-	res, err := backend.ReadThreadTurn(r.Context(), threadURL, prompt)
+	res, err := backend.ReadThreadTurn(r.Context(), threadURL, prompt, s.PendingBubbleID)
 	if errors.Is(err, chatgpt.ErrCompletedEmpty) {
 		old := *s
 		s.URL = threadURL // completed-empty proof includes exact pending binding
@@ -726,7 +726,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 	recovered.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
 	recovered.Fingerprint, recovered.Result, recovered.Dirty, recovered.Phase = fp, out, false, ""
 	recovered.ToolsFP = toolsFingerprint(req.Tools)
-	recovered.PendingRequest, recovered.PendingPrompt = nil, ""
+	recovered.PendingRequest, recovered.PendingPrompt, recovered.PendingBubbleID = nil, "", ""
 	h.sessions[id] = &recovered
 	if err := h.save(); err != nil {
 		h.sessions[id] = s
