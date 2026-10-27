@@ -2693,3 +2693,38 @@ func TestOversizedSingleMessageFailsFastWithoutSubmitting(t *testing.T) {
 		t.Fatalf("refusal left a dirty journal: %+v", s)
 	}
 }
+
+// A long history is replayed in pasteable chunks instead of one giant paste:
+// a single oversized paste is accepted by the composer and then produces no
+// answer at all, which is what leaves a chat unverifiable.
+func TestLongHistoryIsChunkedUnderThePasteLimit(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxChars = 200000
+	h.maxPaste = 150000
+	req := completionsRequest{Model: "chatgpt-web"}
+	for range 3 {
+		req.Messages = append(req.Messages,
+			message{Role: "user", Content: strings.Repeat("q", 60000)},
+			message{Role: "assistant", Content: strings.Repeat("a", 60000)})
+	}
+	req.Messages = append(req.Messages, message{Role: "user", Content: "next question"})
+	turns, err := h.buildTurns(req, req.Messages, toolReminder(req))
+	if err != nil {
+		t.Fatalf("buildTurns: %v", err)
+	}
+	if len(turns) < 2 {
+		t.Fatalf("history was pasted whole in %d turn(s)", len(turns))
+	}
+	for i, tr := range turns {
+		if len(tr.prompt) > h.maxPaste {
+			t.Fatalf("turn %d is %d bytes, over the %d-byte paste limit", i+1, len(tr.prompt), h.maxPaste)
+		}
+	}
+	last := turns[len(turns)-1]
+	if last.replay {
+		t.Fatal("last turn must be the question, not a replay")
+	}
+	if !strings.Contains(last.prompt, "next question") {
+		t.Fatal("last turn lost the question")
+	}
+}

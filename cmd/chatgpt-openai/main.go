@@ -924,9 +924,18 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 	if historyOverhead := len(historyIntro) + len(historyEnd) + len(ack); historyOverhead > overhead {
 		overhead = historyOverhead
 	}
+	// The paste limit binds a single submission just as the per-turn budget
+	// does. Without it a 190KB history replay is accepted as ONE paste, the
+	// composer stalls, and the turn ends with no answer — the exact failure
+	// that leaves a chat unverifiable. Chunking the history instead keeps every
+	// submission pasteable; only the small final question follows it.
+	limitCap := h.maxChars
+	if h.maxPaste > 0 && (limitCap <= 0 || h.maxPaste < limitCap) {
+		limitCap = h.maxPaste
+	}
 	limit := 0
-	if h.maxChars > 0 {
-		if limit = h.maxChars - overhead; limit < 1 {
+	if limitCap > 0 {
+		if limit = limitCap - overhead; limit < 1 {
 			limit = 1
 		}
 	}
@@ -958,7 +967,7 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 		log.Printf("[openai] turn plan refused reason=paste_too_large final_bytes=%d paste_limit=%d max_chars=%d", finalBytes, h.maxPaste, h.maxChars)
 		return nil, fmt.Errorf("this request needs a single %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", finalBytes, h.maxPaste)
 	}
-	if h.maxChars <= 0 || len(combined) <= h.maxChars {
+	if limitCap <= 0 || len(combined) <= limitCap {
 		return []turn{{prompt: combined, atts: append(ha, ca...)}}, nil
 	}
 	var turns []turn
@@ -986,6 +995,10 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 		p := historyIntro + text + historyEnd + ack
 		if last {
 			p = head + currentIntro + text + tail
+			if h.maxPaste > 0 && len(p) > h.maxPaste {
+				log.Printf("[openai] turn plan refused reason=paste_too_large final_bytes=%d paste_limit=%d", len(p), h.maxPaste)
+				return nil, fmt.Errorf("the final question needs a single %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", len(p), h.maxPaste)
+			}
 		}
 		turns = append(turns, turn{prompt: p, atts: atts, replay: !last, synced: g[len(g)-1].end})
 	}
