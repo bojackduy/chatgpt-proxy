@@ -1639,41 +1639,41 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				decision, start = "delta-continue", mismatch.Index
 				log.Printf("[openai] session=%s lane=%s decision=delta-continue mismatch=%d:%s confoff=%d saved=%d", id, lane, mismatch.Index, mismatch.Field, mismatch.ContentOff, len(s.Messages))
 			} else {
-			// The client history no longer matches the stored thread (client
-			// compaction or a reused session ID). Re-establish context by
-			// replaying the full client history into a new thread instead of
-			// failing or concatenating it into one paste. The old thread is
-			// left untouched.
-			decision, start, url = "reset-replay", 0, ""
-			// History-rewrite reseed: the incoming history is a coherent
-			// rewrite (revert/fork/compaction) of committed state, so seed
-			// a fresh thread with the rewritten timeline plus carried
-			// executed results instead of replaying blind. The classifier
-			// runs BEFORE any rotation below so the rotation travels with
-			// the prior-execution record and always commits fresh evidence
-			// instead of shadowing the reseed. Incoherent input plans
-			// nothing and keeps the legacy reset-replay below (clean
-			// sessions hold no uncertainty to protect); a plan armed by
-			// the dirty branch above (uncertainty abandoned) is reused
-			// as-is.
-			if reseedPlan == nil {
-				reseedPlan = h.planCleanReseed(s, req)
-			}
-			// Flag-gated project-per-session: rotate into the session's
-			// dedicated project instead of reset-replaying, carrying the
-			// plan above record-first. serveRotation falls back only on a
-			// proved pre-submission navigation failure; a possibly
-			// submitted turn remains protected.
-			if projectPerSessionEnabled() && id != "" && !resync {
-				if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
-					return
+				// The client history no longer matches the stored thread (client
+				// compaction or a reused session ID). Re-establish context by
+				// replaying the full client history into a new thread instead of
+				// failing or concatenating it into one paste. The old thread is
+				// left untouched.
+				decision, start, url = "reset-replay", 0, ""
+				// History-rewrite reseed: the incoming history is a coherent
+				// rewrite (revert/fork/compaction) of committed state, so seed
+				// a fresh thread with the rewritten timeline plus carried
+				// executed results instead of replaying blind. The classifier
+				// runs BEFORE any rotation below so the rotation travels with
+				// the prior-execution record and always commits fresh evidence
+				// instead of shadowing the reseed. Incoherent input plans
+				// nothing and keeps the legacy reset-replay below (clean
+				// sessions hold no uncertainty to protect); a plan armed by
+				// the dirty branch above (uncertainty abandoned) is reused
+				// as-is.
+				if reseedPlan == nil {
+					reseedPlan = h.planCleanReseed(s, req)
 				}
-				log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
-			}
-			if reseedPlan != nil {
-				decision = "rewrite-reseed"
-				log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
-			}
+				// Flag-gated project-per-session: rotate into the session's
+				// dedicated project instead of reset-replaying, carrying the
+				// plan above record-first. serveRotation falls back only on a
+				// proved pre-submission navigation failure; a possibly
+				// submitted turn remains protected.
+				if projectPerSessionEnabled() && id != "" && !resync {
+					if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
+						return
+					}
+					log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
+				}
+				if reseedPlan != nil {
+					decision = "rewrite-reseed"
+					log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+				}
 			}
 		}
 	}
@@ -1810,6 +1810,20 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			h.appendSent(sentEntry{Event: disp, Session: id, URL: res.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(turns), AnswerHash: answerHash})
 		}
 		if err != nil {
+			// Title turns carry no tools and protect no transcript: a naming
+			// failure must never wedge a journal as uncertain. Clear the
+			// binding so the failure reports uncertain=false and the real
+			// chat behind the single lane proceeds.
+			if lane == "title" {
+				s.Dirty, s.Phase = false, ""
+				s.PendingRequest, s.PendingPrompt = nil, ""
+				if id != "" {
+					if serr := h.save(); serr != nil {
+						h.backendError(w, serr)
+						return
+					}
+				}
+			}
 			// Persist the URL only when the turn really reached a conversation,
 			// so the dirty journal records a usable repair target, not a page
 			// like the Project root. Uncertain sessions still return 409 and

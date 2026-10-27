@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -526,6 +527,17 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 // failure before any conversation exists (provably nothing submitted) it
 // falls back to the shared project once rather than failing closed. A minted
 // project URL is stored on s for the caller to persist with its normal save.
+// titleTimeout bounds low-value title turns: a short plain-text naming answer
+// must never hog the single browser lane for the full 10-minute turn
+// timeout while the real chat waits behind it. Main turns keep r's own
+// deadline untouched. The caller defers the returned cancel.
+func titleTimeout(r *http.Request, lane string) (context.Context, context.CancelFunc) {
+	if lane != "title" {
+		return r.Context(), func() {}
+	}
+	return context.WithTimeout(r.Context(), 3*time.Minute)
+}
+
 func (h *handler) eagerThreadTurn(r *http.Request, id, lane string, req completionsRequest, s *session, t turn, page string, thinking bool, decision string, resync bool) (chatgpt.TurnResult, error) {
 	opt := chatgpt.TurnOptions{Prompt: t.prompt, URL: page, Attachments: t.atts, Thinking: thinking}
 	eager := decision == "fresh" && page == "" && id != "" && !resync && projectPerSessionEnabled()
@@ -536,11 +548,13 @@ func (h *handler) eagerThreadTurn(r *http.Request, id, lane string, req completi
 			eager = false
 		}
 	}
-	res, err := h.client.AskThreadTurn(r.Context(), opt)
+	tctx, cancel := titleTimeout(r, lane)
+	defer cancel()
+	res, err := h.client.AskThreadTurn(tctx, opt)
 	if err != nil && eager && res.URL == "" && s.URL == "" && chatgpt.IsNavigateError(err) {
 		log.Printf("[openai] session=%s lane=%s eager_fallback reason=%v; using shared project", id, lane, err)
 		eager = false
-		res, err = h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{Prompt: t.prompt, URL: page, Attachments: t.atts, Thinking: thinking})
+		res, err = h.client.AskThreadTurn(tctx, chatgpt.TurnOptions{Prompt: t.prompt, URL: page, Attachments: t.atts, Thinking: thinking})
 	}
 	if err == nil && eager && res.ProjectURL != "" {
 		s.Project = res.ProjectURL

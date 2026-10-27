@@ -2984,3 +2984,41 @@ func TestRotationCappedCardShrinksInsteadOfFullReplay(t *testing.T) {
 		t.Fatalf("capped rotation did not complete: status=%d %s", w.Code, w.Body.String())
 	}
 }
+
+func TestTitleTurnFailureLeavesJournalClean(t *testing.T) {
+	f := &fakeBackend{err: errors.New("title answer never arrived"), errorURL: "https://chatgpt.com/c/title-1"}
+	h := testHandler(f)
+	req := completionsRequest{Model: "chatgpt-web", Messages: []message{{Role: "user", Content: "Name this chat about lunch"}}}
+	b, _ := json.Marshal(req)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b))
+	r.Header.Set("X-Session-Id", "title-clean")
+	r.Header.Set("X-OpenCode-Request-Lane", "title")
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, r)
+	if w.Code == 200 {
+		t.Fatal("failing title turn must not succeed")
+	}
+	for id, sess := range h.sessions {
+		if sess.Dirty || sess.PendingRequest != nil || sess.Phase != "" {
+			t.Fatalf("title failure wedged journal %s dirty=%v phase=%q", id, sess.Dirty, sess.Phase)
+		}
+	}
+}
+
+func TestTitleCtxBoundsOnlyTitleLane(t *testing.T) {
+	r := httptest.NewRequest("POST", "/", nil)
+	ctx, cancel := titleTimeout(r, "main")
+	defer cancel()
+	if ctx != r.Context() {
+		t.Fatal("main lane must keep the request context untouched")
+	}
+	ctx, cancel = titleTimeout(r, "title")
+	defer cancel()
+	dl, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("title lane must carry a deadline")
+	}
+	if time.Until(dl) > 3*time.Minute+10*time.Second || time.Until(dl) <= 0 {
+		t.Fatalf("title deadline out of range: %v", time.Until(dl))
+	}
+}
