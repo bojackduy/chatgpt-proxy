@@ -1640,11 +1640,18 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			// dirty session (the thread may hold an abandoned turn), never
 			// for incoherent input, and never for a non-string or large
 			// rewrite — those keep the reseed/rotation path below.
+			//
+			// The bound is on divergence SIZE (byte-length delta of the two
+			// shapes), never on the first-difference offset: a 7-char
+			// touch-up at offset 1530 is smaller than a full replacement
+			// diverging at offset 0, and gating on offset gets exactly
+			// that backwards.
+			divBytes, divOK := contentDivergence(mismatch)
 			if !s.Dirty && len(s.Messages) >= 8 && mismatch.Index >= len(s.Messages)-8 &&
-				mismatch.ContentOff >= 0 && mismatch.ContentOff <= 1024 &&
+				mismatch.Field == "content" && divOK && divBytes <= 256 &&
 				coherentTranscript(req.Messages) && h.sentEntryForThread(id, s.URL) != nil {
 				decision, start = "delta-continue", mismatch.Index
-				log.Printf("[openai] session=%s lane=%s decision=delta-continue mismatch=%d:%s confoff=%d saved=%d", id, lane, mismatch.Index, mismatch.Field, mismatch.ContentOff, len(s.Messages))
+				log.Printf("[openai] session=%s lane=%s decision=delta-continue mismatch=%d:%s divbytes=%d saved=%d", id, lane, mismatch.Index, mismatch.Field, divBytes, len(s.Messages))
 			} else {
 				// The client history no longer matches the stored thread (client
 				// compaction or a reused session ID). Re-establish context by

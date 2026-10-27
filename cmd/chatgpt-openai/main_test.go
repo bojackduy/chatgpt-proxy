@@ -3059,3 +3059,63 @@ func TestBoundBubbleErrorsAreNeverPreSubmit(t *testing.T) {
 		}
 	}
 }
+
+func TestTailTouchUpAtHighOffsetContinuesSameThread(t *testing.T) {
+	// Live replica: 1530-byte saved assistant reply re-recorded with a
+	// 7-char tail touch-up (first diff at offset 1530). Gating on offset
+	// rotated this into a new thread plus a 39-turn reseed; gating on
+	// divergence size continues on the same thread once.
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	const threadURL = "https://chatgpt.com/c/thread-tail"
+	saved := make([]message, 0, 10)
+	for i := 0; i < 5; i++ {
+		saved = append(saved, message{Role: "user", Content: fmt.Sprintf("question %d", i)})
+		saved = append(saved, message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)})
+	}
+	saved[9] = message{Role: "assistant", Content: strings.Repeat("a", 1530)}
+	incoming := append([]message{}, saved...)
+	incoming[9] = message{Role: "assistant", Content: strings.Repeat("a", 1530) + "bbbbbbb"}
+	incoming = append(incoming, message{Role: "user", Content: "implement it"})
+	h.sessions["tail-touch"] = &session{URL: threadURL, Messages: saved}
+	h.sentLog = append(h.sentLog, sentEntry{Session: "tail-touch", URL: threadURL, Event: "completed", PromptHash: "seed"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: incoming}
+	w := request(h, "tail-touch", req)
+	if w.Code != 200 {
+		t.Fatalf("tail touch-up: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 1 || f.urls[0] != threadURL {
+		t.Fatalf("must continue on the same thread once, got urls=%v prompts=%d", f.urls, len(f.prompts))
+	}
+	if got := h.sessions["tail-touch"].URL; got != threadURL {
+		t.Fatalf("thread moved: %s", got)
+	}
+}
+
+func TestLargeRewriteRefusesDeltaContinue(t *testing.T) {
+	// Same position, opposite shape: a 5KB replacement diverging near
+	// offset 0 must keep the reseed/rotation path, never delta-continue.
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	const threadURL = "https://chatgpt.com/c/thread-rewrite"
+	saved := make([]message, 0, 10)
+	for i := 0; i < 5; i++ {
+		saved = append(saved, message{Role: "user", Content: fmt.Sprintf("question %d", i)})
+		saved = append(saved, message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)})
+	}
+	incoming := append([]message{}, saved...)
+	incoming[9] = message{Role: "assistant", Content: "CHANGED:" + strings.Repeat("z", 5000)}
+	incoming = append(incoming, message{Role: "user", Content: "implement it"})
+	h.sessions["big-rewrite"] = &session{URL: threadURL, Messages: saved}
+	h.sentLog = append(h.sentLog, sentEntry{Session: "big-rewrite", URL: threadURL, Event: "completed", PromptHash: "seed"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: incoming}
+	w := request(h, "big-rewrite", req)
+	if w.Code != 200 {
+		t.Fatalf("large rewrite: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) == 1 && len(f.urls) == 1 && f.urls[0] == threadURL {
+		t.Fatal("large rewrite must not delta-continue on the same thread")
+	}
+}

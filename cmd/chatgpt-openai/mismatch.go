@@ -38,6 +38,33 @@ func contentShape(v any) string {
 	}
 }
 
+// shapeBytes parses the byte count out of a "str:<bytes>:<lines>" shape,
+// or -1 when the value is not a plain string. Lets callers bound how MUCH
+// text diverged instead of where the first difference sits: a 7-char tail
+// touch-up at offset 1530 is a smaller rewrite than a full replacement
+// diverging at offset 0.
+func shapeBytes(shape string) int {
+	var n, l int
+	if _, err := fmt.Sscanf(shape, "str:%d:%d", &n, &l); err != nil {
+		return -1
+	}
+	return n
+}
+
+// contentDivergence returns the byte-length delta between the incoming and
+// saved sides of a content mismatch, or ok=false when either side is not a
+// plain string (multipart, null, other) and no size claim can be made.
+func contentDivergence(m *prefixMismatch) (delta int, ok bool) {
+	in, saved := shapeBytes(m.IncomingShape), shapeBytes(m.SavedShape)
+	if in < 0 || saved < 0 {
+		return 0, false
+	}
+	if in >= saved {
+		return in - saved, true
+	}
+	return saved - in, true
+}
+
 func contentEncoding(v any) string {
 	switch v.(type) {
 	case nil:
