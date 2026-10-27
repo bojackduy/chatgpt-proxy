@@ -2747,3 +2747,19 @@ func TestLargeToolCatalogDoesNotCountAgainstPasteLimit(t *testing.T) {
 		t.Fatalf("large catalog did not produce one answer turn: %d", len(turns))
 	}
 }
+
+func TestAnswerlessTurnOnlyMatchesMissingAnswer(t *testing.T) {
+	noAnswer := errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread")
+	if !answerlessTurn(noAnswer) {
+		t.Fatal("missing answer must be recognised")
+	}
+	for _, other := range []error{
+		nil,
+		errors.New("send did not submit the turn"),
+		errors.New("context canceled"),
+	} {
+		if answerlessTurn(other) {
+			t.Fatalf("%v must not be treated as an answerless turn", other)
+		}
+	}
+}

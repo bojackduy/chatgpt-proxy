@@ -840,6 +840,13 @@ func (h *handler) requestFormatRepair(r *http.Request, id, lane, url string, req
 // reason code for the log. The rejected text itself is never logged; the
 // code names only which validation branch fired so the next "why was my
 // turn refused" has an answer without re-running anything.
+// answerlessTurn reports a completed generation with no extractable answer.
+// ChatGPT sometimes renders nothing for an oversized chunk; the message itself
+// was still stored in the thread.
+func answerlessTurn(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "without an extractable new assistant answer")
+}
+
 func protocolReasonCode(err error) string {
 	if err == nil {
 		return "ok"
@@ -1728,6 +1735,13 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 			h.appendSent(sentEntry{Event: "submitted", Session: id, URL: url, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(turns)})
 		}
 		res, err := h.eagerThreadTurn(r, id, lane, req, s, t, url, thinking, decision, resync)
+		if t.replay && err != nil && answerlessTurn(err) {
+			// A replay turn plants history text; the model's acknowledgement is
+			// optional. Treating a missing ACK as a failed turn wedged chats
+			// whose large chunks produced no readable answer.
+			log.Printf("[openai] session=%s replayed chunk=%d/%d imported without an answer", id, i+1, len(turns))
+			err = nil
+		}
 		if id != "" {
 			disp, answerHash := "completed", ""
 			if err != nil {
@@ -1788,7 +1802,9 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		if t.replay {
 			// Acknowledgements are never parsed as executable tool calls. Fail
 			// closed on unexpected output rather than advancing a false prefix.
-			if strings.TrimSpace(res.Answer) != "ACK" {
+			// No output at all is not unexpected: the import is the user
+			// message, which reached the thread before generation started.
+			if got := strings.TrimSpace(res.Answer); got != "ACK" && got != "" {
 				h.backendError(w, errors.New("history import did not acknowledge with ACK; session remains uncertain"))
 				return
 			}
