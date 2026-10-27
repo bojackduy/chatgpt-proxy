@@ -47,6 +47,7 @@ func run() error {
 	background := flag.Bool("background", false, "minimize Chrome")
 	model := flag.String("model", "chatgpt-web", "model ID")
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per ChatGPT turn (chunk); long histories are replayed in chunks of this size, never one giant paste")
+	maxPaste := flag.Int("max-paste-bytes", 150000, "maximum bytes in the one final answer turn; above this the composer stalls and the bridge refuses before sending anything (0 disables)")
 	thinking := flag.Bool("thinking", false, "always select the ChatGPT Thinking model (reasoning)")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
 	maxParallel := flag.Int("max-parallel", parallelDefault, "maximum concurrent owned browser turns (1 serial compatibility, 2 parallel)")
@@ -64,7 +65,7 @@ func run() error {
 	cg := chatgpt.New(*port, *profile, *chrome)
 	cg.Background, cg.DedicatedTab = *background, true
 	defer cg.Close()
-	h := &handler{client: cg, model: *model, maxChars: *maxChars, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
+	h := &handler{client: cg, model: *model, maxChars: *maxChars, maxPaste: *maxPaste, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
 	if err := h.load(); err != nil {
 		return err
 	}
@@ -219,6 +220,7 @@ type handler struct {
 	client           backend
 	model            string
 	maxChars         int
+	maxPaste         int
 	statePath        string
 	profileDir       string // Chrome profile dir; scopes the cross-process turn lock
 	forceThinking    bool
@@ -889,7 +891,13 @@ type piece struct {
 // history is a single answer turn; a long history is replayed as bounded
 // transcript turns followed by the final answer turn. No turn exceeds
 // -max-chars (when > 0), so no single composer paste is ever oversized.
-func (h *handler) buildTurns(req completionsRequest, delta []message, head string) []turn {
+//
+// Two things are refused instead of attempted, because both leave a thread
+// holding a fragment that no read-only recovery can repair:
+//   - splitting ONE question across submissions (an interruption then leaves
+//     half a request with no answer that belongs to it);
+//   - a final turn bigger than -max-paste-bytes (the composer stalls).
+func (h *handler) buildTurns(req completionsRequest, delta []message, head string) ([]turn, error) {
 	tail := answerInstruction(req)
 	// Everything through the last completed assistant exchange is history. The
 	// remaining user/tool messages are the currently unanswered request.
@@ -943,8 +951,15 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 		combined += historyIntro + history + historyEnd
 	}
 	combined += currentIntro + current + tail
+	// The final answer turn is the only submission whose reply matters. Refuse
+	// an unpasteable one BEFORE anything is journaled or sent.
+	finalBytes := len(head) + len(currentIntro) + len(current) + len(tail)
+	if h.maxPaste > 0 && finalBytes > h.maxPaste {
+		log.Printf("[openai] turn plan refused reason=paste_too_large final_bytes=%d paste_limit=%d max_chars=%d", finalBytes, h.maxPaste, h.maxChars)
+		return nil, fmt.Errorf("this request needs a single %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", finalBytes, h.maxPaste)
+	}
 	if h.maxChars <= 0 || len(combined) <= h.maxChars {
-		return []turn{{prompt: combined, atts: append(ha, ca...)}}
+		return []turn{{prompt: combined, atts: append(ha, ca...)}}, nil
 	}
 	var turns []turn
 	// Keep history separate from the final request even when both are small
@@ -952,6 +967,17 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 	for _, g := range packPieces(pieces[:cut], limit) {
 		text, atts := render(g)
 		turns = append(turns, turn{prompt: historyIntro + text + historyEnd + ack, atts: atts, replay: true, synced: g[len(g)-1].end})
+	}
+	// One message is never cut across submissions: the earlier parts would be
+	// inert imports while the last one asks the question, so an interruption
+	// strands a request that has no answer of its own to read back.
+	if h.maxChars > 0 {
+		for _, pc := range pieces[cut:] {
+			if len(pc.text)+1 > limit {
+				log.Printf("[openai] turn plan refused reason=message_too_large message_bytes=%d turn_limit=%d max_chars=%d", len(pc.text), limit, h.maxChars)
+				return nil, fmt.Errorf("one message is %d bytes, over the %d-byte per-turn budget (fixed prompt overhead is about %d bytes). The bridge will not split a single message across submissions, because an interruption cannot be recovered. Nothing was sent and no tool was run; shorten the message or raise -max-chars", len(pc.text), limit, len(head)+len(currentIntro)+len(tail))
+			}
+		}
 	}
 	groups := packPieces(pieces[cut:], limit)
 	for i, g := range groups {
@@ -963,7 +989,7 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 		}
 		turns = append(turns, turn{prompt: p, atts: atts, replay: !last, synced: g[len(g)-1].end})
 	}
-	return turns
+	return turns, nil
 }
 
 // packPieces greedily groups transcript pieces under limit bytes, never merging
@@ -1573,9 +1599,17 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if teachFull {
 		head = toolPrompt(req)
 	}
-	turns := h.buildTurns(req, delta, head)
+	turns, terr := h.buildTurns(req, delta, head)
+	if terr != nil {
+		apiError(w, 400, terr)
+		return
+	}
 	if resync {
-		turns = h.buildResyncTurns(req, s.ResyncMessages, head)
+		turns, terr = h.buildResyncTurns(req, s.ResyncMessages, head)
+		if terr != nil {
+			apiError(w, 400, terr)
+			return
+		}
 	}
 	// A rewrite reseed travels with its prior-execution record first: the
 	// carried exchanges as inert ACK history imports ahead of the rewritten

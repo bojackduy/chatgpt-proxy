@@ -182,7 +182,7 @@ func (h *handler) rearmResyncFromLive(id string, s *session, req completionsRequ
 	return true
 }
 
-func (h *handler) buildResyncTurns(req completionsRequest, history []message, head string) []turn {
+func (h *handler) buildResyncTurns(req completionsRequest, history []message, head string) ([]turn, error) {
 	ack := "Reply with only the single word: ACK. No tool calls.\n"
 	pieces := make([]piece, 0, len(history))
 	for i, m := range history {
@@ -200,11 +200,14 @@ func (h *handler) buildResyncTurns(req completionsRequest, history []message, he
 		}
 		turns = append(turns, turn{prompt: historyIntro + text + historyEnd + ack, replay: true, synced: group[len(group)-1].end})
 	}
-	current := h.buildTurns(req, req.Messages[len(history):], head)
+	current, err := h.buildTurns(req, req.Messages[len(history):], head)
+	if err != nil {
+		return nil, err
+	}
 	for i := range current {
 		if current[i].replay {
 			current[i].synced += len(history)
 		}
 	}
-	return append(turns, current...)
+	return append(turns, current...), nil
 }

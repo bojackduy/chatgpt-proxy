@@ -758,7 +758,11 @@ func TestErrorsAndDirtyRetry(t *testing.T) {
 		}
 		req.ToolChoice, req.Stream = "auto", true
 		req.Messages = append(req.Messages, a, message{Role: "tool", ToolCallID: a.ToolCalls[0].ID, Content: "already completed result"})
-		f.expected = h.buildTurns(req, req.Messages[len(req.Messages)-1:], toolReminder(req))[0].prompt
+		turns1, err1 := h.buildTurns(req, req.Messages[len(req.Messages)-1:], toolReminder(req))
+		if err1 != nil {
+			t.Fatalf("buildTurns: %v", err1)
+		}
+		f.expected = turns1[0].prompt
 		f.err, f.errorURL, f.readErr = chatgpt.ErrMissingAnswer, h.sessions["post-tool-empty"].URL, chatgpt.ErrCompletedEmpty
 		w := request(h, "post-tool-empty", req)
 		s := h.sessions["post-tool-empty"]
@@ -1676,7 +1680,10 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 			}
 			req.Messages = append(req.Messages, message{Role: "user", Content: "Call current get_weather for Hanoi"})
 			req.Tools, req.ToolChoice = weatherReq().Tools, "required"
-			turns := h.buildTurns(req, req.Messages[2:], toolPrompt(req))
+			turns, terr := h.buildTurns(req, req.Messages[2:], toolPrompt(req))
+			if terr != nil {
+				t.Fatalf("buildTurns: %v", terr)
+			}
 			if len(turns) < 3 {
 				t.Fatal("test gap too small")
 			}
@@ -2625,5 +2632,64 @@ func TestProtocolReasonCodeIsContentFree(t *testing.T) {
 	}
 	if got := protocolReasonCode(nil); got != "ok" {
 		t.Fatalf("protocolReasonCode(nil) = %q, want ok", got)
+	}
+}
+
+// A single message is never split across submissions: an interruption would
+// leave the thread holding part of a request with no answer of its own.
+func TestBuildTurnsRefusesToSplitOneMessage(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxChars = 20000
+	req := completionsRequest{Messages: []message{{Role: "user", Content: strings.Repeat("x", 40000)}}}
+	turns, err := h.buildTurns(req, req.Messages, toolReminder(req))
+	if err == nil || len(turns) != 0 {
+		t.Fatalf("oversized single message produced %d turns, err=%v", len(turns), err)
+	}
+	if !strings.Contains(err.Error(), "will not split a single message") {
+		t.Fatalf("refusal does not explain splitting: %v", err)
+	}
+}
+
+// An unpasteable final turn is refused before anything is journaled or sent,
+// because the composer stalls above the single-paste limit.
+func TestBuildTurnsRefusesUnpasteableFinalTurn(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxChars = 200000
+	h.maxPaste = 1000
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	f := &fakeBackend{}
+	h.client = f
+	req := completionsRequest{Messages: []message{{Role: "user", Content: strings.Repeat("x", 5000)}}}
+	turns, err := h.buildTurns(req, req.Messages, toolReminder(req))
+	if err == nil || len(turns) != 0 {
+		t.Fatalf("unpasteable turn produced %d turns, err=%v", len(turns), err)
+	}
+	if !strings.Contains(err.Error(), "single-paste limit") {
+		t.Fatalf("refusal does not name the paste limit: %v", err)
+	}
+	if len(f.prompts) != 0 {
+		t.Fatalf("refused plan still submitted %d turns", len(f.prompts))
+	}
+}
+
+// The HTTP path refuses with 400 and sends nothing, so the session is neither
+// journaled nor left mid-submission.
+func TestOversizedSingleMessageFailsFastWithoutSubmitting(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxChars = 20000
+	f := &fakeBackend{}
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	req := weatherReq()
+	req.Messages = []message{{Role: "user", Content: strings.Repeat("x", 40000)}}
+	w := request(h, "too-big", req)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "will not split a single message") {
+		t.Fatalf("oversized message: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 0 {
+		t.Fatalf("nothing should be submitted, got %d", len(f.prompts))
+	}
+	if s := h.sessions["too-big"]; s != nil && (s.Dirty || s.Phase != "") {
+		t.Fatalf("refusal left a dirty journal: %+v", s)
 	}
 }
