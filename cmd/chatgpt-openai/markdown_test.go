@@ -63,7 +63,11 @@ func TestRenderedMarkdownProtocolAndPersistence(t *testing.T) {
 	h := testHandler(f.fakeBackend)
 	h.client = f
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
-	f.expected = h.buildTurns(req, req.Messages, toolReminder(req))[0].prompt
+	turns1, err1 := h.buildTurns(req, req.Messages, toolReminder(req))
+	if err1 != nil {
+		t.Fatalf("buildTurns: %v", err1)
+	}
+	f.expected = turns1[0].prompt
 	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected, ToolsFP: toolsFingerprint(req.Tools)}
 	if w := recoveryRequest(h, &req); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())

@@ -83,10 +83,18 @@ func TestReadOnlyLegacyRecoveryCachesWithoutSubmission(t *testing.T) {
 			t.Fatal("incomplete record changed or browser accessed")
 		}
 	}
-	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	turns1, err1 := h.buildTurns(req, req.Messages[1:], toolReminder(req))
+	if err1 != nil {
+		t.Fatalf("buildTurns: %v", err1)
+	}
+	f.expected = turns1[0].prompt
 	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
 	h.sessions["recover"] = s
-	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	turns2, err2 := h.buildTurns(req, req.Messages[1:], toolReminder(req))
+	if err2 != nil {
+		t.Fatalf("buildTurns: %v", err2)
+	}
+	f.expected = turns2[0].prompt
 	if w := recoveryRequest(h, &req); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
@@ -238,7 +246,11 @@ func TestRecoveredTurnCarriesRasterImages(t *testing.T) {
 	h := testHandler(f.fakeBackend)
 	h.client = f
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
-	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	turns3, err3 := h.buildTurns(req, req.Messages[1:], toolReminder(req))
+	if err3 != nil {
+		t.Fatalf("buildTurns: %v", err3)
+	}
+	f.expected = turns3[0].prompt
 	h.sessions["recover"] = &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Phase: "final", PendingRequest: &req, PendingPrompt: f.expected}
 	w := recoveryRequest(h, &req)
 	if w.Code != 200 {
@@ -585,7 +597,11 @@ func TestRecoveryFailsClosedAndKeepsDirty(t *testing.T) {
 			h.client = f
 			s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
 			h.sessions["recover"] = s
-			f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+			turns4, err4 := h.buildTurns(req, req.Messages[1:], toolReminder(req))
+			if err4 != nil {
+				t.Fatalf("buildTurns: %v", err4)
+			}
+			f.expected = turns4[0].prompt
 			pending := req
 			s.Phase, s.PendingRequest, s.PendingPrompt = "final", &pending, f.expected
 			switch mode {
@@ -941,7 +957,11 @@ func TestProtocolRefusalIsReportedAsRefusedNotEmpty(t *testing.T) {
 	h.statePath = filepath.Join(t.TempDir(), "state.json")
 	s := &session{URL: "https://chatgpt.com/c/stored", Dirty: true, Messages: req.Messages[:1], ToolsFP: toolsFingerprint(req.Tools)}
 	h.sessions["recover"] = s
-	f.expected = h.buildTurns(req, req.Messages[1:], toolReminder(req))[0].prompt
+	turns5, err5 := h.buildTurns(req, req.Messages[1:], toolReminder(req))
+	if err5 != nil {
+		t.Fatalf("buildTurns: %v", err5)
+	}
+	f.expected = turns5[0].prompt
 	pending := req
 	s.Phase, s.PendingRequest, s.PendingPrompt = "final", &pending, f.expected
 
