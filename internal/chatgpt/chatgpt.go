@@ -1824,9 +1824,23 @@ func (c *Client) submit(ctx context.Context, tab context.Context, prompt string)
 	}
 	proof, perr := c.turnUnsubmitted(tab, prompt)
 	proof.ActionAttempted = true
-	log.Printf("[chatgpt] send did not submit, outcome unproven after %d observations: readable=%v compLen=%d wantLen=%d composerExact=%v userBubble=%v generating=%v sendDisabled=%v probe=%v",
+	log.Printf("[chatgpt] send did not submit after %d observations: readable=%v compLen=%d wantLen=%d composerExact=%v userBubble=%v generating=%v sendDisabled=%v probe=%v",
 		retries, proof.Readable, proof.CompLen, proof.WantLen, proof.ComposerExact, proof.UserBubble, proof.Generating, proof.SendDisabled, perr)
+	if provablyUnsubmitted(proof) {
+		// The composer still holds the exact text and no turn exists: nothing
+		// reached the thread, so this is a pre-send refusal and must not be
+		// recorded as an uncertain turn. A paste this large disables Send
+		// outright, which used to wedge the chat as "outcome unproven".
+		return fmt.Errorf("%w: the composer kept the exact text and its Send control stayed disabled; nothing was submitted", ErrNotSubmitted)
+	}
 	return errors.New("send did not submit the turn; REPAIR: inspect composer/send DOM — outcome unproven")
+}
+
+// provablyUnsubmitted is the strongest pre-send proof the DOM can give: the
+// exact prompt is still in the composer and no user turn appeared, so the
+// submission never reached the thread.
+func provablyUnsubmitted(p sendProof) bool {
+	return p.Readable && p.ComposerExact && !p.UserBubble && !p.Generating && p.SendDisabled
 }
 
 // sendProof is the read-only DOM evidence used to decide whether a Send that

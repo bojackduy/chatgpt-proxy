@@ -47,7 +47,7 @@ func run() error {
 	background := flag.Bool("background", false, "minimize Chrome")
 	model := flag.String("model", "chatgpt-web", "model ID")
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per ChatGPT turn (chunk); long histories are replayed in chunks of this size, never one giant paste")
-	maxPaste := flag.Int("max-paste-bytes", 150000, "maximum bytes in the one final answer turn; above this the composer stalls and the bridge refuses before sending anything (0 disables)")
+	maxPaste := flag.Int("max-paste-bytes", 60000, "maximum bytes one submission may carry; above this the composer disables Send or stalls and the bridge refuses before sending anything (0 disables)")
 	thinking := flag.Bool("thinking", false, "always select the ChatGPT Thinking model (reasoning)")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
 	maxParallel := flag.Int("max-parallel", parallelDefault, "maximum concurrent owned browser turns (1 serial compatibility, 2 parallel)")

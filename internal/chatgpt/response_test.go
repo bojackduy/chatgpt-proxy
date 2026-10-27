@@ -1668,3 +1668,24 @@ func TestShadowWindowToleratesRenderingNotDifferentPrompt(t *testing.T) {
 		t.Fatalf("correlated=%v reason=%q", ok, reason)
 	}
 }
+
+// A disabled Send with the exact prompt still in the composer is a pre-send
+// refusal, not an uncertain turn: recording it as uncertain wedged the chat
+// after ChatGPT itself refused a 149635-byte paste.
+func TestProvablyUnsubmitted(t *testing.T) {
+	base := sendProof{Readable: true, ComposerExact: true, SendDisabled: true}
+	if !provablyUnsubmitted(base) {
+		t.Fatal("exact composer, no turn, disabled send must count as unsubmitted")
+	}
+	for name, p := range map[string]sendProof{
+		"bubble appeared":  {Readable: true, ComposerExact: true, SendDisabled: true, UserBubble: true},
+		"generating":       {Readable: true, ComposerExact: true, SendDisabled: true, Generating: true},
+		"composer differs": {Readable: true, SendDisabled: true},
+		"unreadable":       {ComposerExact: true, SendDisabled: true},
+		"send enabled":     {Readable: true, ComposerExact: true},
+	} {
+		if provablyUnsubmitted(p) {
+			t.Fatalf("%s must not count as unsubmitted", name)
+		}
+	}
+}
