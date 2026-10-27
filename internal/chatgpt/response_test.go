@@ -1952,3 +1952,16 @@ func TestChallengeMidTurnKeepsUncertainty(t *testing.T) {
 		t.Fatalf("challenge error must name the gate and forbid resend: %q", msg)
 	}
 }
+
+// A failed stored-source lookup names its step, stays content-free, and
+// survives the handler's wrap for errors.As classification.
+func TestUserSourceErrorNamesStep(t *testing.T) {
+	wrapped := fmt.Errorf("recovery user source: %w", &UserSourceError{Reason: "message-shape"})
+	var src *UserSourceError
+	if !errors.As(wrapped, &src) || src.Reason != "message-shape" {
+		t.Fatalf("typed reason lost through wrap: %v", wrapped)
+	}
+	if strings.Contains(wrapped.Error(), "0123456789") || strings.Contains(wrapped.Error(), "parts") {
+		t.Fatalf("source error must not leak content: %q", wrapped.Error())
+	}
+}

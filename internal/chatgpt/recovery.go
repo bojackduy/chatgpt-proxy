@@ -536,6 +536,17 @@ func projectSourceURLLinks(text, expected string) string {
 	return text
 }
 
+// UserSourceError classifies WHY the ID-bound stored user message could not
+// be read, so a read-back refusal can name the failed lookup step instead of
+// one opaque "unavailable". Reason is content-free (a step name only, never
+// message content): no-auth, fetch-failed, message-missing, message-shape,
+// or message-empty.
+type UserSourceError struct{ Reason string }
+
+func (e *UserSourceError) Error() string {
+	return fmt.Sprintf("stored user message unreadable (source=%s)", e.Reason)
+}
+
 // fetchUserSource returns the backend mapping's declared serialization of one
 // user turn: the stored text plus whether its declared render format is
 // Markdown. No decoding, no comparison — these raw bytes are the exact-binding
@@ -544,25 +555,28 @@ func fetchUserSource(tab context.Context, id string) (raw string, markdown bool,
 	var source struct {
 		Text     string
 		Markdown bool
+		Fail     string
 	}
 	js := fmt.Sprintf(`(async () => {
 	  const id = %s;
-	  if (!/^[a-zA-Z0-9-]+$/.test(id)) return {};
+	  if (!/^[a-zA-Z0-9-]+$/.test(id)) return {fail:'message-missing'};
 	  const thread = location.pathname.split('/c/')[1];
-	  if (!thread) return {};
+	  if (!thread) return {fail:'message-missing'};
 	  const auth = await (await fetch('/api/auth/session')).json();
-	  if (!auth.accessToken) return {};
+	  if (!auth.accessToken) return {fail:'no-auth'};
 	  const r = await fetch('/backend-api/conversation/' + encodeURIComponent(thread), {headers:{Authorization:'Bearer ' + auth.accessToken}});
-	  if (!r.ok) return {};
+	  if (!r.ok) return {fail:'fetch-failed'};
 	  const m = (await r.json()).mapping?.[id]?.message;
-	  if (m?.id !== id || m.author?.role !== 'user' || m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return {};
+	  if (!m || m.id !== id) return {fail:'message-missing'};
+	  if (m.author?.role !== 'user' || m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return {fail:'message-shape'};
+	  if (m.content.parts[0] === '') return {fail:'message-empty'};
 	  return {Text:m.content.parts[0], Markdown:m.metadata?.serialization_metadata?.render_format === 'markdown'};
 	})()`, strconv.Quote(id))
 	if err := chromedp.Run(tab, chromedp.Evaluate(js, &source, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
 		return "", false, err
 	}
-	if source.Text == "" {
-		return "", false, errors.New("DOM-bound original user message unavailable")
+	if source.Fail != "" {
+		return "", false, &UserSourceError{Reason: source.Fail}
 	}
 	return source.Text, source.Markdown, nil
 }

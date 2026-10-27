@@ -672,6 +672,11 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		// Read-back refusals were silent (409 with no log line), leaving
+		// only the user-facing text to diagnose from. Log the content-free
+		// reason so the next "can't read back a visible answer" names its
+		// failed lookup step.
+		log.Printf("[openai] session=%s recover read failed: %v", id, err)
 		// Before giving up with a 409, attempt the recognized clear-cut
 		// shape: structural adoption failure plus a verifiably complete
 		// thread answer that the sent-log ties to this session.
