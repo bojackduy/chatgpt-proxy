@@ -638,6 +638,62 @@ Scoped reasoning</div><p>Only answer</p></div></div>`)
 			}
 		}
 	})
+	sub("stored markdown keeps every literal newline in the raw source", func(t *testing.T, tab context.Context) {
+		// Byte-faithful shape of a live adoption failure (rendered 1B short,
+		// single divergent span, full re-convergence): a `*` starting a line
+		// mid-paragraph, two blank lines, then a `<`-led line with no closing
+		// bracket (literal paragraph text, never a tag).
+		stored := "lead line\n*\n\n\n<SUFFIX tail without bracket\ntrail line"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/api/auth/session":
+				_, _ = w.Write([]byte(`{"accessToken":"fixture-token"}`))
+			case "/backend-api/conversation/fixture":
+				_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"fixture-user": map[string]any{"message": map[string]any{"id": "fixture-user", "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{stored}}, "metadata": map[string]any{"serialization_metadata": map[string]any{"render_format": "markdown"}}}}}})
+			default:
+				_, _ = w.Write([]byte(`{}`))
+			}
+		}))
+		defer server.Close()
+		if err := chromedp.Run(tab, chromedp.Navigate(server.URL+"/c/fixture")); err != nil {
+			t.Fatal(err)
+		}
+		raw, markdown, err := fetchUserSource(tab, "fixture-user")
+		if err != nil || !markdown || raw != stored {
+			t.Fatalf("raw stored source lost bytes: err=%v markdown=%v len=%d want %d", err, markdown, len(raw), len(stored))
+		}
+		decoded, err := originalUserText(tab, "fixture-user")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Mechanism proof: the declared Markdown rendering drops exactly one
+		// \n for the double blank line; everything after re-converges.
+		want := normalizeRecoveryPrompt(stored)
+		decodedNorm := normalizeRecoveryPrompt(decoded)
+		if len(want)-len(decodedNorm) != 1 {
+			t.Fatalf("expected exactly one dropped newline, decoded %dB from stored %dB", len(decoded), len(stored))
+		}
+		off := firstDiffByte(decodedNorm, want)
+		if off >= len(want) || want[off] != '\n' || decodedNorm[off:] != want[off+1:] {
+			t.Fatalf("decoded rendering did not lose exactly one interior newline at %d", off)
+		}
+		// The fixed comparison binds the turn via the raw bytes.
+		if ok, provenance := matchUserSource(normalizeRecoveryPrompt(raw), decodedNorm, want); !ok || provenance != "raw" {
+			t.Fatalf("raw-exact turn refused: ok=%v provenance=%q", ok, provenance)
+		}
+		// A turn with a different middle is still refused: no collapsing,
+		// no tolerance, on either comparison path.
+		tampered := strings.Replace(stored, "<SUFFIX", "<TUFFIX", 1)
+		if ok, _ := matchUserSource(normalizeRecoveryPrompt(tampered), decodedNorm, want); ok {
+			t.Fatal("tampered middle accepted")
+		}
+		// A turn with one more blank line than submitted is still refused.
+		padded := strings.Replace(stored, "\n\n\n<", "\n\n\n\n<", 1)
+		if ok, _ := matchUserSource(normalizeRecoveryPrompt(padded), normalizeRecoveryPrompt(padded), want); ok {
+			t.Fatal("extra blank line accepted")
+		}
+	})
 }
 
 func TestFinishedEmptyBoundAndGenerationGrace(t *testing.T) {
@@ -1212,6 +1268,41 @@ func TestBubbleOnlyDivergenceWaitsForExactSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := bubbleOnlyDivergence(tc.srcPath, tc.userText, tc.expected); got != tc.want {
 				t.Fatalf("bubbleOnlyDivergence(%q, %q) = %v, want %v", tc.srcPath, tc.userText, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchUserSourceExactBinding(t *testing.T) {
+	want := "lead line\n*\n\n\n<SUFFIX tail without bracket\ntrail line"
+	decodedDrop := "lead line\n*\n\n<SUFFIX tail without bracket\ntrail line"
+	escapedWant := "literal * keep"
+	cases := []struct {
+		name       string
+		raw        string
+		decoded    string
+		against    string
+		ok         bool
+		provenance string
+	}{
+		{"raw exact despite decoded newline loss", want, decodedDrop, want, true, "raw"},
+		{"decoded exact with escaped raw store", `literal \* keep`, escapedWant, escapedWant, true, "decoded"},
+		{"unmapped bubble with decoded match", "", want, want, true, "decoded"},
+		{"both empty never matches", "", "", want, false, ""},
+		{"unmapped bubble mismatch", "", "other", want, false, ""},
+		{"tampered middle refused", strings.Replace(want, "<SUFFIX", "<TUFFIX", 1), decodedDrop, want, false, ""},
+		{"extra blank line refused", strings.Replace(want, "\n\n\n<", "\n\n\n\n<", 1), decodedDrop, want, false, ""},
+		{"missing blank line refused", decodedDrop, decodedDrop, want, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, provenance := matchUserSource(
+				normalizeRecoveryPrompt(tc.raw),
+				normalizeRecoveryPrompt(tc.decoded),
+				normalizeRecoveryPrompt(tc.against),
+			)
+			if ok != tc.ok || provenance != tc.provenance {
+				t.Fatalf("matchUserSource = (%v, %q), want (%v, %q)", ok, provenance, tc.ok, tc.provenance)
 			}
 		})
 	}

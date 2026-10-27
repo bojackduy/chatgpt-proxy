@@ -155,6 +155,7 @@ func PromptHash(prompt string) string {
 // auto-resync) share it, so their finishedness proofs cannot drift apart.
 type threadSnapshot struct {
 	userText    string
+	userRaw     string
 	userID      string
 	srcPath     string
 	answerNext  bool
@@ -164,6 +165,22 @@ type threadSnapshot struct {
 	probeErr    error
 	emptyProved bool
 	emptyErr    error
+}
+
+// matchUserSource decides an exact adoption against the whole normalized
+// prompt. Either the backend's raw stored serialization or its decoded
+// rendering must equal the prompt byte for byte. Empty raw (an unmapped
+// bubble with no DOM message ID) falls back to the decoded text alone; empty
+// decoded never matches. Returns the provenance ("raw" or "decoded") so the
+// caller can report which ground truth bound the turn.
+func matchUserSource(raw, decoded, want string) (bool, string) {
+	if raw != "" && raw == want {
+		return true, "raw"
+	}
+	if decoded != "" && decoded == want {
+		return true, "decoded"
+	}
+	return false, ""
 }
 
 // ReadThreadTurn only reads an existing finished turn in an owned target. The
@@ -182,13 +199,19 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 	// The full DOM-bound source audit matched all 97,805 bytes after decoding
 	// its declared Markdown and normalizing newlines. No extra slash decoding.
 	want := normalizeRecoveryPrompt(prompt)
-	// Compare both spaced and unchanged URL forms symmetrically. All other
-	// content must still match the entire original prompt.
-	if snap.userText == "" || snap.userText != want {
+	// Either the backend's raw stored serialization or its decoded rendering
+	// must equal the prompt byte for byte — never a window, a tolerance, or
+	// whitespace collapsing. The decoded rendering provably drops one \n per
+	// extra blank line, so the raw bytes are the binding ground truth.
+	if ok, provenance := matchUserSource(snap.userRaw, snap.userText, want); !ok {
 		off := firstDiffByte(snap.userText, want)
 		spans := diffSpans(snap.userText, want)
 		log.Printf("[chatgpt] adoption user-bubble mismatch path=%s rendered=%dB want=%dB diffoff=%d spans=%s", snap.srcPath, len(snap.userText), len(want), off, spans)
 		return TurnResult{}, &UserBubbleMismatchError{Path: snap.srcPath, Rendered: len(snap.userText), Want: len(want), DiffOff: off, Spans: spans}
+	} else if provenance == "raw" && snap.userText != want {
+		// Sizes only: the decoded rendering lost bytes the stored
+		// serialization kept. Same turn, proven by the raw bytes.
+		log.Printf("[chatgpt] adoption bound via raw stored source rendered=%dB want=%dB", len(snap.userText), len(want))
 	}
 	if snap.probeErr != nil {
 		return TurnResult{}, snap.probeErr
@@ -360,11 +383,21 @@ func (c *Client) snapshotThread(ctx context.Context, url string, expected ...str
 	userText := normalizeRecoveryPrompt(corr.User)
 	snap.srcPath = "bubble"
 	if corr.UserID != "" {
-		original, err := originalUserText(tab, corr.UserID, expected...)
+		raw, markdown, err := fetchUserSource(tab, corr.UserID)
 		if err != nil {
 			return snap, fmt.Errorf("recovery user source: %w", err)
 		}
-		userText = normalizeRecoveryPrompt(original)
+		// The stored serialization is the binding ground truth: the Markdown
+		// rendering below drops one \n per extra blank line, so the raw bytes
+		// must be kept alongside the decoded text for exact comparison.
+		snap.userRaw = normalizeRecoveryPrompt(raw)
+		if !markdown {
+			userText = snap.userRaw
+		} else if decoded, err := decodeMarkdownUserSource(tab, raw, expected...); err != nil {
+			return snap, fmt.Errorf("recovery user source: %w", err)
+		} else {
+			userText = normalizeRecoveryPrompt(decoded)
+		}
 		snap.srcPath = "mapping"
 	}
 	snap.userText = userText
@@ -503,7 +536,11 @@ func projectSourceURLLinks(text, expected string) string {
 	return text
 }
 
-func originalUserText(tab context.Context, id string, expected ...string) (string, error) {
+// fetchUserSource returns the backend mapping's declared serialization of one
+// user turn: the stored text plus whether its declared render format is
+// Markdown. No decoding, no comparison — these raw bytes are the exact-binding
+// ground truth the lossy rendering below cannot supply.
+func fetchUserSource(tab context.Context, id string) (raw string, markdown bool, err error) {
 	var source struct {
 		Text     string
 		Markdown bool
@@ -522,16 +559,22 @@ func originalUserText(tab context.Context, id string, expected ...string) (strin
 	  return {Text:m.content.parts[0], Markdown:m.metadata?.serialization_metadata?.render_format === 'markdown'};
 	})()`, strconv.Quote(id))
 	if err := chromedp.Run(tab, chromedp.Evaluate(js, &source, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if source.Text == "" {
-		return "", errors.New("DOM-bound original user message unavailable")
+		return "", false, errors.New("DOM-bound original user message unavailable")
 	}
-	if !source.Markdown {
-		return source.Text, nil
-	}
+	return source.Text, source.Markdown, nil
+}
+
+// decodeMarkdownUserSource renders stored Markdown through its declared
+// CommonMark serialization and extracts the text. KNOWN LOSSY: a run of N>1
+// blank lines renders as a single paragraph break and extracts as exactly two
+// \n, so one \n per extra blank line is dropped. Never the binding basis on
+// its own — the raw source is.
+func decodeMarkdownUserSource(tab context.Context, raw string, expected ...string) (string, error) {
 	var rendered bytes.Buffer
-	if err := goldmark.New().Convert([]byte(source.Text), &rendered); err != nil {
+	if err := goldmark.New().Convert([]byte(raw), &rendered); err != nil {
 		return "", err
 	}
 	if bytes.Contains(rendered.Bytes(), []byte("<img")) {
@@ -545,4 +588,15 @@ func originalUserText(tab context.Context, id string, expected ...string) (strin
 		text = projectSourceURLLinks(text, expected[0])
 	}
 	return text, err
+}
+
+func originalUserText(tab context.Context, id string, expected ...string) (string, error) {
+	raw, markdown, err := fetchUserSource(tab, id)
+	if err != nil {
+		return "", err
+	}
+	if !markdown {
+		return raw, nil
+	}
+	return decodeMarkdownUserSource(tab, raw, expected...)
 }
