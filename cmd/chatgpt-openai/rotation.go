@@ -281,6 +281,17 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=card_over_budget bytes=%d budget=%d", id, lane, lastLen, h.maxChars)
 		return false
 	}
+	// The rotation card is ONE composer paste: refuse it here when its new
+	// content alone exceeds the paste budget, before the journal is dirtied
+	// or anything reaches the composer. Oversized pastes stall the page for
+	// ~10 minutes with zero answer bytes, so submitting anyway only buys an
+	// uncertain turn. The caller falls back to the capped chunked
+	// reset-replay/reseed path. The fixed head cannot be chunked, so only
+	// content beyond it counts — same rule as the main choke point.
+	if cap := h.pasteLimit(); cap > 0 && len(prompt)-len(head) > cap {
+		log.Printf("[openai] session=%s lane=%s rotation_fallback reason=paste_over_budget bytes=%d paste_limit=%d", id, lane, len(prompt), cap)
+		return false
+	}
 	var atts []chatgpt.Attachment
 	for _, m := range recent {
 		atts = append(atts, attachmentsOf(m)...)

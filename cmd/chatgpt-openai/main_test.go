@@ -2763,3 +2763,26 @@ func TestAnswerlessTurnOnlyMatchesMissingAnswer(t *testing.T) {
 		}
 	}
 }
+
+func TestRotationCardOverPasteBudgetFallsBackBeforeSubmit(t *testing.T) {
+	f := &fakeBackend{err: errors.New("must not submit")}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	msgs := make([]message, 0, 31)
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, message{Role: "user", Content: strings.Repeat("x", 5000)})
+	}
+	msgs = append(msgs, message{Role: "user", Content: "answer this now"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: msgs}
+	s := &session{URL: "https://chatgpt.com/c/old", Messages: msgs[:len(msgs)-1]}
+	w := httptest.NewRecorder()
+	if h.serveRotation(w, httptest.NewRequest("POST", "/v1/chat/completions", nil), "rotate-paste", "main", req, s, nil) {
+		t.Fatal("oversized rotation card must fall back, not submit")
+	}
+	if len(f.prompts) != 0 {
+		t.Fatal("oversized rotation card reached the composer")
+	}
+	if s.Dirty || s.PendingPrompt != "" || s.URL != "https://chatgpt.com/c/old" {
+		t.Fatal("oversized rotation card dirtied the journal", s.Dirty, len(s.PendingPrompt))
+	}
+}
