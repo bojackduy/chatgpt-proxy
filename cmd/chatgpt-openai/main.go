@@ -940,7 +940,11 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 	}
 	currentIntro := "CURRENT REQUEST\n" + turnIntro
 	ack := "Reply with only the single word: ACK. No tool calls.\n"
-	overhead := len(head) + len(currentIntro) + len(tail)
+	// The cap bounds the part this bridge controls: replayed history and the
+	// current request. The fixed head (tool schemas, instructions) is never
+	// chunked — a schema cannot be split across submissions — so counting it
+	// would block every fresh session whose tool catalog is large.
+	overhead := len(currentIntro) + len(tail)
 	if historyOverhead := len(historyIntro) + len(historyEnd) + len(ack); historyOverhead > overhead {
 		overhead = historyOverhead
 	}
@@ -979,12 +983,12 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 	combined += currentIntro + current + tail
 	// The final answer turn is the only submission whose reply matters. Refuse
 	// an unpasteable one BEFORE anything is journaled or sent.
-	finalBytes := len(head) + len(currentIntro) + len(current) + len(tail)
+	finalBytes := len(current) + len(currentIntro) + len(tail)
 	if h.maxPaste > 0 && finalBytes > h.maxPaste {
 		log.Printf("[openai] turn plan refused reason=paste_too_large final_bytes=%d paste_limit=%d max_chars=%d", finalBytes, h.maxPaste, h.maxChars)
-		return nil, fmt.Errorf("this request needs a single %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", finalBytes, h.maxPaste)
+		return nil, fmt.Errorf("this request needs a single %d-byte paste of new content, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", finalBytes, h.maxPaste)
 	}
-	if limitCap <= 0 || len(combined) <= limitCap {
+	if limitCap <= 0 || len(combined)-len(head) <= limitCap {
 		return []turn{{prompt: combined, atts: append(ha, ca...)}}, nil
 	}
 	var turns []turn
@@ -1012,7 +1016,7 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 		p := historyIntro + text + historyEnd + ack
 		if last {
 			p = head + currentIntro + text + tail
-			if h.maxPaste > 0 && len(p) > h.maxPaste {
+			if h.maxPaste > 0 && len(p)-len(head) > h.maxPaste {
 				log.Printf("[openai] turn plan refused reason=paste_too_large final_bytes=%d paste_limit=%d", len(p), h.maxPaste)
 				return nil, fmt.Errorf("the final question needs a single %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the message or raise -max-paste-bytes", len(p), h.maxPaste)
 			}
@@ -1682,11 +1686,16 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		sizes[i] = len(t.prompt)
 	}
 	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d", id, len(turns), sizes, turnReplayFlags(turns), h.pasteLimit())
-	if limit := h.pasteLimit(); limit > 0 {
+	if cap := h.pasteLimit(); cap > 0 {
 		for i, t := range turns {
+			limit := cap
+			if !t.replay {
+				// The fixed head cannot be chunked; only new content counts.
+				limit += len(head)
+			}
 			if len(t.prompt) > limit {
 				log.Printf("[openai] submission refused reason=paste_too_large turn=%d/%d bytes=%d limit=%d replay=%v", i+1, len(turns), len(t.prompt), limit, t.replay)
-				apiError(w, 400, fmt.Errorf("turn %d/%d needs a %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the request or raise -max-paste-bytes", i+1, len(turns), len(t.prompt), limit))
+				apiError(w, 400, fmt.Errorf("turn %d/%d needs a %d-byte paste over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the request or raise -max-paste-bytes", i+1, len(turns), len(t.prompt), limit))
 				return
 			}
 		}

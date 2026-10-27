@@ -1675,7 +1675,9 @@ func TestCatchupCurrentToolsAndImportFailure(t *testing.T) {
 			a := assistant(t, request(h, "tools-gap", req))
 			url := h.sessions["tools-gap"].URL
 			req.Messages = append(req.Messages, a)
-			for range 6 {
+			// Enough history to force several chunks at maxChars=3000 now that
+			// the fixed head no longer counts against the paste budget.
+			for range 12 {
 				req.Messages = append(req.Messages, message{Role: "user", Content: "gap question"}, message{Role: "assistant", Content: strings.Repeat("gap answer ", 55)})
 			}
 			req.Messages = append(req.Messages, message{Role: "user", Content: "Call current get_weather for Hanoi"})
@@ -2726,5 +2728,22 @@ func TestLongHistoryIsChunkedUnderThePasteLimit(t *testing.T) {
 	}
 	if !strings.Contains(last.prompt, "next question") {
 		t.Fatal("last turn lost the question")
+	}
+}
+
+// A large tool catalog is not chunkable, so it must not count against the
+// paste budget: counting it blocked every fresh session with a big catalog
+// with a 306312-byte refusal for a request that had no new content at all.
+func TestLargeToolCatalogDoesNotCountAgainstPasteLimit(t *testing.T) {
+	h := testHandler(&fakeBackend{})
+	h.maxPaste = 150000
+	req := weatherReq()
+	head := strings.Repeat("S", 300000)
+	turns, err := h.buildTurns(req, req.Messages, head)
+	if err != nil {
+		t.Fatalf("large catalog refused: %v", err)
+	}
+	if len(turns) != 1 || !strings.Contains(turns[0].prompt, "Call weather for Hanoi") {
+		t.Fatalf("large catalog did not produce one answer turn: %d", len(turns))
 	}
 }
