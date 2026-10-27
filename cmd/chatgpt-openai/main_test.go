@@ -3119,3 +3119,41 @@ func TestLargeRewriteRefusesDeltaContinue(t *testing.T) {
 		t.Fatal("large rewrite must not delta-continue on the same thread")
 	}
 }
+
+func TestCompactionAppendStaysOnThread(t *testing.T) {
+	// Live replica: 20-message transcript, client swaps the last assistant
+	// reply for a 70KB compaction summary and appends one user message.
+	// Old path minted a new thread plus a ~40-turn full replay; the tail
+	// now appends onto the current thread chunked (2 imports + final).
+	f := &fakeBackend{}
+	h := testHandler(f)
+	h.maxPaste = 60000
+	const threadURL = "https://chatgpt.com/c/thread-compact"
+	saved := []message{{Role: "system", Content: "You are a helper. Previously compacted."}}
+	for i := 0; i < 9; i++ {
+		saved = append(saved, message{Role: "user", Content: fmt.Sprintf("question %d", i)})
+		saved = append(saved, message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)})
+	}
+	saved = append(saved, message{Role: "assistant", Content: "last short answer"})
+	incoming := append([]message{}, saved...)
+	incoming[len(incoming)-1] = message{Role: "assistant", Content: "SUMMARY:" + strings.Repeat("s", 70000)}
+	incoming = append(incoming, message{Role: "user", Content: "go on"})
+	h.sessions["compact"] = &session{URL: threadURL, Messages: saved}
+	h.sentLog = append(h.sentLog, sentEntry{Session: "compact", URL: threadURL, Event: "completed", PromptHash: "seed"})
+	req := completionsRequest{Model: "chatgpt-web", Messages: incoming}
+	w := request(h, "compact", req)
+	if w.Code != 200 {
+		t.Fatalf("compaction append: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 3 {
+		t.Fatalf("summary must arrive chunked plus final, got %d prompts", len(f.prompts))
+	}
+	for _, u := range f.urls {
+		if u != threadURL {
+			t.Fatalf("must stay on the same thread, got urls=%v", f.urls)
+		}
+	}
+	if got := h.sessions["compact"].URL; got != threadURL {
+		t.Fatalf("thread moved: %s", got)
+	}
+}

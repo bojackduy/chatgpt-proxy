@@ -1673,20 +1673,37 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 				if reseedPlan == nil {
 					reseedPlan = h.planCleanReseed(s, req)
 				}
-				// Flag-gated project-per-session: rotate into the session's
-				// dedicated project instead of reset-replaying, carrying the
-				// plan above record-first. serveRotation falls back only on a
-				// proved pre-submission navigation failure; a possibly
-				// submitted turn remains protected.
-				if projectPerSessionEnabled() && id != "" && !resync {
-					if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
-						return
+				// Compaction with a huge shared prefix: the current thread
+				// already holds ~everything before the summary, so appending
+				// the tail onto it costs a few pastes instead of a
+				// full-thread replay into a new thread. The summary is meant
+				// to supersede the old text; keeping both costs one stale
+				// message of context against recency, which wins. Never on
+				// a dirty session, never for non-content rewrites, never
+				// without sent-log proof — forks, truncations and anything
+				// unproven keep the rotation/reseed path below.
+				if reseedPlan != nil && reseedPlan.classification == rewriteCompaction && !s.Dirty &&
+					mismatch.Field == "content" && len(s.Messages) > 0 && mismatch.Index >= len(s.Messages)*9/10 &&
+					coherentTranscript(req.Messages) && h.sentEntryForThread(id, s.URL) != nil {
+					decision, start = "compaction-append", mismatch.Index
+					url = s.URL
+					log.Printf("[openai] session=%s lane=%s decision=compaction-append mismatch=%d prefix=%d/%d", id, lane, mismatch.Index, mismatch.Index, len(s.Messages))
+				} else {
+					// Flag-gated project-per-session: rotate into the session's
+					// dedicated project instead of reset-replaying, carrying the
+					// plan above record-first. serveRotation falls back only on a
+					// proved pre-submission navigation failure; a possibly
+					// submitted turn remains protected.
+					if projectPerSessionEnabled() && id != "" && !resync {
+						if h.serveRotation(w, r, id, lane, req, s, reseedPlan) {
+							return
+						}
+						log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
 					}
-					log.Printf("[openai] session=%s lane=%s rotation_fallback: continuing with shared-project reset-replay", id, lane)
-				}
-				if reseedPlan != nil {
-					decision = "rewrite-reseed"
-					log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+					if reseedPlan != nil {
+						decision = "rewrite-reseed"
+						log.Printf("[openai] session=%s lane=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s", id, lane, reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+					}
 				}
 			}
 		}
@@ -1704,7 +1721,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	// server-side and a compact reminder suffices — resending the whole dump
 	// every turn is what blew the per-turn paste budget.
 	toolsFP := toolsFingerprint(req.Tools)
-	teachFull := (decision != "delta" && decision != "delta-continue") || s.ToolsFP == "" || s.ToolsFP != toolsFP
+	teachFull := (decision != "delta" && decision != "delta-continue" && decision != "compaction-append") || s.ToolsFP == "" || s.ToolsFP != toolsFP
 	head := toolReminder(req)
 	if teachFull {
 		head = toolPrompt(req)
