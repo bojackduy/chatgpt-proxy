@@ -342,8 +342,8 @@ func (h *handler) buildReseedRecordTurns(carried []message) []turn {
 		pieces = append(pieces, piece{text: renderMsg(m)})
 	}
 	limit := 0
-	if h.maxChars > 0 {
-		if limit = h.maxChars - len(historyIntro) - len(reseedRecordIntro) - len(reseedRecordEnd) - len(historyEnd) - len(ack); limit < 1 {
+	if capBytes := h.pasteLimit(); capBytes > 0 {
+		if limit = capBytes - len(historyIntro) - len(reseedRecordIntro) - len(reseedRecordEnd) - len(historyEnd) - len(ack); limit < 1 {
 			limit = 1
 		}
 	}

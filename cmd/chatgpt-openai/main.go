@@ -872,6 +872,17 @@ func answerInstruction(req completionsRequest) string {
 	return "\nNow produce the next assistant reply for the external client. Tool choice: " + toolChoiceText(req.ToolChoice) + ". A required/named tool means output the opencode_bridge_call JSON wrapper now, as TEXT for external execution.\n"
 }
 
+// pasteLimit is the byte ceiling for ONE composer submission. It exists
+// because the composer accepts an oversized paste and then answers nothing,
+// which strands the chat as unverifiable; -max-chars stays the hard per-turn
+// budget, this is the smaller of the two.
+func (h *handler) pasteLimit() int {
+	if h.maxPaste > 0 && (h.maxChars <= 0 || h.maxPaste < h.maxChars) {
+		return h.maxPaste
+	}
+	return h.maxChars
+}
+
 // turn is one ChatGPT submission: a bounded prompt (and its attachments) plus
 // whether it is a context-replay turn (expects only an acknowledgement).
 type turn struct {
@@ -879,6 +890,15 @@ type turn struct {
 	atts   []chatgpt.Attachment
 	replay bool
 	synced int // complete delta messages acknowledged by this history chunk
+}
+
+// turnReplayFlags keeps the plan log free of content: one bool per turn.
+func turnReplayFlags(turns []turn) []bool {
+	out := make([]bool, len(turns))
+	for i, t := range turns {
+		out[i] = t.replay
+	}
+	return out
 }
 
 type piece struct {
@@ -929,10 +949,7 @@ func (h *handler) buildTurns(req completionsRequest, delta []message, head strin
 	// composer stalls, and the turn ends with no answer — the exact failure
 	// that leaves a chat unverifiable. Chunking the history instead keeps every
 	// submission pasteable; only the small final question follows it.
-	limitCap := h.maxChars
-	if h.maxPaste > 0 && (limitCap <= 0 || h.maxPaste < limitCap) {
-		limitCap = h.maxPaste
-	}
+	limitCap := h.pasteLimit()
 	limit := 0
 	if limitCap > 0 {
 		if limit = limitCap - overhead; limit < 1 {
@@ -1656,6 +1673,23 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		}
 		// No dirty-only write here: the loop atomically saves Dirty together
 		// with the phase and source binding before the FIRST submission too.
+	}
+	// One choke point for every builder (delta, resync, reseed record): a turn
+	// over the paste limit is refused here, before the journal is dirtied or
+	// anything reaches the composer.
+	sizes := make([]int, len(turns))
+	for i, t := range turns {
+		sizes[i] = len(t.prompt)
+	}
+	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d", id, len(turns), sizes, turnReplayFlags(turns), h.pasteLimit())
+	if limit := h.pasteLimit(); limit > 0 {
+		for i, t := range turns {
+			if len(t.prompt) > limit {
+				log.Printf("[openai] submission refused reason=paste_too_large turn=%d/%d bytes=%d limit=%d replay=%v", i+1, len(turns), len(t.prompt), limit, t.replay)
+				apiError(w, 400, fmt.Errorf("turn %d/%d needs a %d-byte paste, over the %d-byte single-paste limit (a paste this large stalls the ChatGPT composer). Nothing was sent and no tool was run. Shorten the request or raise -max-paste-bytes", i+1, len(turns), len(t.prompt), limit))
+				return
+			}
+		}
 	}
 	var answer, reasoning string
 	var images []chatgpt.RasterImage

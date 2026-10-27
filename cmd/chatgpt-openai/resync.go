@@ -189,8 +189,8 @@ func (h *handler) buildResyncTurns(req completionsRequest, history []message, he
 		pieces = append(pieces, piece{text: renderMsg(m), end: i + 1})
 	}
 	limit := 0
-	if h.maxChars > 0 {
-		limit = max(1, h.maxChars-len(historyIntro)-len(historyEnd)-len(ack))
+	if capBytes := h.pasteLimit(); capBytes > 0 {
+		limit = max(1, capBytes-len(historyIntro)-len(historyEnd)-len(ack))
 	}
 	var turns []turn
 	for _, group := range packPieces(pieces, limit) {
