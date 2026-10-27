@@ -556,6 +556,7 @@ func fetchUserSource(tab context.Context, id string) (raw string, markdown bool,
 		Text     string
 		Markdown bool
 		Fail     string
+		Shape    string
 	}
 	js := fmt.Sprintf(`(async () => {
 	  const id = %s;
@@ -568,15 +569,32 @@ func fetchUserSource(tab context.Context, id string) (raw string, markdown bool,
 	  if (!r.ok) return {fail:'fetch-failed'};
 	  const m = (await r.json()).mapping?.[id]?.message;
 	  if (!m || m.id !== id) return {fail:'message-missing'};
-	  if (m.author?.role !== 'user' || m.content?.content_type !== 'text' || m.content.parts?.length !== 1 || typeof m.content.parts[0] !== 'string') return {fail:'message-shape'};
-	  if (m.content.parts[0] === '') return {fail:'message-empty'};
-	  return {Text:m.content.parts[0], Markdown:m.metadata?.serialization_metadata?.render_format === 'markdown'};
+	  if (m.author?.role !== 'user') return {fail:'message-shape'};
+	  // Turns carrying attachments store as multimodal_text with the prompt
+	  // as exactly one string part beside non-text parts. The binding ground
+	  // truth is that single text part: the whole prompt was submitted as
+	  // one text, so byte equality against it is still exact. Zero or
+	  // several string parts stays a refusal (ambiguous).
+	  const parts = m.content?.parts;
+	  if (!Array.isArray(parts)) return {fail:'message-shape'};
+	  const texts = parts.filter(p => typeof p === 'string');
+	  const nonText = parts.length - texts.length;
+	  if (texts.length !== 1) return {fail:'message-shape'};
+	  const ct = m.content?.content_type;
+	  if (ct !== 'text' && !(ct === 'multimodal_text' && nonText >= 1)) return {fail:'message-shape'};
+	  if (texts[0] === '') return {fail:'message-empty'};
+	  return {Text:texts[0], Markdown:m.metadata?.serialization_metadata?.render_format === 'markdown', Shape:(ct || '?') + '/' + parts.length + 'p'};
 	})()`, strconv.Quote(id))
 	if err := chromedp.Run(tab, chromedp.Evaluate(js, &source, chromedp.EvalAsValue, func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) })); err != nil {
 		return "", false, err
 	}
 	if source.Fail != "" {
 		return "", false, &UserSourceError{Reason: source.Fail}
+	}
+	if source.Shape != "" && source.Shape != "text/1p" {
+		// Content-free shape note: a multimodal turn bound on its single
+		// text part. Same turn, proven by the text bytes below.
+		log.Printf("[chatgpt] recovery source shape=%s", source.Shape)
 	}
 	return source.Text, source.Markdown, nil
 }
