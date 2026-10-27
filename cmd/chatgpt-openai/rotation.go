@@ -347,7 +347,7 @@ func (h *handler) serveRotation(w http.ResponseWriter, r *http.Request, id, lane
 		return true
 	}
 	thinking := h.forceThinking || (req.ReasoningEffort != nil && req.ReasoningEffort != "none") || (req.Reasoning != nil && req.Reasoning != false)
-	log.Printf("[openai] session=%s lane=%s decision=rotation project=%q thread=%s record_turns=%d", id, lane, name, projectURL, len(recordTurns))
+	log.Printf("[openai] session=%s lane=%s decision=rotation project=%q thread=%s record_turns=%d card_bytes=%d", id, lane, name, projectURL, len(recordTurns), len(prompt))
 	// Seed the new project thread record-first, then the rotation card. The
 	// first submission mints the project chat (empty URL + project
 	// targeting); every later turn continues the minted thread. Record turns
