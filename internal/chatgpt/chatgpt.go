@@ -61,6 +61,13 @@ var (
 	// ready, empty body, no composer, no login control, no challenge). It is
 	// a transient render state, so it stays safe-retryable pre-submit.
 	ErrBlankProjectPage = errors.New("chatgpt project page loaded blank (document ready, empty body, no composer and no login); REPAIR: reload the project page in the logged Chrome profile")
+	// ErrChallengeMidTurn marks a human-verification gate that appeared AFTER
+	// the turn was submitted, while the answer was awaited. Unlike
+	// ErrPageChallenge (pre-submit, clean journal) this turn may have
+	// executed: the journal stays dirty/uncertain and the caller must not
+	// resend. Deliberately absent from IsPreSubmit so the pending binding
+	// survives for read-only recovery or deliberate abandon.
+	ErrChallengeMidTurn = errors.New("turn was submitted but the page now shows human-verification; outcome unknown — do not resend; solve it in the bridge profile window, then recover or abandon")
 	// ErrForeignDraft marks a refusal that RETRYING CANNOT FIX: the composer
 	// holds text this bridge cannot prove it wrote, or proves it wrote a turn
 	// that may already have been dispatched. It deliberately does NOT wrap
@@ -2086,6 +2093,12 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 	lastText := ""
 	stablePolls := 0
 	continues := 0
+	// emptyPolls counts consecutive polls with no answer text and no active
+	// generation. A challenge interstitial reads exactly like that (len=0,
+	// no stop button), so every ~30s of nothing gets one read-only page
+	// probe: naming the verification early beats a 10-minute timeout that
+	// says nothing about what happened.
+	emptyPolls := 0
 
 	empty := emptyAnswerWatch{Started: time.Now()}
 
@@ -2166,6 +2179,17 @@ func (c *Client) waitForAnswer(ctx context.Context, tab context.Context, timeout
 			}
 			lastText = st.Last
 			stablePolls = 0
+		}
+		if st.Last == "" && !st.StopBtn && !st.ContinueBtn {
+			emptyPolls++
+			if emptyPolls%10 == 0 {
+				if ps, perr := c.probePageLoadState(tab); perr == nil && ps.Challenge {
+					log.Printf("[chatgpt-flow] id=%s stage=challenge_mid_turn bodyLen=%d emptyPolls=%d", id, ps.BodyTextLen, emptyPolls)
+					return "", "", ErrChallengeMidTurn
+				}
+			}
+		} else if st.Last != "" || st.StopBtn {
+			emptyPolls = 0
 		}
 		if err := pause(tab, pollInterval); err != nil {
 			return "", "", err

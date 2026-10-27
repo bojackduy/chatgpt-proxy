@@ -1920,3 +1920,18 @@ func TestProvablyUnsubmitted(t *testing.T) {
 		}
 	}
 }
+
+// A mid-turn challenge names the verification, keeps the pending binding
+// (never pre-submit), and never looks like a safe retry post-submit.
+func TestChallengeMidTurnKeepsUncertainty(t *testing.T) {
+	if IsPreSubmit(ErrChallengeMidTurn) {
+		t.Fatal("mid-turn challenge after submission must not be pre-submit")
+	}
+	if got := classifyPreSendFailure(ErrChallengeMidTurn, true); !errors.Is(got, ErrChallengeMidTurn) || errors.Is(got, ErrNotSubmitted) {
+		t.Fatalf("post-submit challenge reclassified: %v", got)
+	}
+	msg := ErrChallengeMidTurn.Error()
+	if !strings.Contains(msg, "human-verification") || !strings.Contains(msg, "do not resend") {
+		t.Fatalf("challenge error must name the gate and forbid resend: %q", msg)
+	}
+}
