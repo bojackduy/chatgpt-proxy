@@ -162,8 +162,23 @@ type session struct {
 	// failed strict tool validation. It selects the terminal 422 wording only;
 	// no acceptance decision reads it.
 	RejectReason string `json:",omitempty"`
-	Result       result
-	Dirty        bool // an interrupted/failed submitted turn must not be silently retried
+	// RejectedPromptHash and RejectedAnswerHash bind a durable rejection to the
+	// EXACT submitted prompt and the EXACT rejected reply. A read-only recheck
+	// refuses to look at any other turn, and a human-authorized correction
+	// refuses to quote a reply that is not the one that was rejected. Empty on
+	// legacy journals, where recheck fails honestly instead of inventing proof.
+	RejectedPromptHash string `json:",omitempty"`
+	RejectedAnswerHash string `json:",omitempty"`
+	// RejectedAnswerSample is a bounded (800-rune) inert copy of the rejected
+	// reply, kept so a correction prompt can quote the defect without trusting a
+	// freshly rendered answer. Journal data only; never a log line.
+	RejectedAnswerSample string `json:",omitempty"`
+	// CorrectionFingerprint records the request fingerprint a human-authorized
+	// format correction was already spent on. One correction per rejected
+	// reply: a second is refused, never resubmitted.
+	CorrectionFingerprint string `json:",omitempty"`
+	Result                result
+	Dirty                 bool // an interrupted/failed submitted turn must not be silently retried
 	// ToolsFP is the fingerprint of the tool set whose full schemas were last
 	// taught to this thread. The thread holds them server-side afterwards, so
 	// later turns only need a compact reminder (see toolReminder).
@@ -227,6 +242,8 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/readyz", h.readyz)
 	mux.HandleFunc("/v1/chat/completions", h.transactionRoute((*handler).completions))
 	mux.HandleFunc("/v1/sessions/recover", h.transactionRoute((*handler).recoverSession))
+	mux.HandleFunc("/v1/sessions/recheck", h.recheckRejectedReply)
+	mux.HandleFunc("/v1/sessions/correct-format", h.correctRejectedFormat)
 	mux.HandleFunc("/v1/sessions/resync", h.transactionRoute((*handler).resyncSession))
 	// Read-only state inspection and explicit operator abandonment are plain
 	// JSON endpoints: neither takes a browser transaction nor submits a turn.
@@ -1718,6 +1735,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.URL = url
 		if id != "" {
+			s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(s.PendingPrompt, answer)
 			if serr := h.rejectCompleted(s, fingerprint, rejectToolProtocol); serr != nil {
 				h.backendError(w, serr)
 				return

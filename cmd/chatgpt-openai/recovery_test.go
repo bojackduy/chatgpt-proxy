@@ -962,7 +962,272 @@ func TestProtocolRefusalIsReportedAsRefusedNotEmpty(t *testing.T) {
 	}
 }
 
-// --- user-facing recovery contract ---------------------------------------
+// --- exact rejected-reply recheck and human correction --------------------
+
+func sessionPost(h *handler, path, id, origin string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest("POST", path, nil)
+	if id != "" {
+		r.Header.Set("X-Session-Id", id)
+	}
+	if origin != "" {
+		r.Header.Set("Origin", origin)
+	}
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, r)
+	return w
+}
+
+// rejectedSession builds a fully bound rejected_output journal: the exact
+// request, the exact submitted prompt and the exact rejected reply.
+func rejectedSession(req completionsRequest, prompt, answer string) *session {
+	s := &session{
+		URL:                 "https://chatgpt.com/c/rejected",
+		Messages:            append([]message{}, req.Messages[:1]...),
+		Phase:               "invalid",
+		RejectReason:        rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+		PendingRequest:      &req,
+		PendingPrompt:       prompt,
+	}
+	s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(prompt, answer)
+	return s
+}
+
+// A recheck must read the EXACT rejected turn, refuse a changed reply, and
+// cache only bytes that pass the original request's own validation. It never
+// submits and never executes a tool.
+func TestRecheckRejectedReplyUsesOnlyTheExactRejectedBytes(t *testing.T) {
+	req := weatherReq()
+	bad := `here is my answer: {"name":"get_weather","arguments":{"city":"Hanoi"}}`
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: bad, expected: "submitted prompt"}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["recheck"] = rejectedSession(req, "submitted prompt", bad)
+
+	w := sessionPost(h, "/v1/sessions/recheck", "recheck", "")
+	if w.Code != 422 || !strings.Contains(w.Body.String(), `"state":"rejected_output"`) {
+		t.Fatalf("unusable rejected bytes were accepted: %d %s", w.Code, w.Body.String())
+	}
+	if f.reads != 1 || len(f.prompts) != 0 {
+		t.Fatalf("recheck read=%d submitted=%d", f.reads, len(f.prompts))
+	}
+	if s := h.sessions["recheck"]; s.Phase != "invalid" || s.RejectReason != rejectToolProtocol || s.Fingerprint != "" || s.Result.ID != "" {
+		t.Fatalf("failed recheck mutated the journal: %+v", s)
+	}
+
+	// The vendor reply changed: refuse rather than cache an unrelated answer.
+	f.answer = weatherAnswer
+	w = sessionPost(h, "/v1/sessions/recheck", "recheck", "")
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"reason":"reply_changed"`) {
+		t.Fatalf("changed reply was cached: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 0 || h.sessions["recheck"].Fingerprint != "" {
+		t.Fatal("changed reply was cached or submitted")
+	}
+
+	// The exact rejected bytes were always valid; the identity was wrong. Bind
+	// the journal to them and recheck: the reply is cached, nothing is sent.
+	s := rejectedSession(req, "submitted prompt", weatherAnswer)
+	h.sessions["recheck"] = s
+	f.answer = weatherAnswer
+	w = sessionPost(h, "/v1/sessions/recheck", "recheck", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"cached_tool_calls":1`) {
+		t.Fatalf("exact rejected bytes were not cached: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 0 {
+		t.Fatal("recheck submitted a turn")
+	}
+	if s.Dirty || s.Phase != "" || s.RejectedFingerprint != "" || s.RejectReason != "" || s.Result.ID == "" || len(s.Result.Calls) != 1 {
+		t.Fatalf("recheck did not clear the rejection durably: %+v", s)
+	}
+	if s.RejectedAnswerHash != "" || s.RejectedPromptHash != "" || s.PendingRequest != nil {
+		t.Fatal("recheck kept stale rejection identity after caching")
+	}
+
+	// The client's unchanged retry receives the cache instead of a new turn.
+	before := len(f.prompts)
+	dup := assistant(t, request(h, "recheck", req))
+	if dup.ToolCalls[0].ID != s.Result.Calls[0].ID || len(f.prompts) != before {
+		t.Fatal("exact retry did not hit the recheck cache")
+	}
+}
+
+// A journal recorded before reply digests existed is still bound by the exact
+// prompt: the read-only turn can only return the answer that follows it, so the
+// first recheck may adopt that identity instead of inventing a match.
+func TestRecheckBindsLegacyJournalFromItsExactTurn(t *testing.T) {
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: weatherAnswer, expected: "prompt"}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+
+	legacy := &session{
+		URL: "https://chatgpt.com/c/rejected", Messages: req.Messages[:1],
+		Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+		PendingRequest:      &req, PendingPrompt: "prompt",
+	}
+	h.sessions["legacy"] = legacy
+	w := sessionPost(h, "/v1/sessions/recheck", "legacy", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"rechecked":true`) {
+		t.Fatalf("legacy rejection was not rechecked honestly: %d %s", w.Code, w.Body.String())
+	}
+	if f.reads != 1 || legacy.Result.ID == "" || legacy.Phase != "" {
+		t.Fatalf("legacy recheck did not cache from the exact turn: reads=%d %+v", f.reads, legacy)
+	}
+	if legacy.RejectedAnswerHash != "" || legacy.RejectedPromptHash != "" {
+		t.Fatal("legacy recheck kept stale rejection identity after caching")
+	}
+}
+
+// A journal that cannot even name its exact turn must fail honestly, without
+// touching the browser or inventing proof.
+func TestRecheckRefusesJournalWithoutExactTurn(t *testing.T) {
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: weatherAnswer, expected: "prompt"}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+
+	h.sessions["unbound"] = &session{
+		URL: "https://chatgpt.com/c/rejected", Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+	}
+	w := sessionPost(h, "/v1/sessions/recheck", "unbound", "")
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"reason":"no_rejected_identity"`) {
+		t.Fatalf("unbound rejection was rechecked: %d %s", w.Code, w.Body.String())
+	}
+	if f.reads != 0 {
+		t.Fatal("unbound journal was read")
+	}
+}
+
+// Exactly one human-authorized correction: the original task is never resent,
+// the binding is durable before the browser action, and a spent correction is
+// refused instead of resubmitted.
+func TestCorrectionSubmitsOnceAndNeverResendsTheTask(t *testing.T) {
+	req := weatherReq()
+	rejected := `Sorry, I cannot format that.`
+	s := rejectedSession(req, "submitted prompt", rejected)
+	f := &fakeBackend{answers: []string{weatherAnswer}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["fix"] = s
+
+	w := sessionPost(h, "/v1/sessions/correct-format", "fix", "")
+	if w.Code != 200 {
+		t.Fatalf("correction refused: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 1 || f.urls[0] != "https://chatgpt.com/c/rejected" {
+		t.Fatalf("correction submissions=%d url=%v", len(f.prompts), f.urls)
+	}
+	prompt := f.prompts[0]
+	if !strings.Contains(prompt, "<opencode_bridge_call>") || !strings.Contains(prompt, "</opencode_bridge_call>") {
+		t.Fatal("correction prompt does not state the literal wrapper")
+	}
+	if strings.Contains(prompt, "Call weather for Hanoi") {
+		t.Fatal("correction resent the original task")
+	}
+	if s.Dirty || s.Phase != "" || s.RejectReason != "" || s.RejectedFingerprint != "" || s.Result.ID == "" || len(s.Result.Calls) != 1 {
+		t.Fatalf("correction did not cache the validated reply: %+v", s)
+	}
+	if s.CorrectionFingerprint != requestFingerprint(req) {
+		t.Fatal("correction budget was not recorded durably")
+	}
+	// No tool call was delivered by the correction itself.
+	if len(f.prompts) != 1 {
+		t.Fatal("correction executed or resubmitted something")
+	}
+}
+
+// A correction that produces another unusable reply keeps the rejection (now
+// bound to that exact new reply) and refuses a second correction.
+func TestCorrectionStopsAfterOneAttempt(t *testing.T) {
+	req := weatherReq()
+	s := rejectedSession(req, "submitted prompt", "bad one")
+	f := &fakeBackend{answers: []string{"still bad"}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["fix"] = s
+
+	w := sessionPost(h, "/v1/sessions/correct-format", "fix", "")
+	if w.Code != 422 || !strings.Contains(w.Body.String(), `"reason":"`) {
+		t.Fatalf("unusable correction was accepted: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("corrections submitted=%d", len(f.prompts))
+	}
+	if s.Phase != "invalid" || s.RejectReason != rejectToolProtocol || s.RejectedAnswerHash != answerDigest("still bad") {
+		t.Fatalf("correction did not rebind the rejection to the new reply: %+v", s)
+	}
+	if s.CorrectionFingerprint == "" {
+		t.Fatal("correction budget was not persisted")
+	}
+
+	w = sessionPost(h, "/v1/sessions/correct-format", "fix", "")
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"reason":"correction_already_spent"`) {
+		t.Fatalf("second correction was not refused: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 1 {
+		t.Fatal("second correction was submitted")
+	}
+	// The recheck remains available for the exact new reply.
+	if !s.recheckable() || s.correctable() {
+		t.Fatal("state predicates disagree after a spent correction")
+	}
+}
+
+// An uncertain correction must persist its binding before the browser action,
+// refuse a duplicate, and point at read-only recovery instead.
+func TestCorrectionUncertainRefusesDuplicate(t *testing.T) {
+	req := weatherReq()
+	s := rejectedSession(req, "submitted prompt", "bad one")
+	f := &fakeBackend{err: errors.New("timed out reading the answer")}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["fix"] = s
+
+	w := sessionPost(h, "/v1/sessions/correct-format", "fix", "")
+	if w.Code != 422 || !strings.Contains(w.Body.String(), `"reason":"correction_uncertain"`) {
+		t.Fatalf("uncertain correction reported as success: %d %s", w.Code, w.Body.String())
+	}
+	if !s.Dirty || s.Phase != "final" || s.PendingRequest == nil || s.PendingPrompt == "" {
+		t.Fatalf("uncertain correction lost its binding: %+v", s)
+	}
+	if s.RejectedFingerprint == "" || s.CorrectionFingerprint == "" {
+		t.Fatal("uncertain correction dropped the rejection identity or budget")
+	}
+	w = sessionPost(h, "/v1/sessions/correct-format", "fix", "")
+	if w.Code != 409 || len(f.prompts) != 1 {
+		t.Fatalf("duplicate correction submitted: %d prompts=%d", w.Code, len(f.prompts))
+	}
+}
+
+// Mutations are not a browser API: Origin is refused, and a missing identity
+// is refused whole. Nothing reaches the browser.
+func TestCorrectionRefusesBrowserOriginAndMissingIdentity(t *testing.T) {
+	req := weatherReq()
+	s := rejectedSession(req, "submitted prompt", "bad one")
+	f := &fakeBackend{answers: []string{weatherAnswer}}
+	h := testHandler(f)
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+	h.sessions["fix"] = s
+
+	if w := sessionPost(h, "/v1/sessions/correct-format", "fix", "https://evil.example"); w.Code != 403 {
+		t.Fatalf("browser-originated correction allowed: %d", w.Code)
+	}
+	if w := sessionPost(h, "/v1/sessions/correct-format", "", ""); w.Code != 400 {
+		t.Fatalf("correction without a session allowed: %d", w.Code)
+	}
+	if w := sessionPost(h, "/v1/sessions/correct-format", "*", ""); w.Code != 400 {
+		t.Fatalf("correction with a wildcard allowed: %d", w.Code)
+	}
+	if len(f.prompts) != 0 || s.Dirty {
+		t.Fatal("refused correction reached the browser or the journal")
+	}
+}
 
 func stateGet(h *handler, id, method string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "/v1/sessions/state", nil)
@@ -1085,7 +1350,7 @@ func TestSessionStateLeaksNoContentAndDoesNotMutate(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
 		t.Fatal(err)
 	}
-	allowed := map[string]bool{"session": true, "state": true, "can_recover": true, "can_resync": true, "thread_url_present": true, "completed_messages": true, "pending_prompt_bytes": true, "outstanding_tool_calls": true, "summary": true, "actions": true}
+	allowed := map[string]bool{"session": true, "state": true, "can_recover": true, "can_resync": true, "can_recheck": true, "can_correct_format": true, "thread_url_present": true, "completed_messages": true, "pending_prompt_bytes": true, "outstanding_tool_calls": true, "summary": true, "actions": true}
 	for k := range v {
 		if !allowed[k] {
 			t.Fatalf("unexpected field %q in state body", k)
@@ -1239,5 +1504,115 @@ func TestAbandonRefusedWhileTurnInFlight(t *testing.T) {
 	}
 	if w := abandonPost(h, `{"sessions":["go"]}`, ""); w.Code == 200 {
 		t.Fatal("abandon succeeded while a turn was in flight")
+	}
+}
+
+// The inspector must offer the two exact-rejected-reply actions only when the
+// shared predicates say the journal really holds that reply. A spent
+// correction disappears from the list; the read-only recheck stays.
+func TestSessionStateOffersExactRejectedReplyActions(t *testing.T) {
+	req := weatherReq()
+	h := testHandler(&fakeBackend{})
+	s := rejectedSession(req, "submitted prompt", "bad reply")
+	h.sessions["state"] = s
+
+	v := stateBody(t, h, "state")
+	if v["can_recheck"] != true || v["can_correct_format"] != true {
+		t.Fatalf("bound rejection offers no actions: %v", v)
+	}
+	if got := strings.Join(stateActionsOf(v), ","); got != "recheck,correct_format,continue" {
+		t.Fatalf("actions %q", got)
+	}
+
+	// A spent correction is never offered twice.
+	s.CorrectionFingerprint = requestFingerprint(req)
+	v = stateBody(t, h, "state")
+	if v["can_recheck"] != true || v["can_correct_format"] != false {
+		t.Fatalf("spent correction still offered: %v", v)
+	}
+	if got := strings.Join(stateActionsOf(v), ","); got != "recheck,continue" {
+		t.Fatalf("actions after spent correction %q", got)
+	}
+
+	// A journal predating reply digests is still bound by its exact prompt, so
+	// both read-only and one-shot correction stay available.
+	h.sessions["state"] = &session{
+		URL: "https://chatgpt.com/c/t", Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req), PendingRequest: &req, PendingPrompt: "submitted prompt",
+	}
+	v = stateBody(t, h, "state")
+	if v["can_recheck"] != true || v["can_correct_format"] != true {
+		t.Fatalf("legacy rejection lost its exact-turn actions: %v", v)
+	}
+	if got := strings.Join(stateActionsOf(v), ","); got != "recheck,correct_format,continue" {
+		t.Fatalf("legacy actions %q", got)
+	}
+
+	// A rejection that cannot name its exact turn offers neither.
+	h.sessions["state"] = &session{
+		URL: "https://chatgpt.com/c/t", Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+	}
+	v = stateBody(t, h, "state")
+	if v["can_recheck"] != false || v["can_correct_format"] != false {
+		t.Fatalf("unbound rejection claims proof it does not have: %v", v)
+	}
+	if got := strings.Join(stateActionsOf(v), ","); got != "continue" {
+		t.Fatalf("unbound actions %q", got)
+	}
+}
+
+// A journal recorded before reply digests existed still quotes the refused
+// reply: the correction reads the exact turn once, binds it, then submits.
+func TestCorrectionBindsLegacyJournalFromItsExactTurn(t *testing.T) {
+	req := weatherReq()
+	const rejected = "Sorry, I cannot format that."
+	f := &inspectBackend{fakeBackend: &fakeBackend{answers: []string{weatherAnswer}}, answer: rejected, expected: "prompt"}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+
+	legacy := &session{
+		URL: "https://chatgpt.com/c/rejected", Messages: append([]message{}, req.Messages[:1]...),
+		Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+		PendingRequest:      &req, PendingPrompt: "prompt",
+	}
+	h.sessions["legacy"] = legacy
+	w := sessionPost(h, "/v1/sessions/correct-format", "legacy", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"corrected":true`) {
+		t.Fatalf("legacy correction failed: %d %s", w.Code, w.Body.String())
+	}
+	if f.reads != 1 || len(f.prompts) != 1 {
+		t.Fatalf("legacy correction reads=%d prompts=%d, want 1 and 1", f.reads, len(f.prompts))
+	}
+	if !strings.Contains(f.prompts[0], rejected) {
+		t.Fatal("correction did not quote the refused reply it read")
+	}
+	if legacy.Result.ID == "" || legacy.Phase != "" {
+		t.Fatalf("legacy correction did not cache the corrected reply: %+v", legacy)
+	}
+}
+
+// A legacy journal whose exact turn cannot be read back is refused rather than
+// quoted from a guess.
+func TestCorrectionRefusesLegacyJournalThatCannotBeRead(t *testing.T) {
+	req := weatherReq()
+	f := &inspectBackend{fakeBackend: &fakeBackend{}, answer: "x", expected: "prompt", readErr: errors.New("source unreadable")}
+	h := testHandler(f.fakeBackend)
+	h.client = f
+	h.statePath = filepath.Join(t.TempDir(), "state.json")
+
+	h.sessions["legacy"] = &session{
+		URL: "https://chatgpt.com/c/rejected", Phase: "invalid", RejectReason: rejectToolProtocol,
+		RejectedFingerprint: requestFingerprint(req),
+		PendingRequest:      &req, PendingPrompt: "prompt",
+	}
+	w := sessionPost(h, "/v1/sessions/correct-format", "legacy", "")
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"reason":"no_rejected_sample"`) {
+		t.Fatalf("unreadable legacy correction was not refused: %d %s", w.Code, w.Body.String())
+	}
+	if len(f.prompts) != 0 {
+		t.Fatal("correction was submitted without the refused reply")
 	}
 }

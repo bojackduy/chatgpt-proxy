@@ -142,6 +142,7 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (b
 	}
 	out, err := parseAnswer(res.Answer, *pending)
 	if err != nil {
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(s.PendingPrompt, res.Answer)
 		if err := h.rejectCompleted(s, requestFingerprint(*pending), rejectToolProtocol); err != nil {
 			return false, nil
 		}
@@ -220,6 +221,356 @@ func requestFingerprint(req completionsRequest) string {
 		Choice   any
 	}{req.Messages, req.Tools, req.ToolChoice})
 	return fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
+// ---------------------------------------------------------------------------
+// Exact rejected-reply identity, recheck and human-authorized correction
+// ---------------------------------------------------------------------------
+//
+// A Phase=="invalid" journal proves that the model produced a finished reply
+// that failed strict validation and that ZERO tool calls were delivered. Two
+// separate human actions exist for it, and they must never be confused:
+//
+//   POST /v1/sessions/recheck        read-only: re-read the exact stored turn
+//                                    and validate those same bytes again.
+//   POST /v1/sessions/correct-format exactly ONE explicit correction
+//                                    submission, authorized by a person.
+//
+// Neither executes a tool. Neither resends the original task. Neither silently
+// repairs JSON, strips escapes or inserts tags.
+
+// rejectedIdentity binds a durable rejection to the exact bytes behind it: the
+// submitted prompt (normalized exactly as adoption compares it) and the
+// rejected reply. Only a bounded inert sample of the reply is retained so a
+// correction prompt can quote the defect. Content never reaches the log.
+func rejectedIdentity(prompt, answer string) (promptHash, answerHash, sample string) {
+	return chatgpt.PromptHash(prompt), answerDigest(answer), boundedRunes(answer, 800)
+}
+
+func answerDigest(answer string) string {
+	sum := sha256.Sum256([]byte(answer))
+	return fmt.Sprintf("%x", sum)
+}
+
+// boundedRunes truncates by runes so a multi-byte character is never split.
+func boundedRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// openSessionTurn resolves the named session under the adapter's transaction
+// gate and turn lock, mirroring recoverSession's serialization. browserMutation
+// additionally refuses anything a web page could have originated. The returned
+// release must be called on every path where ok is true.
+func (h *handler) openSessionTurn(w http.ResponseWriter, r *http.Request, browserMutation bool) (*session, string, func(), bool) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		apiError(w, http.StatusMethodNotAllowed, errors.New("POST required"))
+		return nil, "", nil, false
+	}
+	if browserMutation && r.Header.Get("Origin") != "" {
+		apiError(w, http.StatusForbidden, errors.New("browser-originated recovery is forbidden"))
+		return nil, "", nil, false
+	}
+	id, _, err := completionSessionID(r)
+	if err != nil {
+		apiError(w, 400, err)
+		return nil, "", nil, false
+	}
+	if id == "" {
+		apiError(w, 400, errors.New("session header required"))
+		return nil, "", nil, false
+	}
+	if why := unresolvableID(id); why != "" {
+		apiError(w, 400, errors.New("session header: "+why))
+		return nil, "", nil, false
+	}
+	if !h.acquire(r.Context()) {
+		return nil, "", nil, false
+	}
+	unlock, err := h.lockTurn(r.Context())
+	if err != nil {
+		h.release()
+		log.Printf("[openai] turn lock: %v", err)
+		apiError(w, http.StatusServiceUnavailable, err)
+		return nil, "", nil, false
+	}
+	return h.sessions[id], id, func() { unlock(); h.release() }, true
+}
+
+// cacheRejectedReply validates the exact rejected bytes against the retained
+// original request, then commits them to the normal completion cache under the
+// ORIGINAL request fingerprint, so the client's unchanged retry receives them.
+// A validation failure returns a content-free reason and changes nothing; a
+// persistence failure rolls the journal back in memory. No tool is executed.
+func (h *handler) cacheRejectedReply(id string, s *session, req completionsRequest, answer string, res chatgpt.TurnResult) (map[string]any, string, error) {
+	out, err := parseAnswer(answer, req)
+	if err != nil {
+		return nil, protocolReasonCode(err), nil
+	}
+	if out.Text == "" && len(out.Calls) == 0 {
+		return nil, "empty", nil
+	}
+	out.Reasoning, out.Images = res.Reasoning, res.Images
+	fp := requestFingerprint(req)
+	out.ID, out.Created = fmt.Sprintf("chatcmpl-%x", sha256.Sum256([]byte(id+":"+fp))), time.Now().Unix()
+	for i := range out.Calls {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", id, fp, i)))
+		out.Calls[i].ID = fmt.Sprintf("call_%x", sum[:12])
+	}
+	old := *s
+	s.Messages = append(append([]message{}, req.Messages...), message{Role: "assistant", Content: out.Text, ToolCalls: out.Calls})
+	s.Fingerprint, s.Result, s.Dirty, s.Phase = fp, out, false, ""
+	s.ToolsFP = toolsFingerprint(req.Tools)
+	s.PendingRequest, s.PendingPrompt, s.RepairPendingPrompt = nil, "", ""
+	s.RejectedFingerprint, s.RejectReason = "", ""
+	s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = "", "", ""
+	if err := h.save(); err != nil {
+		*s = old
+		return nil, "", err
+	}
+	return map[string]any{"cached_tool_calls": len(out.Calls), "response_bytes": len(answer)}, "", nil
+}
+
+// recheckRejectedReply re-reads the exact turn behind a durable rejected_output
+// journal and validates those SAME bytes with the retained original request.
+// Success caches the reply (nothing is sent and no tool runs); OpenCode is not
+// resumed by this call — the client's unchanged retry receives the cache.
+func (h *handler) recheckRejectedReply(w http.ResponseWriter, r *http.Request) {
+	s, id, release, ok := h.openSessionTurn(w, r, false)
+	if !ok {
+		return
+	}
+	defer release()
+	if s == nil || s.Phase != "invalid" || s.RejectReason != rejectToolProtocol {
+		apiError(w, 409, errors.New("this chat holds no rejected reply to recheck; nothing was sent and nothing changed"))
+		return
+	}
+	if !s.recheckable() {
+		apiErrorDetail(w, http.StatusConflict, errors.New("the rejected reply has no retained exact identity, so it cannot be rechecked honestly; send a new message to continue"), map[string]any{
+			"reason": "no_rejected_identity",
+			"state":  stateClass(s),
+		})
+		return
+	}
+	backend, ok := h.client.(recoveryBackend)
+	if !ok {
+		apiError(w, 503, errors.New("backend cannot inspect stored responses"))
+		return
+	}
+	req, url, prompt := *s.PendingRequest, s.URL, s.PendingPrompt
+	res, err := backend.ReadThreadTurn(r.Context(), url, prompt)
+	if err != nil {
+		reason := "source_unreadable"
+		if errors.Is(err, chatgpt.ErrCompletedEmpty) {
+			reason = "empty_source"
+		}
+		log.Printf("[openai] session=%s rejected recheck refused reason=%s", id, reason)
+		apiErrorDetail(w, http.StatusConflict, fmt.Errorf("the stored reply could not be read back exactly (%s); nothing was cached and nothing was sent", reason), map[string]any{
+			"reason": reason,
+			"state":  stateClass(s),
+		})
+		return
+	}
+	if s.rejectionBound() {
+		if answerDigest(res.Answer) != s.RejectedAnswerHash {
+			log.Printf("[openai] session=%s rejected recheck refused reason=reply_changed", id)
+			apiErrorDetail(w, http.StatusConflict, errors.New("the stored reply is not the reply that was rejected, so it was not cached; nothing was sent"), map[string]any{"reason": "reply_changed"})
+			return
+		}
+	} else {
+		// A journal from before reply digests were recorded: the exact-prompt
+		// turn read above is what proves identity, so bind it now instead of
+		// inventing a match against a digest that never existed.
+		old := *s
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(prompt, res.Answer)
+		if err := h.save(); err != nil {
+			*s = old
+			apiError(w, 500, err)
+			return
+		}
+		log.Printf("[openai] session=%s rejected recheck bound legacy identity bytes=%d", id, len(res.Answer))
+	}
+	cached, reason, err := h.cacheRejectedReply(id, s, req, res.Answer, res)
+	if err != nil {
+		apiError(w, 500, err)
+		return
+	}
+	if reason != "" {
+		log.Printf("[openai] session=%s rejected recheck still unusable reason=%s", id, reason)
+		apiErrorDetail(w, http.StatusUnprocessableEntity, fmt.Errorf("the stored reply still cannot be used (reason: %s); nothing was cached, nothing was sent and no tool was run", reason), map[string]any{
+			"reason": reason,
+			"state":  stateClass(s),
+		})
+		return
+	}
+	h.appendSent(sentEntry{Event: "rechecked", Session: id, URL: url, PromptHash: promptHash(prompt), Bytes: len(prompt), AnswerHash: answerDigest(res.Answer), Note: "read-only recheck of the exact rejected reply; no submission or execution"})
+	writeJSON(w, 200, map[string]any{
+		"rechecked":         true,
+		"session":           id,
+		"cached_tool_calls": cached["cached_tool_calls"],
+		"response_bytes":    cached["response_bytes"],
+		"next":              "the stored reply is now held by the bridge; resend the same message unchanged to receive it. Nothing was sent and no tool was run.",
+	})
+}
+
+// humanCorrectionPrompt is the ONE explicit, human-authorized correction
+// submission. It never restates the task: it asks the model to re-emit the
+// reply it already produced, in the literal wrapper the client parses, and
+// reuses the existing bounded repair schema/sample section.
+func humanCorrectionPrompt(rejected string, req completionsRequest) string {
+	lead := "Your previous reply could not be used by the external client. Re-emit that same reply exactly once, as one literal wrapper and nothing else:\n" +
+		`<opencode_bridge_call>{"name":"<tool name>","arguments":{...}}</opencode_bridge_call>` + "\n" +
+		"Use the exact tool name and argument schema from the instructions below. No Markdown fences, no escaped quotes, and no text before or after the wrapper.\n"
+	return lead + formatRepairPrompt(rejected, req)
+}
+
+// correctRejectedFormat performs exactly one human-authorized correction
+// submission in the saved thread. The binding is journaled before the browser
+// action, so a crash cannot make a second correction possible; an uncertain
+// outcome therefore refuses a repeat and points at read-only recovery instead.
+func (h *handler) correctRejectedFormat(w http.ResponseWriter, r *http.Request) {
+	s, id, release, ok := h.openSessionTurn(w, r, true)
+	if !ok {
+		return
+	}
+	defer release()
+	if s == nil || s.Phase != "invalid" || s.RejectReason != rejectToolProtocol {
+		apiError(w, 409, errors.New("this chat holds no rejected reply to correct; nothing was sent and nothing changed"))
+		return
+	}
+	if !s.recheckable() {
+		apiErrorDetail(w, http.StatusConflict, errors.New("the rejected reply has no retained exact identity, so a correction cannot be prepared honestly; send a new message to continue"), map[string]any{
+			"reason": "no_rejected_identity",
+			"state":  stateClass(s),
+		})
+		return
+	}
+	req, url, rejected := *s.PendingRequest, s.URL, s.RejectedAnswerSample
+	fp := requestFingerprint(req)
+	if s.CorrectionFingerprint == fp {
+		apiErrorDetail(w, http.StatusConflict, errors.New("a format correction was already asked for this reply and will not be sent twice; use the read-only recheck or send a new message"), map[string]any{"reason": "correction_already_spent"})
+		return
+	}
+	if rejected == "" {
+		// No retained sample (journal predates reply digests): read the exact
+		// turn once, so the quoted defect is the refused reply and not a guess,
+		// and bind the identity before anything is submitted.
+		backend, ok := h.client.(recoveryBackend)
+		if !ok {
+			apiError(w, 503, errors.New("backend cannot inspect stored responses"))
+			return
+		}
+		res, err := backend.ReadThreadTurn(r.Context(), url, s.PendingPrompt)
+		if err != nil || strings.TrimSpace(res.Answer) == "" {
+			log.Printf("[openai] session=%s format correction refused reason=no_rejected_sample", id)
+			apiErrorDetail(w, http.StatusConflict, errors.New("the rejected reply could not be read back exactly, so a correction cannot be prepared honestly; nothing was sent"), map[string]any{"reason": "no_rejected_sample"})
+			return
+		}
+		old := *s
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(s.PendingPrompt, res.Answer)
+		if err := h.save(); err != nil {
+			*s = old
+			apiError(w, 500, err)
+			return
+		}
+		rejected = boundedRunes(res.Answer, 800)
+		log.Printf("[openai] session=%s format correction bound legacy identity bytes=%d", id, len(res.Answer))
+	}
+	prompt := humanCorrectionPrompt(rejected, req)
+	if h.maxChars > 0 && len(prompt) > h.maxChars {
+		apiError(w, 400, fmt.Errorf("the correction prompt is %d bytes, over the per-turn budget %d", len(prompt), h.maxChars))
+		return
+	}
+	old := *s
+	s.URL, s.Dirty, s.Phase = url, true, "final"
+	s.PendingRequest, s.PendingPrompt = &req, prompt
+	s.RepairFingerprint, s.RepairPendingPrompt = fp, prompt
+	s.CorrectionFingerprint = fp
+	if err := h.save(); err != nil {
+		*s = old
+		apiError(w, 500, err)
+		return
+	}
+	log.Printf("[openai] session=%s format correction requested bytes=%d", id, len(prompt))
+	h.appendSent(sentEntry{Event: "submitted", Session: id, URL: url, PromptHash: promptHash(prompt), Bytes: len(prompt), Chunk: 1, Chunks: 1, Note: "human format-correction intent"})
+	thinking := h.forceThinking || (req.ReasoningEffort != nil && req.ReasoningEffort != "none") || (req.Reasoning != nil && req.Reasoning != false)
+	res, err := h.client.AskThreadTurn(r.Context(), chatgpt.TurnOptions{Prompt: prompt, URL: url, Thinking: thinking})
+	h.recordTurnOutcome(id, prompt, url, res, err, 1, 1)
+	if err != nil {
+		if chatgpt.IsPreSubmit(err) || chatgpt.IsNavigateError(err) {
+			// Nothing reached the thread: restore the rejected state exactly.
+			*s = old
+			if serr := h.save(); serr != nil {
+				apiError(w, 500, serr)
+				return
+			}
+			apiError(w, 422, errors.New(failureText("The correction was not submitted, so nothing changed.", nextNewMessage)))
+			return
+		}
+		if res.URL != "" && chatgpt.ThreadPattern.MatchString(res.URL) {
+			s.URL = res.URL
+			_ = h.save()
+		}
+		log.Printf("[openai] session=%s format correction uncertain; duplicate refused by journal", id)
+		apiErrorDetail(w, 422, errors.New(failureText("The correction could not be confirmed, so this chat now holds an unknown turn.", sayRecoverReset)), map[string]any{
+			"reason":  "correction_uncertain",
+			"state":   stateClass(s),
+			"actions": stateActions(stateClass(s), s),
+			"next":    "read-only recovery: POST /v1/sessions/recover; a second correction is refused",
+		})
+		return
+	}
+	if res.URL != "" && strings.Contains(res.URL, "/c/") {
+		s.URL = res.URL
+		if err := h.save(); err != nil {
+			apiError(w, 500, err)
+			return
+		}
+	}
+	if strings.TrimSpace(res.Answer) == "" {
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(prompt, res.Answer)
+		if serr := h.rejectCompleted(s, fp, rejectEmptyFinal); serr != nil {
+			apiError(w, 500, serr)
+			return
+		}
+		log.Printf("[openai] session=%s format correction produced an empty reply", id)
+		apiErrorDetail(w, 422, errors.New(failureText("The corrected reply was empty, so nothing could be used.", nextNewMessage)), map[string]any{"reason": "empty_source"})
+		return
+	}
+	cached, reason, err := h.cacheRejectedReply(id, s, req, res.Answer, res)
+	if err != nil {
+		apiError(w, 500, err)
+		return
+	}
+	if reason != "" {
+		// The correction produced yet another unusable reply. Keep the durable
+		// rejection, now bound to THIS exact reply, and refuse a second
+		// correction (CorrectionFingerprint is already set).
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(prompt, res.Answer)
+		if serr := h.rejectCompleted(s, fp, rejectToolProtocol); serr != nil {
+			apiError(w, 500, serr)
+			return
+		}
+		log.Printf("[openai] session=%s format correction still unusable reason=%s", id, reason)
+		apiErrorDetail(w, 422, fmt.Errorf("the corrected reply still cannot be used (reason: %s); it was not cached and no tool was run. A second correction will not be sent", reason), map[string]any{
+			"reason":  reason,
+			"state":   stateClass(s),
+			"actions": stateActions(stateClass(s), s),
+		})
+		return
+	}
+	h.appendSent(sentEntry{Event: "corrected", Session: id, URL: url, PromptHash: promptHash(prompt), Bytes: len(prompt), AnswerHash: answerDigest(res.Answer), Note: "human-authorized format correction; no execution"})
+	writeJSON(w, 200, map[string]any{
+		"corrected":         true,
+		"session":           id,
+		"cached_tool_calls": cached["cached_tool_calls"],
+		"response_bytes":    cached["response_bytes"],
+		"next":              "the corrected reply is now held by the bridge; resend the same message unchanged to receive it. No tool was run by the correction, and this does not resume OpenCode by itself.",
+	})
 }
 
 // Recovery never emits executable calls, never submits, and never clears an
@@ -339,6 +690,7 @@ func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
 		old := *s
 		s.URL = threadURL // source-bound answer was received, even if invalid
 		s.PendingRequest, s.PendingPrompt = req, prompt
+		s.RejectedPromptHash, s.RejectedAnswerHash, s.RejectedAnswerSample = rejectedIdentity(prompt, res.Answer)
 		if serr := h.rejectCompleted(s, requestFingerprint(*req), rejectToolProtocol); serr != nil {
 			*s = old
 			apiError(w, 500, serr)

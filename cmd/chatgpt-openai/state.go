@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chatgpt-proxy/internal/chatgpt"
 	"context"
 	"errors"
 	"net/http"
@@ -27,11 +28,50 @@ const (
 )
 
 const (
-	actionContinue = "continue"
-	actionRecover  = "recover"
-	actionResync   = "resync"
-	actionAbandon  = "abandon"
+	actionContinue      = "continue"
+	actionRecover       = "recover"
+	actionResync        = "resync"
+	actionAbandon       = "abandon"
+	actionRecheck       = "recheck"
+	actionCorrectFormat = "correct_format"
 )
+
+// rejectionIdentifiable reports whether a durable rejected_output journal still
+// names the exact turn it refuses: the same request fingerprint and the same
+// submitted prompt. Reading that turn needs no stored hash, because
+// chatgpt.ReadThreadTurn refuses any user bubble that is not this exact prompt,
+// so it can only return the answer that follows it — never "whatever is
+// latest". This is the same proof adoption already trusts.
+func (s *session) rejectionIdentifiable() bool {
+	if s == nil || s.Phase != "invalid" || s.RejectReason != rejectToolProtocol ||
+		s.PendingRequest == nil || s.PendingPrompt == "" || s.URL == "" {
+		return false
+	}
+	return s.RejectedFingerprint == requestFingerprint(*s.PendingRequest)
+}
+
+// rejectionBound additionally proves the journal already holds the digest of
+// the exact reply it refuses. When it does, a recheck must see that same reply
+// or change nothing.
+func (s *session) rejectionBound() bool {
+	return s.rejectionIdentifiable() && s.RejectedAnswerHash != "" &&
+		s.RejectedPromptHash == chatgpt.PromptHash(s.PendingPrompt)
+}
+
+// recheckable is the single predicate behind /v1/sessions/recheck, its 409
+// guard and the state inspector's can_recheck. A journal predating reply
+// digests (rejected before this was recorded) still qualifies: the first
+// recheck binds the identity it reads from the exact-prompt turn.
+func (s *session) recheckable() bool { return s.rejectionIdentifiable() }
+
+// correctable gates the ONE human-authorized correction submission. A spent
+// correction (CorrectionFingerprint already recorded for this request) is never
+// offered again. A journal without a retained sample reads the exact reply
+// first, so the quoted defect is still the refused one.
+func (s *session) correctable() bool {
+	return s.rejectionIdentifiable() &&
+		s.CorrectionFingerprint != requestFingerprint(*s.PendingRequest)
+}
 
 // adoptable reports whether a read-only adoption of the EXACT retained
 // original request is possible. It is the single predicate behind both
@@ -82,7 +122,7 @@ func stateSummary(class string) string {
 	case statePendingUnverifiable:
 		return "A previous reply could not be confirmed and cannot be read back; this chat has to be explicitly cleared before it can be used again."
 	case stateRejectedOutput:
-		return "The model's last reply could not be used as a tool call, and nothing was run; a new message will continue."
+		return "The model's last reply could not be used as a tool call, and nothing was run; you can check that exact reply again, ask ChatGPT to repeat it once in the right format, or send a new message."
 	case stateEmptyFinal:
 		return "The model's last reply was empty and nothing was run; a new message will continue."
 	default:
@@ -95,7 +135,18 @@ func stateActions(class string, s *session) []string {
 	canRecover, canResync := s.adoptable(), s.resyncable()
 	out := []string{}
 	switch class {
-	case stateClean, stateRejectedOutput, stateEmptyFinal:
+	case stateClean, stateEmptyFinal:
+		out = append(out, actionContinue)
+	case stateRejectedOutput:
+		// Read-only check first: it can only ever cache the reply that was
+		// already produced. The correction is a NEW submission and is offered
+		// only while its one-shot budget is unspent.
+		if s != nil && s.recheckable() {
+			out = append(out, actionRecheck)
+		}
+		if s != nil && s.correctable() {
+			out = append(out, actionCorrectFormat)
+		}
 		out = append(out, actionContinue)
 	case statePendingVerifiable:
 		if canRecover {
@@ -151,6 +202,7 @@ func outstandingCallCount(msgs []message) int {
 func describeSession(id string, s *session) map[string]any {
 	class := stateClass(s)
 	canRecover, canResync := s.adoptable(), s.resyncable()
+	canRecheck, canCorrect := s.recheckable(), s.correctable()
 	completed, pendingBytes, outstanding, threadURL := 0, 0, 0, false
 	if s != nil {
 		completed = len(s.Messages)
@@ -163,6 +215,8 @@ func describeSession(id string, s *session) map[string]any {
 		"state":                  class,
 		"can_recover":            canRecover,
 		"can_resync":             canResync,
+		"can_recheck":            canRecheck,
+		"can_correct_format":     canCorrect,
 		"thread_url_present":     threadURL,
 		"completed_messages":     completed,
 		"pending_prompt_bytes":   pendingBytes,
