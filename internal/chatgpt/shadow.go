@@ -61,8 +61,9 @@ type shadowCapture struct {
 	lastOp   string
 	lastPath string
 
-	state   map[string]any
-	message map[string]any
+	state    map[string]any
+	message  map[string]any
+	identity string // how the submitted prompt was matched, never its text
 	// messages indexes every message object seen, and seen preserves arrival
 	// order so "newest matching message" is deterministic.
 	messages map[string]map[string]any
@@ -630,10 +631,46 @@ func (s *shadowCapture) promptUser() string {
 			continue
 		}
 		if t, ok := partsText(m); ok && samePromptKey(t) == want {
+			s.identity = identityExact
+			return s.seen[i]
+		}
+	}
+	// A long prompt can render differently from what was typed (markdown in
+	// the message rewrites the middle), which used to make every long turn
+	// unverifiable. Both ends plus a bounded length still identify the
+	// message this capture submitted.
+	for i := len(s.seen) - 1; i >= 0; i-- {
+		m := s.messages[s.seen[i]]
+		if roleOf(m) != "user" {
+			continue
+		}
+		if t, ok := partsText(m); ok && samePromptWindow(t, s.prompt) {
+			s.identity = identityWindow
 			return s.seen[i]
 		}
 	}
 	return ""
+}
+
+const (
+	identityExact  = "exact"
+	identityWindow = "window"
+)
+
+// samePromptWindow accepts a stored user message whose leading and trailing
+// runes match the submitted prompt while the length stays within an eighth.
+// Interior re-rendering is tolerated; a different message is not.
+func samePromptWindow(have, want string) bool {
+	h := []rune(samePromptKey(have))
+	w := []rune(samePromptKey(want))
+	const edge = 200
+	if len(w) < 2*edge || len(h) < 2*edge {
+		return false
+	}
+	if d := len(h) - len(w); d > len(w)/8 || d < -len(w)/8 {
+		return false
+	}
+	return string(h[:edge]) == string(w[:edge]) && string(h[len(h)-edge:]) == string(w[len(w)-edge:])
 }
 
 // samePromptKey is the prompt identity a textarea round trip preserves: words
@@ -696,12 +733,13 @@ func reportShadow(s *shadowCapture, id, answer string) {
 	matched := correlated && sameAnswerText(text, answer)
 	s.mu.Lock()
 	frames, bytes, completed, ignored := s.frames, s.bytes, s.done, s.ignoredPatches
+	identity := s.identity
 	s.mu.Unlock()
 	prefix, suffix := sharedEdges(text, answer)
 	// Content-free shape only: sizes, shared edges and non-ASCII byte counts,
 	// which is enough to name the class of a difference without printing it.
-	log.Printf("[chatgpt-shadow] id=%s frames=%d bytes=%d completed=%v correlated=%v match=%v ignored=%d shadow_bytes=%d answer_bytes=%d trim_shadow_bytes=%d trim_answer_bytes=%d prefix=%d suffix=%d nonascii=%d/%d reason=%q",
-		id, frames, bytes, completed, correlated, matched, ignored,
+	log.Printf("[chatgpt-shadow] id=%s frames=%d bytes=%d completed=%v correlated=%v identity=%q match=%v ignored=%d shadow_bytes=%d answer_bytes=%d trim_shadow_bytes=%d trim_answer_bytes=%d prefix=%d suffix=%d nonascii=%d/%d reason=%q",
+		id, frames, bytes, completed, correlated, identity, matched, ignored,
 		len(text), len(answer), len(strings.TrimSpace(text)), len(strings.TrimSpace(answer)),
 		prefix, suffix, countNonASCII(text), countNonASCII(answer), reason)
 }

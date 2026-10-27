@@ -1634,3 +1634,37 @@ func TestHasMermaidFence(t *testing.T) {
 		}
 	}
 }
+
+// A long prompt is stored as the rendered message, not the typed bytes: the
+// middle can change (markdown, links). Both ends must still identify it, or
+// every long turn becomes unverifiable.
+func TestShadowCorrelatesRenderedLongPrompt(t *testing.T) {
+	answer := "the answer"
+	head := strings.Repeat("A", 400)
+	tail := strings.Repeat("B", 400)
+	typed := head + "LINK" + tail
+	stored := head + "LINK (docs at example dot com)" + tail
+
+	s := newShadowCapture(typed)
+	shadowFeed(t, s, shadowStream(shadowFixture(stored, answer)), 7)
+	ok, text, reason := s.result()
+	if !ok || text != answer {
+		t.Fatalf("correlated=%v reason=%q text=%q", ok, reason, text)
+	}
+	if s.identity != identityWindow {
+		t.Fatalf("identity=%q, want window", s.identity)
+	}
+}
+
+// Tolerant matching still refuses a different message: same length, other tail.
+func TestShadowWindowToleratesRenderingNotDifferentPrompt(t *testing.T) {
+	head := strings.Repeat("A", 400)
+	typed := head + "LINK" + strings.Repeat("B", 400)
+	other := head + "LINK" + strings.Repeat("C", 400)
+
+	s := newShadowCapture(typed)
+	shadowFeed(t, s, shadowStream(shadowFixture(other, "the answer")), 7)
+	if ok, _, reason := s.result(); ok || reason != "no matching user message" {
+		t.Fatalf("correlated=%v reason=%q", ok, reason)
+	}
+}
