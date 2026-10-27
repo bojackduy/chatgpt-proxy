@@ -858,6 +858,126 @@ func TestComposerInsertModeFollowsContent(t *testing.T) {
 	}
 }
 
+// A composer-less project page must be classified before anything touches
+// the browser again. Only a blank loaded page (document ready, empty body,
+// no composer, no login control, no challenge) may see a single reload:
+// nothing was typed yet, so no submit and no draft is at risk. Auth,
+// challenge, loading and unknown shapes must never trigger hidden
+// navigation.
+func TestClassifyMissingComposer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		ps          pageLoadState
+		cause       missingComposerCause
+		recoverable bool
+	}{
+		{"blank loaded page may reload once", pageLoadState{ReadyComplete: true}, missingComposerBlank, true},
+		{"rendered body without composer is unknown", pageLoadState{ReadyComplete: true, BodyTextLen: 1200}, missingComposerUnknown, false},
+		{"loading page is unavailable", pageLoadState{}, missingComposerLoading, false},
+		{"ready page still hydrating is unavailable", pageLoadState{BodyTextLen: 300}, missingComposerLoading, false},
+		{"login button is auth, never reload", pageLoadState{ReadyComplete: true, Login: true}, missingComposerAuth, false},
+		{"challenge is never reloaded", pageLoadState{ReadyComplete: true, Challenge: true}, missingComposerChallenge, false},
+		{"login wins over challenge", pageLoadState{ReadyComplete: true, Login: true, Challenge: true}, missingComposerAuth, false},
+		{"blank body with composer is not this path", pageLoadState{ReadyComplete: true, Composer: true}, missingComposerUnknown, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cause, recoverable := classifyMissingComposer(tc.ps)
+			if cause != tc.cause || recoverable != tc.recoverable {
+				t.Fatalf("got (%v,%v) want (%v,%v)", cause, recoverable, tc.cause, tc.recoverable)
+			}
+		})
+	}
+}
+
+// A single pre-submit reload must not risk a draft: only a missing record
+// or an already-fenced (submitted) one allows it. An unsubmitted own draft
+// refuses, so its page text can never be wiped by recovery.
+func TestBlankReloadNeedsNoUnsubmittedDraft(t *testing.T) {
+	if !blankReloadAllowed(nil) {
+		t.Fatal("missing draft record must allow the reload")
+	}
+	if !blankReloadAllowed(&draftRecord{Submitted: true}) {
+		t.Fatal("fenced submitted draft must allow the reload")
+	}
+	if blankReloadAllowed(&draftRecord{Doc: "typed", Hash: draftFingerprint("typed")}) {
+		t.Fatal("unsubmitted draft must refuse the reload")
+	}
+}
+
+// The missing-composer errors keep their pre-submit identity through
+// askLocked's defer: a challenge is pre-submit but must never look like a
+// safe retry, while a blank-page failure stays safe-retryable. Either way
+// the original error survives, and a post-submit turn is never reclassified.
+func TestMissingComposerErrorsStayPreSubmit(t *testing.T) {
+	if !IsPreSubmit(ErrPageChallenge) {
+		t.Fatal("challenge must be pre-submit")
+	}
+	if got := classifyPreSendFailure(fmt.Errorf("%w: captcha", ErrPageChallenge), false); errors.Is(got, ErrNotSubmitted) {
+		t.Fatalf("challenge must not look like a safe retry: %v", got)
+	}
+	if got := classifyPreSendFailure(ErrBlankProjectPage, false); !errors.Is(got, ErrNotSubmitted) {
+		t.Fatalf("blank-page failure must stay safe-retryable pre-submit: %v", got)
+	}
+	for _, err := range []error{ErrPageChallenge, ErrBlankProjectPage} {
+		if got := classifyPreSendFailure(err, true); !errors.Is(got, err) {
+			t.Fatalf("post-submit turn reclassified: %v", got)
+		}
+	}
+}
+
+// A canceled caller context surfaces without probing or reloading: no CDP,
+// no navigation, no duplicate send.
+func TestBlankRecoveryHonorsCanceledContext(t *testing.T) {
+	c := &Client{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.recoverBlankProjectPage(ctx, nil, ErrNoComposer); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context must surface, got %v", err)
+	}
+}
+
+func TestProbePageLoadStateReadsOnlyShape(t *testing.T) {
+	chrome := findChrome()
+	if chrome == "" {
+		t.Skip("Chrome unavailable for page-state probe fixture")
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.UserDataDir(t.TempDir()))
+	alloc, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+	root, cancelRoot := chromedp.NewContext(alloc)
+	defer cancelRoot()
+	ctx, cancelTab := context.WithTimeout(root, 60*time.Second)
+	defer cancelTab()
+	if err := chromedp.Run(ctx, chromedp.Navigate("about:blank")); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{}
+	ps, err := c.probePageLoadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ps.ReadyComplete || ps.BodyTextLen != 0 || ps.Composer || ps.Login || ps.Challenge {
+		t.Fatalf("blank fixture misread: %+v", ps)
+	}
+	if cause, ok := classifyMissingComposer(ps); cause != missingComposerBlank || !ok {
+		t.Fatalf("blank fixture not recoverable: %v %v", cause, ok)
+	}
+	set := `<div data-testid="login-button">Log in</div><div id="prompt-textarea"></div>`
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = `+quoteJS(set), nil)); err != nil {
+		t.Fatal(err)
+	}
+	ps, err = c.probePageLoadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ps.Login || !ps.Composer {
+		t.Fatalf("populated fixture misread: %+v", ps)
+	}
+	if cause, ok := classifyMissingComposer(ps); cause != missingComposerAuth || ok {
+		t.Fatalf("login fixture must be auth without recovery: %v %v", cause, ok)
+	}
+}
+
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
 // composer on a dedicated bridge tab: the deprecated execCommand wipe pair does
 // not clear it, a trusted deletion key event does (when deletesHonoured), one

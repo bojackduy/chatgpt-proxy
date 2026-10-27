@@ -53,6 +53,14 @@ var (
 	ErrMissingAnswer  = errors.New("ChatGPT generation ended without an extractable new assistant answer; inspect stored thread/rendering and recover the pending turn; no automatic resubmission")
 	ErrProjectSetup   = errors.New("project setup failed before turn submission")
 	ErrNotSubmitted   = errors.New("turn failed before any submission action")
+	// ErrPageChallenge marks a human-verification gate on the page. Like the
+	// draft refusals it is pre-submit yet needs a person, so it keeps its own
+	// identity instead of looking like a safe resubmission.
+	ErrPageChallenge = errors.New("chatgpt page shows a human-verification challenge; resolve it in the logged Chrome profile")
+	// ErrBlankProjectPage marks a loaded-but-empty project page (document
+	// ready, empty body, no composer, no login control, no challenge). It is
+	// a transient render state, so it stays safe-retryable pre-submit.
+	ErrBlankProjectPage = errors.New("chatgpt project page loaded blank (document ready, empty body, no composer and no login); REPAIR: reload the project page in the logged Chrome profile")
 	// ErrForeignDraft marks a refusal that RETRYING CANNOT FIX: the composer
 	// holds text this bridge cannot prove it wrote, or proves it wrote a turn
 	// that may already have been dispatched. It deliberately does NOT wrap
@@ -67,7 +75,7 @@ var (
 // which is why retryability is decided separately.
 func IsPreSubmit(err error) bool {
 	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned) ||
-		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn)
+		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn) || errors.Is(err, ErrPageChallenge)
 }
 
 // IsNavigateError reports a page-navigation or explicit project-setup failure. All
@@ -832,7 +840,8 @@ func sameURL(a, b string) bool {
 // so they keep their own identity instead of being folded into ErrNotSubmitted.
 func nonRetryablePreSubmit(err error) bool {
 	return errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned) ||
-		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn)
+		errors.Is(err, ErrNoComposer) || errors.Is(err, ErrNotLoggedIn) ||
+		errors.Is(err, ErrPageChallenge)
 }
 
 // classifyPreSendFailure is askLocked's defer, as a pure function so the
@@ -903,7 +912,7 @@ func (c *Client) askLocked(ctx context.Context, opt TurnOptions, page string, ti
 	// 2. Wait up to 30s for the SPA to finish loading & hydrating
 	log.Printf("[chatgpt] waiting for page ready...")
 	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
-		return out, err
+		return out, c.recoverBlankProjectPage(ctx, tab, err)
 	}
 	if projectPattern.MatchString(page) {
 		var projectComposer bool
@@ -1104,6 +1113,148 @@ func (c *Client) waitPageReady(ctx context.Context, tab context.Context, timeout
 		}
 	}
 	return ErrNoComposer
+}
+
+// pageLoadState is the content-free shape of the page at a failed readiness
+// check: one capped length plus flags, never text.
+type pageLoadState struct {
+	ReadyComplete bool
+	BodyTextLen   int
+	Composer      bool
+	Login         bool
+	Challenge     bool
+}
+
+type missingComposerCause int
+
+const (
+	missingComposerUnknown missingComposerCause = iota
+	missingComposerLoading
+	missingComposerAuth
+	missingComposerChallenge
+	missingComposerBlank
+)
+
+func (m missingComposerCause) String() string {
+	switch m {
+	case missingComposerLoading:
+		return "loading"
+	case missingComposerAuth:
+		return "auth"
+	case missingComposerChallenge:
+		return "challenge"
+	case missingComposerBlank:
+		return "blank"
+	default:
+		return "unknown"
+	}
+}
+
+// classifyMissingComposer decides a composer-less page. Only the blank loaded
+// page may see a single reload: nothing was typed yet, so no submit and no
+// draft is at risk. Auth, challenge, loading and unknown shapes must never
+// trigger hidden navigation.
+func classifyMissingComposer(ps pageLoadState) (missingComposerCause, bool) {
+	switch {
+	case ps.Login:
+		return missingComposerAuth, false
+	case ps.Challenge:
+		return missingComposerChallenge, false
+	case !ps.ReadyComplete:
+		return missingComposerLoading, false
+	case !ps.Composer && ps.BodyTextLen == 0:
+		return missingComposerBlank, true
+	default:
+		return missingComposerUnknown, false
+	}
+}
+
+// probePageLoadState reads one content-free snapshot of the page: a single
+// readonly evaluate returning flags and one capped length. The challenge
+// regex runs in-page; only its boolean leaves the browser.
+func (c *Client) probePageLoadState(tab context.Context) (pageLoadState, error) {
+	ctx, cancel := context.WithTimeout(tab, 10*time.Second)
+	defer cancel()
+	js := `(() => {
+	  const q = (sel) => !!document.querySelector(sel);
+	  const body = document.body;
+	  const textLen = body && typeof body.innerText === 'string' ? body.innerText.length : 0;
+	  return {
+	    ready: document.readyState === 'complete',
+	    bodyLen: Math.min(textLen, 1048576),
+	    composer: !!(document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]')),
+	    login: q('[data-testid="login-button"]'),
+	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human/i.test((body && body.innerText || '').slice(0, 4000)),
+	  };
+	})()`
+	var raw struct {
+		Ready     bool `json:"ready"`
+		BodyLen   int  `json:"bodyLen"`
+		Composer  bool `json:"composer"`
+		Login     bool `json:"login"`
+		Challenge bool `json:"challenge"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &raw)); err != nil {
+		return pageLoadState{}, err
+	}
+	return pageLoadState{
+		ReadyComplete: raw.Ready,
+		BodyTextLen:   raw.BodyLen,
+		Composer:      raw.Composer,
+		Login:         raw.Login,
+		Challenge:     raw.Challenge,
+	}, nil
+}
+
+// blankReloadAllowed reports whether a single pre-submit reload risks no
+// draft: only a missing record or an already-fenced (submitted) one.
+func blankReloadAllowed(rec *draftRecord) bool {
+	return rec == nil || rec.Submitted
+}
+
+// recoverBlankProjectPage handles a waitPageReady failure on the turn path
+// (askLocked step 2), where nothing has been typed or submitted yet. It
+// probes the content-free page shape once and reloads at most once, and only
+// for a blank loaded page with no unsubmitted draft. Auth, challenge,
+// loading and unknown shapes return classified errors with no navigation; a
+// canceled context returns without probing. Nil return means the re-wait
+// passed and the caller proceeds with the turn.
+func (c *Client) recoverBlankProjectPage(ctx context.Context, tab context.Context, waitErr error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ps, err := c.probePageLoadState(tab)
+	if err != nil {
+		log.Printf("[chatgpt] blank-page probe failed: %v", err)
+		return waitErr
+	}
+	cause, recoverable := classifyMissingComposer(ps)
+	log.Printf("[chatgpt] missing composer cause=%s ready=%v bodyLen=%d composer=%v login=%v challenge=%v recoverable=%v", cause, ps.ReadyComplete, ps.BodyTextLen, ps.Composer, ps.Login, ps.Challenge, recoverable)
+	switch cause {
+	case missingComposerAuth:
+		return ErrNotLoggedIn
+	case missingComposerChallenge:
+		return ErrPageChallenge
+	}
+	if !recoverable {
+		return waitErr
+	}
+	if !blankReloadAllowed(c.draftOwnership()) {
+		log.Printf("[chatgpt] blank-page reload refused: unsubmitted draft on record")
+		return ErrBlankProjectPage
+	}
+	reloadCtx, cancel := context.WithTimeout(tab, 30*time.Second)
+	defer cancel()
+	if err := chromedp.Run(reloadCtx, chromedp.Reload()); err != nil {
+		log.Printf("[chatgpt] blank-page reload failed: %v", err)
+		return ErrBlankProjectPage
+	}
+	if err := c.waitPageReady(ctx, tab, 30*time.Second); err != nil {
+		log.Printf("[chatgpt] blank-page re-wait failed: %v", err)
+		return ErrBlankProjectPage
+	}
+	log.Printf("[chatgpt] blank-page reload recovered the composer")
+	return nil
 }
 
 func (c *Client) startNewChat(ctx context.Context, tab context.Context) error {
