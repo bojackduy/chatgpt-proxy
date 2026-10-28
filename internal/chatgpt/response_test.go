@@ -1028,6 +1028,22 @@ func TestProbePageLoadStateReadsOnlyShape(t *testing.T) {
 	if !ps.Challenge {
 		t.Fatalf("cloudflare_challenge bubble fixture misread: %+v", ps)
 	}
+	// Interstitial-title variant: blank body, no widget DOM yet, but the
+	// document title already reads "Just a moment...". Must classify as
+	// challenge without waiting on body text.
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = ''; document.title = 'Just a moment...'`, nil)); err != nil {
+		t.Fatal(err)
+	}
+	ps, err = c.probePageLoadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ps.Challenge {
+		t.Fatalf("interstitial-title fixture misread: %+v", ps)
+	}
+	if cause, ok := classifyMissingComposer(ps); cause != missingComposerChallenge || ok {
+		t.Fatalf("interstitial-title fixture must be challenge without recovery: %v %v", cause, ok)
+	}
 }
 
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
