@@ -48,6 +48,7 @@ func run() error {
 	model := flag.String("model", "chatgpt-web", "model ID")
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per ChatGPT turn (chunk); long histories are replayed in chunks of this size, never one giant paste")
 	maxPaste := flag.Int("max-paste-bytes", 60000, "maximum bytes one submission may carry; above this the composer disables Send or stalls and the bridge refuses before sending anything (0 disables)")
+	replayPacing := flag.Int("replay-pacing-secs", 5, "think-time pause before every submission after the first in one request; spaces out multi-chunk history replays so bursts look less mechanical (0 disables)")
 	thinking := flag.Bool("thinking", false, "always select the ChatGPT Thinking model (reasoning)")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
 	maxParallel := flag.Int("max-parallel", parallelDefault, "maximum concurrent owned browser turns (1 serial compatibility, 2 parallel)")
@@ -65,7 +66,7 @@ func run() error {
 	cg := chatgpt.New(*port, *profile, *chrome)
 	cg.Background, cg.DedicatedTab = *background, true
 	defer cg.Close()
-	h := &handler{client: cg, model: *model, maxChars: *maxChars, maxPaste: *maxPaste, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
+	h := &handler{client: cg, model: *model, maxChars: *maxChars, maxPaste: *maxPaste, replayPacing: *replayPacing, forceThinking: *thinking, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
 	if err := h.load(); err != nil {
 		return err
 	}
@@ -224,10 +225,14 @@ type session struct {
 	Project string `json:",omitempty"`
 }
 type handler struct {
-	client           backend
-	model            string
-	maxChars         int
-	maxPaste         int
+	client   backend
+	model    string
+	maxChars int
+	maxPaste int
+	// replayPacing is think-time seconds before every submission after the
+	// first in one request. It spaces multi-chunk replays (load hygiene,
+	// disclosed in the plan log), never hides automation.
+	replayPacing     int
 	statePath        string
 	profileDir       string // Chrome profile dir; scopes the cross-process turn lock
 	forceThinking    bool
@@ -920,6 +925,17 @@ func (h *handler) pasteLimit() int {
 		return h.maxPaste
 	}
 	return h.maxChars
+}
+
+// pacingBeforeTurn returns how long to wait before submitting turns[i]: zero
+// for the first turn, zero when pacing is disabled, otherwise the configured
+// think-time. Pure so the burst shape is unit-testable; the loop applies it
+// cancellation-aware. Single-turn requests (the common case) never wait.
+func pacingBeforeTurn(i, secs int) time.Duration {
+	if i <= 0 || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // turn is one ChatGPT submission: a bounded prompt (and its attachments) plus
@@ -1778,7 +1794,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	for i, t := range turns {
 		sizes[i] = len(t.prompt)
 	}
-	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d", id, len(turns), sizes, turnReplayFlags(turns), h.pasteLimit())
+	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d pacing=%ds", id, len(turns), sizes, turnReplayFlags(turns), h.pasteLimit(), max(0, h.replayPacing))
 	if cap := h.pasteLimit(); cap > 0 {
 		for i, t := range turns {
 			limit := cap
@@ -1797,6 +1813,17 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	var images []chatgpt.RasterImage
 	finalTurn := false
 	for i, t := range turns {
+		if wait := pacingBeforeTurn(i, h.replayPacing); wait > 0 {
+			log.Printf("[openai] session=%s pacing turn=%d/%d wait=%s", id, i+1, len(turns), wait)
+			timer := time.NewTimer(wait)
+			select {
+			case <-r.Context().Done():
+				timer.Stop()
+				h.backendError(w, r.Context().Err())
+				return
+			case <-timer.C:
+			}
+		}
 		finalTurn = !t.replay
 		if id != "" {
 			// Record the interruption phase before submitting. Replay turns

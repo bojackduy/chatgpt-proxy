@@ -3157,3 +3157,15 @@ func TestCompactionAppendStaysOnThread(t *testing.T) {
 		t.Fatalf("thread moved: %s", got)
 	}
 }
+
+func TestPacingBeforeTurnShapesBurst(t *testing.T) {
+	if got := pacingBeforeTurn(0, 5); got != 0 {
+		t.Fatalf("first turn must never wait: %v", got)
+	}
+	if got := pacingBeforeTurn(3, 0); got != 0 {
+		t.Fatalf("disabled pacing must never wait: %v", got)
+	}
+	if got := pacingBeforeTurn(2, 5); got != 5*time.Second {
+		t.Fatalf("later turns must wait the configured think-time: %v", got)
+	}
+}
