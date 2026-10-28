@@ -770,7 +770,7 @@ func (c *Client) probeState(ctx context.Context, tab context.Context) (*Status, 
 	    sidebar: q('#sidebar'),
 	    loginBtn: q('[data-testid="login-button"]'),
 	    newChat: q('a[aria-label="New chat"], button[aria-label="New chat"], a[href="/"]'),
-	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human|verify.challenge/i.test(bodyText.slice(0, 4000)),
+	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human|verify.challenge|cloudflare.challenge/i.test(bodyText.slice(0, 4000)),
 	    bodyLen: Math.min(bodyText.length, 1048576),
 	    url: location.href,
 	    title: document.title,
@@ -1202,7 +1202,7 @@ func (c *Client) probePageLoadState(tab context.Context) (pageLoadState, error) 
 	    bodyLen: Math.min(textLen, 1048576),
 	    composer: !!(document.querySelector('#prompt-textarea') || document.querySelector('textarea#prompt-textarea') || document.querySelector('form[data-chatgpt-composer] div[contenteditable="true"]') || document.querySelector('.ProseMirror[contenteditable="true"]')),
 	    login: q('[data-testid="login-button"]'),
-	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human|verify.challenge/i.test((body && body.innerText || '').slice(0, 4000)),
+	    challenge: !!document.querySelector('iframe[src*="challenges.cloudflare"]') || /verify you are human|verify.challenge|cloudflare.challenge/i.test((body && body.innerText || '').slice(0, 4000)),
 	  };
 	})()`
 	var raw struct {

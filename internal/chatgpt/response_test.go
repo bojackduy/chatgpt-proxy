@@ -1013,6 +1013,21 @@ func TestProbePageLoadStateReadsOnlyShape(t *testing.T) {
 	if cause, ok := classifyMissingComposer(ps); cause != missingComposerChallenge || ok {
 		t.Fatalf("challenge-label fixture must be challenge without recovery: %v %v", cause, ok)
 	}
+	// In-thread error-bubble variant observed live (automation profile,
+	// manual temporary chat): a bare `cloudflare_challenge` error with a
+	// Retry button, plus 403s on backend-api fetches. Same gate, third
+	// wording — must classify identically.
+	set = `<div><span>cloudflare_challenge</span><button>Retry</button></div>`
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerHTML = `+quoteJS(set), nil)); err != nil {
+		t.Fatal(err)
+	}
+	ps, err = c.probePageLoadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ps.Challenge {
+		t.Fatalf("cloudflare_challenge bubble fixture misread: %+v", ps)
+	}
 }
 
 // composerFixtureJS reproduces the measured behaviour of ChatGPT's ProseMirror
