@@ -51,6 +51,27 @@ func shapeBytes(shape string) int {
 	return n
 }
 
+// roleInitials renders message roles as content-free initials (u/a/t/s)
+// so logs show suffix composition without any text.
+func roleInitials(msgs []message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			b.WriteByte('u')
+		case "assistant":
+			b.WriteByte('a')
+		case "tool":
+			b.WriteByte('t')
+		case "system":
+			b.WriteByte('s')
+		default:
+			b.WriteByte('?')
+		}
+	}
+	return b.String()
+}
+
 // contentDivergence returns the byte-length delta between the incoming and
 // saved sides of a content mismatch, or ok=false when either side is not a
 // plain string (multipart, null, other) and no size claim can be made.

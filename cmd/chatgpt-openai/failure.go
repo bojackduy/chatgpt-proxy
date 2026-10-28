@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 )
 
 // User-facing terminal failures.
@@ -49,6 +50,14 @@ func apiErrorDetail(w http.ResponseWriter, status int, err error, details map[st
 	if status == http.StatusUnprocessableEntity {
 		kind = "invalid_request_error"
 	}
+	// Same terminal line as apiError: refusals must be traceable without
+	// reproducing them. Detail keys only (reason/state codes), never values.
+	keys := make([]string, 0, len(details))
+	for k := range details {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	log.Printf("[openai] refused status=%d err=%v details=%v", status, err, keys)
 	body := map[string]any{"message": err.Error(), "type": kind, "code": status}
 	if len(details) > 0 {
 		body["details"] = details

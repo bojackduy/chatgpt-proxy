@@ -335,6 +335,10 @@ func apiError(w http.ResponseWriter, status int, err error) {
 	if status == http.StatusUnprocessableEntity {
 		kind = "invalid_request_error"
 	}
+	// Every refusal lands one terminal line: session attribution (when the
+	// caller names it in the error) plus status and reason. Refusals used
+	// to be silent, leaving only user-visible text to diagnose from.
+	log.Printf("[openai] refused status=%d err=%v", status, err)
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": kind, "code": status}})
 }
 func (h *handler) readyz(w http.ResponseWriter, r *http.Request) {
@@ -1477,6 +1481,13 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 	if id == "" || s == nil {
 		s = &session{}
 	}
+	{
+		thread := "none"
+		if s.URL != "" {
+			thread = "stored"
+		}
+		log.Printf("[openai] session=%s lane=%s request in=%d saved=%d thread=%s dirty=%v phase=%q", id, lane, len(req.Messages), len(s.Messages), thread, s.Dirty, s.Phase)
+	}
 	b, _ := json.Marshal(struct {
 		Messages []message
 		Tools    []toolDef
@@ -1769,7 +1780,7 @@ func (h *handler) completions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	thinking := h.forceThinking || (req.ReasoningEffort != nil && req.ReasoningEffort != "none") || (req.Reasoning != nil && req.Reasoning != false)
-	log.Printf("[openai] session=%s lane=%s decision=%s delta_messages=%d turns=%d tools=%d tools_bytes=%d teach_full=%v stream=%v thread=%s", id, lane, decision, len(delta), len(turns), len(req.Tools), toolsBytes(req.Tools), teachFull, req.Stream, url)
+	log.Printf("[openai] session=%s lane=%s decision=%s delta_messages=%d cut=%d roles=%s turns=%d tools=%d tools_bytes=%d teach_full=%v stream=%v thread=%s", id, lane, decision, len(delta), start, roleInitials(delta), len(turns), len(req.Tools), toolsBytes(req.Tools), teachFull, req.Stream, url)
 	// Journal uncertainty before the first submission so a crash/retry cannot
 	// duplicate a tool turn. The thread URL is persisted turn by turn.
 	if len(turns) == 0 {
