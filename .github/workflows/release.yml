@@ -85,6 +85,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --repo bojackduy/chatgpt-proxy \
+            --verify-tag \
             --title "$GITHUB_REF_NAME" \
             --notes "Bridge binaries for opencode-chatgpt (chatgpt-openai + chatgpt-proxy, 6 platform/arch pairs, sha256 checksums.txt)." \
             dist/*
